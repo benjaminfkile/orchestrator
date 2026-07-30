@@ -1,0 +1,32 @@
+/*
+ * Global reset + full-viewport shell.
+ *
+ * Vite/vitest apply no default stylesheet, so the browser's 8px body margin
+ * would otherwise leave a scroll gutter around the App shell. Zero it out and
+ * let html/body/#root fill the viewport so the Fluent shell owns the whole
+ * area.
+ *
+ * The base background/foreground are driven off Fluent's design tokens
+ * (exposed as CSS custom properties by FluentProvider) so the region behind the
+ * shell — e.g. overscroll rubber-banding — matches the active theme, dark mode
+ * included. Fallbacks keep things sane before the provider mounts.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background-color: var(--colorNeutralBackground1, #ffffff);
+  color: var(--colorNeutralForeground1, #242424);
+}

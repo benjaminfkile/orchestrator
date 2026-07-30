@@ -1,0 +1,87 @@
+# escape=`
+
+# orchestrator-runner-windows — the Windows-container counterpart of
+# ./Dockerfile, for hosts whose Docker daemon is in *Windows containers* mode.
+#
+# wisp boots this container with the Windows keep-alive (`cmd /c ping -t
+# localhost >NUL`) as PID 1 and drives all work through execs (wrapped in
+# `cmd /c` by wisp), so the image needs no entrypoint — just the same tools the
+# executor's steps and the agent exec expect: node, git, and the claude CLI,
+# plus the Go and .NET toolchains for mixed-stack repos.
+#
+# The base tag's OS build must be compatible with the host per Windows-container
+# rules (ltsc2022 runs on newer hosts under Hyper-V isolation, which is Docker
+# Desktop's default).
+#
+# Build (on the machine running wispd, while Docker is in Windows mode):
+#   docker build -t orchestrator-runner-windows -f runner/Dockerfile.windows ./runner
+#
+# Then allow-list it in the wisp HOST's policy config — the file the operator's
+# WISP_CONFIG points at (wisp.config.example.json next to this file shows the
+# needed entries) — and point
+# the orchestrator setting `default_lease_image` at "orchestrator-runner-windows"
+# while the host is in Windows mode.
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+# Pinned toolchain versions, mirroring ./Dockerfile: Go tracks 1.22.x and .NET
+# the 8.0 LTS channel; Node tracks the same 20.x line as node:20-slim.
+ENV NODE_VERSION=20.19.0 `
+    GIT_VERSION=2.47.1 `
+    GO_VERSION=1.22.12 `
+    DOTNET_CHANNEL=8.0
+
+# Node.js (zip distribution -> C:\nodejs).
+RUN Invoke-WebRequest -Uri "https://nodejs.org/dist/v$env:NODE_VERSION/node-v$env:NODE_VERSION-win-x64.zip" -OutFile C:\node.zip; `
+    Expand-Archive C:\node.zip -DestinationPath C:\; `
+    Rename-Item "C:\node-v$env:NODE_VERSION-win-x64" nodejs; `
+    Remove-Item C:\node.zip
+
+# MinGit (headless git for Windows -> C:\git).
+RUN Invoke-WebRequest -Uri "https://github.com/git-for-windows/git/releases/download/v$($env:GIT_VERSION).windows.1/MinGit-$($env:GIT_VERSION)-64-bit.zip" -OutFile C:\mingit.zip; `
+    Expand-Archive C:\mingit.zip -DestinationPath C:\git; `
+    Remove-Item C:\mingit.zip
+
+# Go toolchain (zip extracts to C:\go).
+RUN Invoke-WebRequest -Uri "https://go.dev/dl/go$($env:GO_VERSION).windows-amd64.zip" -OutFile C:\go.zip; `
+    Expand-Archive C:\go.zip -DestinationPath C:\; `
+    Remove-Item C:\go.zip
+
+# .NET 8 SDK via the official install script -> C:\dotnet.
+RUN Invoke-WebRequest -Uri https://dot.net/v1/dotnet-install.ps1 -OutFile C:\dotnet-install.ps1; `
+    C:\dotnet-install.ps1 -Channel $env:DOTNET_CHANNEL -InstallDir C:\dotnet; `
+    Remove-Item C:\dotnet-install.ps1
+
+# Expose every toolchain machine-wide (later RUN steps and every exec user see
+# this). C:\npm is the global npm prefix set below, so `claude` resolves for
+# ContainerUser too, not just the build-time admin.
+RUN [Environment]::SetEnvironmentVariable('Path', $env:Path + ';C:\nodejs;C:\npm;C:\git\cmd;C:\go\bin;C:\dotnet', 'Machine')
+
+# Global npm prefix outside any user profile, then the claude CLI into it.
+RUN npm config set prefix C:\npm --location=global; `
+    npm install -g @anthropic-ai/claude-code@latest
+
+# Cloned repos and exec cwds can mix ownership; never let git balk at that
+# inside a throwaway container. Also strip MinGit's bundled credential manager:
+# it intercepts dev.azure.com URLs (demanding an org name) instead of honoring
+# the inline PAT the clone pre-steps embed — the Linux image's plain git has no
+# helper, so keep the behavior identical.
+RUN git config --system --add safe.directory '*'; `
+    git config --system --unset-all credential.helper
+
+# Sanity-check every toolchain resolves from the machine PATH.
+RUN node --version; git --version; go version; dotnet --version; claude --version
+
+# Quiet the .NET CLI and keep Go's caches under the exec user's profile.
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 `
+    DOTNET_NOLOGO=1 `
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 `
+    GOPATH=C:\Users\ContainerUser\go
+
+# Run as the unprivileged ContainerUser, mirroring the Linux image's non-root
+# `node` user: agent execs run with --dangerously-skip-permissions and must not
+# run with administrative rights.
+USER ContainerUser
+WORKDIR C:\Users\ContainerUser

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+web/node_modules/
+web/dist/
+web/coverage/
+
+# Local, private setup scripts (team/org-specific automation — never committed).
+scripts/local/
