@@ -40,6 +40,12 @@ vi.mock("../discovery", () => ({
   getAdoIterations: vi.fn(),
   getAdoIdentities: vi.fn(),
 }));
+// The page registers a live-refetch subscription that requires a ChangesProvider
+// in the tree. These unit tests render the page bare, so stub the hook to a
+// no-op; the live-stream wiring is covered by useLiveRefetch.test.tsx.
+vi.mock("../components/useLiveRefetch", () => ({
+  useLiveRefetch: vi.fn(),
+}));
 
 const mockListModules = vi.mocked(listModules);
 const mockGetModuleConfig = vi.mocked(getModuleConfig);

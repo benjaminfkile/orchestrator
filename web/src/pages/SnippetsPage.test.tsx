@@ -24,6 +24,12 @@ vi.mock("../snippets", async (importOriginal) => ({
   updateSnippet: vi.fn(),
   deleteSnippet: vi.fn(),
 }));
+// The page registers a live-refetch subscription that requires a ChangesProvider
+// in the tree. These unit tests render the page bare, so stub the hook to a
+// no-op; the live-stream wiring is covered by useLiveRefetch.test.tsx.
+vi.mock("../components/useLiveRefetch", () => ({
+  useLiveRefetch: vi.fn(),
+}));
 
 const mockList = vi.mocked(listSnippets);
 const mockCreate = vi.mocked(createSnippet);

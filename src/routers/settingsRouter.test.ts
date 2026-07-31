@@ -161,6 +161,9 @@ describe("settings router", () => {
     });
 
     it("returns the wisper base URL, hostId, mode, and key presence from config", async () => {
+      // Inject a resolver that finds no key so the assertion below never depends
+      // on whether the developer's real secret store holds a wisper API key.
+      setRuntime({ wisperHosts: { resolveApiKey: () => undefined } });
       const res = await request(app).get("/api/settings/system");
       expect(res.status).toBe(200);
       expect(typeof res.body.wisperBaseUrl).toBe("string");
