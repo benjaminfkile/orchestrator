@@ -10,18 +10,25 @@
  * is added/renamed, a request/response shape changes, a setting key or runner
  * appears, template/matching semantics move — update this briefing in the same
  * change. The README ("Agent briefing" section) and CLAUDE.md both point here.
+ *
+ * Rendered per request with the port this server actually booted on (`PORT`,
+ * default 3007), so the base URL stays correct however the app is run.
  */
 
-export const AGENT_BRIEFING = `# Driving orchestrator via its local API (agent briefing)
+export function agentBriefing(port: number): string {
+  const baseUrl = `http://127.0.0.1:${port}/api`;
+  return `# Driving orchestrator via its local API (agent briefing)
 
 You are talking to **orchestrator**, a single-user desktop app that watches
 external systems (Azure DevOps), matches events against user-configured rules,
 and runs data-driven playbooks inside short-lived container leases. Your job:
 help the user configure and operate it over plain HTTP+JSON.
 
-Base URL: \`http://127.0.0.1:3007/api\` (loopback only, NO auth). Verify with
+Base URL: \`${baseUrl}\` (loopback only, NO auth). Verify with
 \`GET /api/health\` -> \`{status:"ok", db:true, wisper:true}\` ("wisper" false means
-the lease backend is down; config edits still work, runs will not).
+the lease backend is down; config edits still work, runs will not). This text is
+served at \`GET /api/agent-briefing\` -> \`{briefing}\` — re-fetch it any time to
+refresh these instructions.
 
 \`GET /api/changes/stream\` is a Server-Sent Events feed of \`{resource, ts}\`
 frames — one per data change (e.g. \`{"resource":"playbooks"}\`) — that the web UI
@@ -38,19 +45,26 @@ run-lifecycle event -> **notifiers** fire notifications.
 Key invariants you must respect:
 - The core is domain-neutral: all intent lives in DATA you write (rule
   criteria, prompts, templates, event-type strings) — never ask to change code.
-- Requests are strictly validated: send ONLY documented keys (unknown keys are
-  rejected with a 400 naming the offender).
+- Send ONLY documented keys. The rules/playbooks/snippets/notifiers/dispatches
+  write endpoints (and the datadog config PUT) reject unknown body keys with a
+  400 naming the offender; a few others (settings, secrets, ADO config) do not,
+  so a typo there can persist silently — double-check those bodies yourself.
 - Secrets are write-only: you can set and reference them by NAME, never read a
   value back. Never echo a secret value the user gives you into any other field.
 
 ## Events
 
-- \`GET /api/events?limit=N&cursor=<id>\` — newest first. \`GET /api/events/:id\`.
+- \`GET /api/events?limit=N&before=<id>\` — newest first; \`before\` pages past
+  the given event id. \`GET /api/events/:id\`.
   Add \`?q=<text>\` to substring-search (case-insensitive) across source, type,
   subject_kind, subject_ref, and the raw payload JSON; whitespace-separated terms
-  are ANDed and it composes with the cursor.
-- Shape: \`{id, source, type, subject_kind, subject_ref, payload, ts}\`. Payload
-  is opaque JSON from the producer.
+  are ANDed and it composes with \`before\`.
+- \`GET /api/events/facets\` -> \`{sources, types}\` — every recorded source/type
+  merged with what the registered modules can emit (works on an empty DB). Use
+  it to discover valid \`match.type\` strings before writing a rule.
+- Shape: \`{id, source, type, subject_kind, subject_ref, payload, dedupe_key,
+  ts, last_dispatched_at, cleared_at}\`. Payload is opaque JSON from the
+  producer. All columns are addressable in rule criteria as \`event.<column>\`.
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
   .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
   .updated\` (source \`ado\`).
@@ -75,6 +89,9 @@ Key invariants you must respect:
   fire on terminal dispatch outcomes. Payload: \`{dispatch_id, run_id,
   playbook_id, playbook_name, rule_id, status, exit_code, error, findings,
   findings_count, collected, duration_ms, total_tokens, origin, chain_depth}\`.
+  \`origin\` is an OBJECT describing the triggering event — \`{event_id, source,
+  type, subject_kind, subject_ref}\` — so a chaining rule matches e.g.
+  \`payload.origin.subject_ref\`; \`findings\` is \`[{content, tags}]\`.
   Rules can match these to CHAIN playbooks; the \`dispatch_max_chain_depth\`
   setting (default 3) caps runaway chains.
 
@@ -82,14 +99,21 @@ Key invariants you must respect:
 
 Body: \`{name, enabled?, match?, dispatch?, notify?}\`.
 - \`match\`: \`{source?, type?, criteria?}\` — absent field = wildcard.
-  - \`type\` supports \`*\` and \`prefix.*\` wildcards.
+  - \`type\` supports \`*\` and \`prefix.*\` wildcards (\`prefix.*\` also matches the
+    bare \`prefix\`).
   - \`criteria\` keys are dotted paths into the event payload (\`fields.state\`),
     or \`event.<column>\` for the event row itself. Values: a scalar (strict
     equality), an array (membership), or an operator map ANDed together:
-    \`eq/ne/in/nin/contains/exists\`, regex \`=~\`/\`!~\`, ordering \`gt/gte/lt/lte\`.
-    The literal string \`"@Me"\` resolves to the \`identity_me\` setting.
+    \`eq/ne/in/nin/contains/exists\`, regex \`=~\`/\`!~\`, ordering \`gt/gte/lt/lte\`
+    (aliases also accepted: \`=\`, \`==\`, \`!=\`, \`<>\`, \`not_in\`, \`has\`, \`regex\`,
+    \`matches\`, \`not_matches\`, \`>\`, \`>=\`, \`<\`, \`<=\`).
+    The literal string \`"@Me"\` resolves to the \`identity_me\` setting in
+    scalar/array specs and eq/ne/in/nin/contains/ordering operands — NOT inside
+    regex patterns; when \`identity_me\` is unset it compares literally.
     Malformed criteria fail closed (rule silently does not fire).
 - \`dispatch\`: \`[{playbook_id, bindings?}]\` — playbooks to run on match.
+  \`bindings\` is validated and stored but NOT currently read by the executor or
+  exposed to templates — do not rely on it to parameterize a run.
 - \`notify\`: \`[{notifier_id}]\` — notifiers to fire on match (not rate-capped).
 
 ## Playbooks — \`GET/POST /api/playbooks\`, \`GET/PATCH/DELETE /api/playbooks/:id\`
@@ -115,12 +139,15 @@ steps?, granted_capabilities?, output_kind?}\`.
   against the selected host's advertised \`isolation_levels\` at dispatch time — a
   host that cannot provide it fails the dispatch BEFORE leasing (like an
   unoffered image) — and is sent on \`POST /v1/leases\`; \`dev\` mode ignores it. A
-  value outside the allowed set is a \`400\` at save time.
+  value outside the allowed set is a \`400\` at save time. Note
+  \`GET /api/wisper/hosts\` does NOT expose isolation levels, so you cannot
+  pre-check support — a mismatch surfaces as the dispatch failure.
 - \`runner\` (see \`GET /api/runners\`):
   - \`claude-code\` (default): runs Claude Code in the lease against the
     rendered \`prompt_template\`. \`runner_config\`: \`{model?, allowed_tools?}\`
     (models list: \`GET /api/anthropic/models\`).
-  - \`script\`: no LLM — \`runner_config.command_template\` (required) is rendered
+  - \`script\`: no LLM — \`runner_config.command_template\` (required; a missing/
+    empty one fails the dispatch BEFORE leasing) is rendered
     and run as the agent step; its stdout is the run's result text. Exit 0 =
     success. CAUTION: leases may be Windows containers (check the
     \`default_lease_image\` setting); commands then run under \`cmd /c\` and
@@ -139,6 +166,9 @@ steps?, granted_capabilities?, output_kind?}\`.
   \`{{payload.<dotted.path>}}\`, \`{{env.NAME}}\`. Unknown tokens render empty.
 - Findings: an agent (or script) persists findings by printing
   \`<NOTES_TO_SAVE>[{"content":"...","visibility":"all","tags":["..."]}]</NOTES_TO_SAVE>\`.
+  \`visibility\` is \`self|siblings|descendants|ancestors|all\` (default \`all\`);
+  \`content\` must be a non-empty string. Invalid entries are SILENTLY skipped
+  (never fatal); multiple blocks in one output accumulate.
 - \`DELETE /api/playbooks/:id\` CASCADES the playbook's run history — its terminal
   dispatches, their runs, those runs' findings, and each dispatch's log file —
   then the playbook row (204). A playbook with any IN-FLIGHT (queued/leasing/
@@ -186,10 +216,22 @@ rename therefore breaks every reference by design.
   type, and playbook name. \`GET /api/runs\` takes the same \`?q=\` and searches
   playbook name, status, error, subject fields, and each run's result text,
   collected JSON, and findings content. Both compose with the other filters.
-- Manual run: \`POST /api/dispatches\` body \`{event_id, playbook_id}\`.
-- \`POST /api/dispatches/:id/retry\`; \`GET /api/dispatches/:id/log\` (full log).
+- Manual run: \`POST /api/dispatches\` body \`{event_id, playbook_id}\` -> 201
+  (404 for an unknown event or playbook). Deliberately bypasses
+  \`dispatch_max_per_event\`, but still counts against the per-hour cap and the
+  run/token budget gate.
+- \`POST /api/dispatches/:id/retry\` — 409 unless the status is exactly \`failed\`.
+- \`GET /api/dispatches/:id/log\` — a \`text/plain\` stream that TAILS the log
+  until the dispatch is terminal (it deliberately stays open while the dispatch
+  runs — do not curl it and wait); 404 until the log file exists.
+- There is NO cancel endpoint: an in-flight dispatch runs to completion (which
+  is also why deleting its playbook is refused until it finishes).
 - Status flow: queued -> leasing -> running -> collecting -> done | failed.
-- Runs: \`GET /api/runs/:id\` -> run + collected output + findings.
+  A dispatch held by the run/token budget gate stays \`queued\` annotated with
+  \`{waiting_reason: "budget", window_count, budget, next_eligible_at, ...}\` —
+  check those fields when a dispatch seems stuck.
+- Runs: \`GET /api/runs/:id\` -> run + collected output + findings. \`GET
+  /api/runs\` also takes \`?limit=\` (1..1000) and \`?status=\` (a dispatch status).
 
 ## Notifiers & notifications
 
@@ -201,16 +243,23 @@ rename therefore breaks every reference by design.
   \`/read-all\`, \`GET /api/notifications/unread-count\`. \`GET /api/notifications\`
   takes \`?q=<text>\` to substring-search (case-insensitive, terms ANDed) across
   title, body, status, and error; it composes with the cursor and \`unread=1\`.
+  \`GET /api/notifications/stream\` is an SSE feed of new notifications.
 
 ## Settings & secrets
 
 - \`GET /api/settings\`, \`PUT /api/settings\` body \`{key, value}\` (whitelisted
-  keys): \`default_lease_image\`, \`dispatcher_interval_seconds\`,
+  keys): \`default_lease_image\`, \`dispatch_concurrency\`,
+  \`dispatcher_interval_seconds\`,
   \`dispatch_max_attempts\`, \`dispatch_timeout_seconds\`, \`dispatch_max_per_event\`,
   \`dispatch_max_per_hour\`, \`dispatch_max_chain_depth\`,
   \`event_dedupe_cooldown_seconds\`, \`identity_me\`, \`run_retention_max\`
   (caps kept terminal runs, default 2000; oldest beyond it are pruned with their
-  findings and log files; 0 or negative disables pruning).
+  findings and log files; 0 or negative disables pruning),
+  \`run_budget_per_hour\`, \`run_budget_window_minutes\` (default 60), and
+  \`token_budget_per_window\`. The run/token budgets are a GATE, not a rejection:
+  when the window's run count or token spend is exhausted, further dispatches
+  are HELD in \`queued\` (annotated with \`waiting_reason: "budget"\` — see
+  Dispatches) until the window frees up.
 - Secrets: \`GET /api/secrets\` (names only), \`PUT /api/secrets\` body
   \`{key, value}\`, \`DELETE /api/secrets/:key\`. Typical names:
   \`CLAUDE_CODE_OAUTH_TOKEN\`, \`ADO_PAT\`, \`GIT_TOKEN\`, \`DD_API_KEY\`,
@@ -249,10 +298,28 @@ rename therefore breaks every reference by design.
 
 ## Modules (integration producers)
 
-- \`GET /api/modules\`, \`GET/PUT /api/modules/ado/config\` (org, project,
-  pat_secret_ref, enabled, interval_seconds, watched, pull_requests),
-  \`POST /api/modules/ado/backfill\`. Discovery pickers under
-  \`/api/modules/ado/discovery/*\`. The ADO integration is READ-ONLY.
+- \`GET /api/modules\` -> \`[{id, producers: [{producerId, trigger, lastTickAt,
+  lastError, nextFireAt}]}]\` — whether each poller is armed and its last error.
+- \`GET /api/modules/:id/config\` -> \`{module_id, config}\`; \`PUT\` takes the
+  BARE config object (do not round-trip the GET wrapper back).
+- ADO config keys (\`/api/modules/ado/config\`): org, project, base_url,
+  pat_secret_ref, enabled, interval_seconds, watched, pull_requests. NOT
+  shape-validated on PUT (unlike datadog) — a typoed key persists silently, so
+  double-check the body. The ADO integration is READ-ONLY.
+- \`POST /api/modules/ado/backfill\` body \`{producer_id?, limit?, dry_run?}\` ->
+  \`{candidates, emitted}\` (400 when the module is disabled or unconfigured).
+- Discovery pickers under \`/api/modules/ado/discovery/*\` (orgs, projects,
+  types, states, people, iterations; \`workitems?q=\` searches work items), plus
+  \`GET /api/modules/ado/identity/me\`. On a PAT lacking scopes these DEGRADE to
+  200 + an empty list with an \`X-Ado-Restricted\` header, never a hard 401.
+- \`POST /api/modules/ado/workitems/:id/materialize\` -> 201 with a stored
+  \`ado.workitem.manual\` event (source \`ado\`; rule matching and dedupe are
+  skipped) — the way to mint a real test event on demand.
+- Grantable capabilities (\`GET /api/capabilities\` -> \`[{id, module_id}]\`) are
+  READ-ONLY prompt enrichers granted per playbook; for ANY capability, a grant
+  with no \`config\` inherits the owning module's stored connection config. ADO
+  contributes \`ado.get_work_item\`, \`ado.query_work_items\`, \`ado.sprint_rollup\`,
+  and \`ado.get_work_item_links\`.
 - \`GET/PUT /api/modules/datadog/config\` (enabled, site — a bare domain like
   \`us5.datadoghq.com\`, default \`datadoghq.com\`; api_key_secret_ref,
   app_key_secret_ref, interval_seconds, monitors, watches). Config is
@@ -281,11 +348,19 @@ rename therefore breaks every reference by design.
 ## Portability
 
 - \`GET /api/config/export\` (add \`?scrub=environment\` to strip machine-local
-  values) / \`POST /api/config/import\` — playbooks, rules, module config,
-  settings; secrets travel as names only.
+  values) — one JSON document: playbooks, rules, snippets, module config,
+  whitelisted settings; secrets travel as NAMES only. 409s when a stored secret
+  VALUE is found pasted inside a template (fix the template, then re-export).
+- \`POST /api/config/import\` body \`{document, mode?, dry_run?}\` — \`mode\` is
+  \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
+  \`dry_run: true\` computes the full plan with NO writes. Returns per-object
+  actions plus \`missing_secrets\` and a post-import checklist; the apply is one
+  transaction. ALWAYS dry-run first and show the user the plan.
 
 ## Working style
 
 Confirm before destructive calls (DELETE, imports). After creating rules or
-playbooks, offer to test them with a manual dispatch against a recent event and
-report the run's outcome from \`GET /api/runs/:id\`.`;
+playbooks, offer to test them: mint an event with the ADO materialize endpoint
+(or pick a recent one from \`GET /api/events\`), dispatch it manually, and report
+the run's outcome from \`GET /api/runs/:id\`.`;
+}
