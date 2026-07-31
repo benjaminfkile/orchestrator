@@ -62,6 +62,7 @@ function samplePlan(overrides: Partial<ImportPlan> = {}): ImportPlan {
     applied: false,
     playbooks: [{ key: "researcher", action: "create" }],
     rules: [{ key: "bugs-to-researcher", action: "create" }],
+    snippets: [{ key: "prompt:house-style", action: "create" }],
     modules: [{ key: "ado", action: "create" }],
     settings: [{ key: "default_lease_image", action: "create" }],
     missing_secrets: [{ name: "GIT_TOKEN", used_by: ["playbook:researcher"] }],

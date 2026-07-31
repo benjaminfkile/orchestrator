@@ -5,20 +5,26 @@ import { listModuleConfigs } from "../db/moduleConfig";
 import { listPlaybooks } from "../db/playbooks";
 import { listRules } from "../db/rules";
 import { getAllSettings } from "../db/settings";
+import { listSnippets } from "../db/snippets";
 import { DEFAULT_LEASE_IMAGE_SETTING } from "../executor/executor";
-import type { LeaseIsolation, PlaybookRecord } from "../interfaces";
+import type {
+  LeaseIsolation,
+  PlaybookRecord,
+  SnippetKind,
+  SnippetRecord,
+} from "../interfaces";
 import { IDENTITY_ME_SETTING } from "../services/eventIntake";
 
 import { KNOWN_SETTING_KEYS } from "../routers/settingsRouter";
 
 /**
  * config export — a single portable JSON document describing one orchestrator's
- * automation setup (playbooks, rules, module config, whitelisted settings) so it
- * can be reproduced on another instance.
+ * automation setup (playbooks, rules, snippets, module config, whitelisted
+ * settings) so it can be reproduced on another instance.
  *
  * SECRET HYGIENE (load-bearing). This module NEVER imports or touches the secret
- * store: it reads only playbooks, rules, module_config, and app_settings. The
- * document references secrets by NAME only. As defense in depth, the caller
+ * store: it reads only playbooks, rules, snippets, module_config, and
+ * app_settings. The document references secrets by NAME only. As defense in depth, the caller
  * passes in the currently stored secret {name, value} pairs and {@link
  * exportConfig} scans the serialized document for any of those values, FAILING
  * loudly (a {@link SecretLeakError}) rather than masking — a template holding a
@@ -80,6 +86,18 @@ export interface ExportedPlaybook {
   output_kind: string;
 }
 
+/**
+ * A snippet as exported: identified by its (kind, name) pair — the same identity
+ * references resolve against at dispatch time — with numeric ids and timestamps
+ * dropped.
+ */
+export interface ExportedSnippet {
+  kind: SnippetKind;
+  name: string;
+  description: string;
+  content: string;
+}
+
 /** The full export document. */
 export interface ConfigExportDocument {
   kind: typeof EXPORT_KIND;
@@ -89,6 +107,7 @@ export interface ConfigExportDocument {
   modules: Record<string, unknown>;
   playbooks: ExportedPlaybook[];
   rules: ExportedRule[];
+  snippets: ExportedSnippet[];
   required_secrets: RequiredSecret[];
 }
 
@@ -149,6 +168,19 @@ function exportPlaybook(p: PlaybookRecord): ExportedPlaybook {
     steps: p.steps,
     granted_capabilities: p.granted_capabilities,
     output_kind: p.output_kind,
+  };
+}
+
+/**
+ * Build the exported form of one snippet: its (kind, name) identity plus
+ * description and content; numeric ids and timestamps are dropped.
+ */
+function exportSnippet(s: SnippetRecord): ExportedSnippet {
+  return {
+    kind: s.kind,
+    name: s.name,
+    description: s.description,
+    content: s.content,
   };
 }
 
@@ -219,9 +251,9 @@ function scanForSecrets(
 
 /**
  * Build (and secret-scan) the portable config export document. Reads only
- * playbooks, rules, module_config, and app_settings — never the secret store.
- * Throws {@link SecretLeakError} when a stored secret value appears anywhere in
- * the document.
+ * playbooks, rules, snippets, module_config, and app_settings — never the
+ * secret store. Throws {@link SecretLeakError} when a stored secret value
+ * appears anywhere in the document.
  */
 export async function exportConfig(
   options: ExportConfigOptions
@@ -229,12 +261,14 @@ export async function exportConfig(
   const db = options.db ?? getDb();
   const scrub = options.scrub === "environment";
 
-  const [playbooks, rules, moduleConfigs, allSettings] = await Promise.all([
-    listPlaybooks(db),
-    listRules(db),
-    listModuleConfigs(db),
-    getAllSettings(db),
-  ]);
+  const [playbooks, rules, snippets, moduleConfigs, allSettings] =
+    await Promise.all([
+      listPlaybooks(db),
+      listRules(db),
+      listSnippets(undefined, db),
+      listModuleConfigs(db),
+      getAllSettings(db),
+    ]);
 
   // playbook id -> stable key (name), so rule dispatch targets can be rewritten
   // to reference playbooks by key instead of the numeric id.
@@ -242,6 +276,16 @@ export async function exportConfig(
   for (const p of playbooks) keyById.set(p.id, p.name);
 
   const exportedPlaybooks = playbooks.map(exportPlaybook);
+
+  // Snippets are listed newest-first for the UI; sort by (kind, name) — their
+  // stable identity — so exports of the same setup are diffable.
+  const exportedSnippets = snippets
+    .map(exportSnippet)
+    .sort((a, b) =>
+      a.kind === b.kind
+        ? a.name.localeCompare(b.name)
+        : a.kind.localeCompare(b.kind)
+    );
 
   const exportedRules: ExportedRule[] = rules.map((rule) => ({
     name: rule.name,
@@ -304,6 +348,7 @@ export async function exportConfig(
     modules,
     playbooks: exportedPlaybooks,
     rules: exportedRules,
+    snippets: exportedSnippets,
     required_secrets,
   };
 
@@ -317,6 +362,9 @@ export async function exportConfig(
   }
   for (const rule of doc.rules) {
     scanForSecrets(`rule ${rule.name}`, rule, options.secrets);
+  }
+  for (const s of doc.snippets) {
+    scanForSecrets(`snippet ${s.kind}:${s.name}`, s, options.secrets);
   }
   for (const [key, value] of Object.entries(doc.app_settings)) {
     scanForSecrets(`app_settings ${key}`, value, options.secrets);

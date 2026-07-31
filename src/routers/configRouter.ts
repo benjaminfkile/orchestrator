@@ -13,10 +13,11 @@ import { handler, HttpError, requireBody } from "./http";
 /**
  * `/api/config` — portable config export/import.
  *
- *   GET  /export       a single JSON document (playbooks, rules, module config,
- *                      whitelisted settings, required-secrets manifest) served as
- *                      an attachment. `?scrub=environment` additionally blanks
- *                      environment identifiers for public sharing.
+ *   GET  /export       a single JSON document (playbooks, rules, snippets,
+ *                      module config, whitelisted settings, required-secrets
+ *                      manifest) served as an attachment. `?scrub=environment`
+ *                      additionally blanks environment identifiers for public
+ *                      sharing.
  *
  *   POST /import        {document, mode?, dry_run?} — reproduces an export
  *                      document locally. `mode` is "merge" (default, skip name

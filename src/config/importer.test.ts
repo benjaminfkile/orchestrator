@@ -10,6 +10,7 @@ import { getModuleConfig, setModuleConfig } from "../db/moduleConfig";
 import { createPlaybook, listPlaybooks } from "../db/playbooks";
 import { createRule, listRules } from "../db/rules";
 import { getSetting, setSetting } from "../db/settings";
+import { createSnippet, listSnippets } from "../db/snippets";
 
 import { exportConfig } from "./exporter";
 import { importConfig, ImportError } from "./importer";
@@ -62,6 +63,14 @@ function sampleDoc(overrides: Record<string, unknown> = {}) {
         enabled: true,
         match: { source: "ado", type: "ado.workitem.created" },
         dispatch: [{ playbook: "researcher", bindings: { priority: "high" } }],
+      },
+    ],
+    snippets: [
+      {
+        kind: "prompt",
+        name: "house-style",
+        description: "Shared prose style",
+        content: "Write terse findings.",
       },
     ],
     required_secrets: [
@@ -143,6 +152,9 @@ describe("config importer", () => {
     expect(plan.rules).toEqual([
       { key: "bugs-to-researcher", action: "create" },
     ]);
+    expect(plan.snippets).toEqual([
+      { key: "prompt:house-style", action: "create" },
+    ]);
     expect(plan.modules).toEqual([{ key: "ado", action: "create" }]);
     expect(plan.settings).toEqual(
       expect.arrayContaining([
@@ -153,6 +165,7 @@ describe("config importer", () => {
     // No writes happened.
     expect(await listPlaybooks(db)).toHaveLength(0);
     expect(await listRules(db)).toHaveLength(0);
+    expect(await listSnippets(undefined, db)).toHaveLength(0);
     expect(await getModuleConfig("ado", db)).toBeUndefined();
   });
 
@@ -175,6 +188,78 @@ describe("config importer", () => {
     expect(rules[0].dispatch).toEqual([
       { playbook_id: pb.id, bindings: { priority: "high" } },
     ]);
+
+    const snippets = await listSnippets(undefined, db);
+    expect(snippets).toHaveLength(1);
+    expect(snippets[0]).toMatchObject({
+      kind: "prompt",
+      name: "house-style",
+      description: "Shared prose style",
+      content: "Write terse findings.",
+    });
+  });
+
+  it("rejects a snippet whose kind is not a known snippet kind", async () => {
+    const doc = sampleDoc({
+      snippets: [{ kind: "template", name: "bad", content: "x" }],
+    });
+    await expect(
+      importConfig({ document: doc, secretNames: [], db })
+    ).rejects.toThrow(/invalid kind/);
+    // The rejection also holds for a dry-run, and nothing is written.
+    await expect(
+      importConfig({ document: doc, dryRun: true, secretNames: [], db })
+    ).rejects.toThrow(/invalid kind/);
+    expect(await listSnippets(undefined, db)).toHaveLength(0);
+  });
+
+  it("merge mode skips a colliding snippet; overwrite mode replaces its content", async () => {
+    const local = await createSnippet(
+      {
+        kind: "prompt",
+        name: "house-style",
+        description: "LOCAL description",
+        content: "LOCAL content",
+      },
+      db
+    );
+
+    const mergePlan = await importConfig({
+      document: sampleDoc(),
+      secretNames: [],
+      db,
+    });
+    expect(mergePlan.snippets).toEqual([
+      { key: "prompt:house-style", action: "skip" },
+    ]);
+    let [snippet] = await listSnippets("prompt", db);
+    expect(snippet.content).toBe("LOCAL content");
+
+    const overwritePlan = await importConfig({
+      document: sampleDoc(),
+      mode: "overwrite",
+      secretNames: [],
+      db,
+    });
+    expect(overwritePlan.snippets).toEqual([
+      { key: "prompt:house-style", action: "overwrite" },
+    ]);
+    [snippet] = await listSnippets("prompt", db);
+    // Overwrite patches the LOCAL row in place: same id, imported content.
+    expect(snippet.id).toBe(local.id);
+    expect(snippet.description).toBe("Shared prose style");
+    expect(snippet.content).toBe("Write terse findings.");
+  });
+
+  it("tolerates a document with no snippets field (older exports)", async () => {
+    const plan = await importConfig({
+      document: sampleDoc({ snippets: undefined }),
+      secretNames: [],
+      db,
+    });
+    expect(plan.applied).toBe(true);
+    expect(plan.snippets).toEqual([]);
+    expect(await listSnippets(undefined, db)).toHaveLength(0);
   });
 
   it("round-trips a playbook's set isolation through export then import", async () => {
@@ -440,6 +525,15 @@ describe("config importer", () => {
     );
     await setModuleConfig("ado", { org: "contoso", enabled: false }, db);
     await setSetting("dispatch_max_attempts", "5", db);
+    await createSnippet(
+      {
+        kind: "prompt",
+        name: "house-style",
+        description: "Shared prose style",
+        content: "Write terse findings.",
+      },
+      db
+    );
 
     const first = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
@@ -469,6 +563,8 @@ describe("config importer", () => {
       // be equivalent.
       expect(second.playbooks).toEqual(first.playbooks);
       expect(second.rules).toEqual(first.rules);
+      expect(second.snippets).toEqual(first.snippets);
+      expect(second.snippets).toHaveLength(1);
       expect(second.modules).toEqual(first.modules);
       expect(second.app_settings).toEqual(first.app_settings);
       expect(second.required_secrets).toEqual(first.required_secrets);

@@ -10,6 +10,7 @@ import { setModuleConfig } from "../db/moduleConfig";
 import { createPlaybook } from "../db/playbooks";
 import { createRule } from "../db/rules";
 import { setSetting } from "../db/settings";
+import { createSnippet } from "../db/snippets";
 
 import {
   EXPORT_KIND,
@@ -167,6 +168,69 @@ describe("config exporter", () => {
     const plain = doc.playbooks.find((p) => p.name === "plain");
     expect(sandboxed?.isolation).toBe("sandboxed");
     expect(plain?.isolation).toBeNull();
+  });
+
+  it("exports snippets sorted by (kind, name) with no ids or timestamps", async () => {
+    await createSnippet(
+      { kind: "userdata", name: "setup", content: "apt-get install -y jq" },
+      db
+    );
+    await createSnippet(
+      {
+        kind: "prompt",
+        name: "house-style",
+        description: "Shared prose style",
+        content: "Write terse findings.",
+      },
+      db
+    );
+    await createSnippet(
+      { kind: "prompt", name: "guardrails", content: "Never push." },
+      db
+    );
+    const doc = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      db,
+    });
+    expect(doc.snippets).toEqual([
+      {
+        kind: "prompt",
+        name: "guardrails",
+        description: "",
+        content: "Never push.",
+      },
+      {
+        kind: "prompt",
+        name: "house-style",
+        description: "Shared prose style",
+        content: "Write terse findings.",
+      },
+      {
+        kind: "userdata",
+        name: "setup",
+        description: "",
+        content: "apt-get install -y jq",
+      },
+    ]);
+  });
+
+  it("throws SecretLeakError when a snippet's content embeds a secret value", async () => {
+    await createSnippet(
+      {
+        kind: "userdata",
+        name: "leaky",
+        content: "export TOKEN=deadbeefcafef00d",
+      },
+      db
+    );
+    await expect(
+      exportConfig({
+        nowIso: "2026-07-15T00:00:00.000Z",
+        secrets: [{ name: "TOKEN", value: "deadbeefcafef00d" }],
+        db,
+      })
+    ).rejects.toThrow(/snippet userdata:leaky/);
   });
 
   it("emits no numeric ids anywhere in the document", async () => {

@@ -5,13 +5,16 @@ import { getModuleConfig, setModuleConfig } from "../db/moduleConfig";
 import { createPlaybook, listPlaybooks, updatePlaybook } from "../db/playbooks";
 import { createRule, listRules, updateRule } from "../db/rules";
 import { getSetting, setSetting } from "../db/settings";
+import { createSnippet, listSnippets, updateSnippet } from "../db/snippets";
 import { DEFAULT_LEASE_IMAGE_SETTING } from "../executor/executor";
 import {
   LEASE_ISOLATION_LEVELS,
+  SNIPPET_KINDS,
   type LeaseIsolation,
   type NewPlaybook,
   type RuleDispatchTarget,
   type RuleMatch,
+  type SnippetKind,
 } from "../interfaces";
 import { IDENTITY_ME_SETTING } from "../services/eventIntake";
 
@@ -23,12 +26,14 @@ import {
   type ConfigExportDocument,
   type ExportedPlaybook,
   type ExportedRule,
+  type ExportedSnippet,
 } from "./exporter";
 
 /**
  * config import — the counterpart to {@link import("./exporter").exportConfig}.
  * It takes a portable export document and reproduces its automation setup
- * (playbooks, rules, module config, whitelisted settings) on the local instance.
+ * (playbooks, rules, snippets, module config, whitelisted settings) on the
+ * local instance.
  *
  * SECRET HYGIENE (load-bearing). Like the exporter, this module NEVER touches the
  * secret store: it neither creates, reads, nor modifies secrets. It computes a
@@ -97,6 +102,8 @@ export interface ImportPlan {
   applied: boolean;
   playbooks: ImportPlanItem[];
   rules: ImportPlanItem[];
+  /** Snippet plan items, keyed `<kind>:<name>` — a snippet's stable identity. */
+  snippets: ImportPlanItem[];
   modules: ImportPlanItem[];
   settings: ImportPlanItem[];
   missing_secrets: MissingSecret[];
@@ -183,6 +190,56 @@ function readRules(doc: ConfigExportDocument): ExportedRule[] {
     throw new ImportError("import document rules must be an array");
   }
   return raw as ExportedRule[];
+}
+
+/**
+ * Coerce the document's `snippets` field to an array, tolerating absence (older
+ * exports predate snippets), and validate each entry: `kind` must be one of
+ * {@link SNIPPET_KINDS} and `name`/`content` must be strings (`name` non-empty),
+ * else the import is rejected naming the offending snippet.
+ */
+function readSnippets(doc: ConfigExportDocument): ExportedSnippet[] {
+  const raw = (doc as { snippets?: unknown }).snippets;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new ImportError("import document snippets must be an array");
+  }
+  return raw.map((entry, i) => {
+    if (!isPlainObject(entry)) {
+      throw new ImportError(`import document snippets[${i}] must be an object`);
+    }
+    const { kind, name, content, description } = entry;
+    if (typeof name !== "string" || name.length === 0) {
+      throw new ImportError(
+        `import document snippets[${i}] must have a non-empty string name`
+      );
+    }
+    if (
+      typeof kind !== "string" ||
+      !SNIPPET_KINDS.includes(kind as SnippetKind)
+    ) {
+      throw new ImportError(
+        `snippet "${name}" has invalid kind ${JSON.stringify(kind)} ` +
+          `(expected one of ${SNIPPET_KINDS.map((k) => JSON.stringify(k)).join(
+            ", "
+          )})`
+      );
+    }
+    if (typeof content !== "string") {
+      throw new ImportError(`snippet "${name}" must have string content`);
+    }
+    return {
+      kind: kind as SnippetKind,
+      name,
+      description: typeof description === "string" ? description : "",
+      content,
+    };
+  });
+}
+
+/** A snippet's stable identity string, used as its import plan key. */
+function snippetKeyOf(s: { kind: SnippetKind; name: string }): string {
+  return `${s.kind}:${s.name}`;
 }
 
 /** The playbook's stable identity key, falling back to its name. */
@@ -334,6 +391,7 @@ export async function importConfig(
   const doc = validateDocument(options.document);
   const docPlaybooks = readPlaybooks(doc);
   const docRules = readRules(doc);
+  const docSnippets = readSnippets(doc);
   const docModules = isPlainObject(doc.modules) ? doc.modules : {};
   const docSettings = importableSettings(doc);
 
@@ -347,12 +405,14 @@ export async function importConfig(
   for (const pb of docPlaybooks) docPlaybooksByKey.set(playbookKeyOf(pb), pb);
 
   // Snapshot local state to plan create/skip/overwrite decisions.
-  const [localPlaybooks, localRules] = await Promise.all([
+  const [localPlaybooks, localRules, localSnippets] = await Promise.all([
     listPlaybooks(db),
     listRules(db),
+    listSnippets(undefined, db),
   ]);
   const localPlaybookNames = new Set(localPlaybooks.map((p) => p.name));
   const localRuleNames = new Set(localRules.map((r) => r.name));
+  const localSnippetKeys = new Set(localSnippets.map(snippetKeyOf));
 
   const decide = (exists: boolean): ImportAction =>
     exists ? (mode === "overwrite" ? "overwrite" : "skip") : "create";
@@ -364,6 +424,10 @@ export async function importConfig(
   const rulePlan: ImportPlanItem[] = docRules.map((rule) => ({
     key: rule.name,
     action: decide(localRuleNames.has(rule.name)),
+  }));
+  const snippetPlan: ImportPlanItem[] = docSnippets.map((s) => ({
+    key: snippetKeyOf(s),
+    action: decide(localSnippetKeys.has(snippetKeyOf(s))),
   }));
 
   // Module/setting collision checks read the DB per key.
@@ -437,6 +501,7 @@ export async function importConfig(
     applied: false,
     playbooks: playbookPlan,
     rules: rulePlan,
+    snippets: snippetPlan,
     modules: modulePlan,
     settings: settingPlan,
     missing_secrets: missingSecrets,
@@ -481,6 +546,36 @@ export async function importConfig(
           await updateRule(
             existing.id,
             { name: rule.name, enabled: rule.enabled, match, dispatch },
+            trx
+          );
+        }
+      }
+    }
+
+    // Snippets, keyed by (kind, name). An overwrite patches description and
+    // content in place, keeping the local row's id so nothing referencing it by
+    // name resolves differently afterward.
+    for (const s of docSnippets) {
+      const action = decide(localSnippetKeys.has(snippetKeyOf(s)));
+      if (action === "skip") continue;
+      if (action === "create") {
+        await createSnippet(
+          {
+            kind: s.kind,
+            name: s.name,
+            description: s.description,
+            content: s.content,
+          },
+          trx
+        );
+      } else {
+        const existing = localSnippets.find(
+          (local) => local.kind === s.kind && local.name === s.name
+        );
+        if (existing) {
+          await updateSnippet(
+            existing.id,
+            { description: s.description, content: s.content },
             trx
           );
         }

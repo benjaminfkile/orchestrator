@@ -65,7 +65,7 @@ export function deleteSecret(key: string): Promise<void> {
   });
 }
 
-/** Fetch the portable config export document (playbooks/rules/modules/settings). */
+/** Fetch the portable config export document (playbooks/rules/snippets/modules/settings). */
 export function getConfigExport(): Promise<unknown> {
   return apiFetch<unknown>(`/config/export`);
 }
@@ -103,6 +103,8 @@ export interface ImportPlan {
   applied: boolean;
   playbooks: ImportPlanItem[];
   rules: ImportPlanItem[];
+  /** Snippet plan items, keyed `<kind>:<name>` — a snippet's stable identity. */
+  snippets: ImportPlanItem[];
   modules: ImportPlanItem[];
   settings: ImportPlanItem[];
   missing_secrets: MissingSecret[];
