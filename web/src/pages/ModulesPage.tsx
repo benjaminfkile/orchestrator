@@ -143,10 +143,11 @@ const useStyles = makeStyles({
 });
 
 /**
- * Local, editable form state backing the ADO config card. `people`/`states`/
- * `area_paths` are now multi-select lists (they map 1:1 to the persisted config
- * arrays). Work-item types are NOT part of this draft — they are ephemeral UI
- * state used only to decide which states to fetch, and never persisted.
+ * Local, editable form state backing the ADO config card. `people`/
+ * `work_item_types`/`states`/`area_paths` are multi-select lists (they map 1:1
+ * to the persisted config arrays). `state_mode` mirrors the config's
+ * include/exclude semantics for `states` — without it an exclude watch would
+ * DISPLAY as (and silently save back as) an include watch.
  */
 interface AdoDraft {
   org: string;
@@ -156,7 +157,9 @@ interface AdoDraft {
   interval_seconds: string;
   assignee_mode: "me" | "people" | "any";
   people: string[];
+  work_item_types: string[];
   states: string[];
+  state_mode: "include" | "exclude";
   area_paths: string[];
   current_iteration: boolean;
 }
@@ -169,7 +172,9 @@ const EMPTY_DRAFT: AdoDraft = {
   interval_seconds: "",
   assignee_mode: "any",
   people: [],
+  work_item_types: [],
   states: [],
+  state_mode: "include",
   area_paths: [],
   current_iteration: false,
 };
@@ -187,29 +192,67 @@ function draftFromConfig(config: AdoModuleConfig | null): AdoDraft {
       typeof c.interval_seconds === "number" ? String(c.interval_seconds) : "",
     assignee_mode: w.assignee_mode ?? "any",
     people: w.people ?? [],
+    work_item_types: w.work_item_types ?? [],
     states: w.states ?? [],
+    state_mode: w.state_mode ?? "include",
     area_paths: w.area_paths ?? [],
     current_iteration: w.iteration === "current",
   };
 }
 
-/** Assemble the config payload sent to the API from the current draft. */
-function configFromDraft(draft: AdoDraft): AdoModuleConfig {
-  const watched: WatchedQueryConfig = { assignee_mode: draft.assignee_mode };
+/**
+ * Assemble the config payload sent to the API from the current draft, layered
+ * over the stored config. The PUT replaces the WHOLE object server-side, so
+ * facets this form doesn't model (`pull_requests`, `base_url`, `watched.tags`,
+ * team/explicit iterations) must be carried through from `base` or a save
+ * silently destroys them.
+ */
+function configFromDraft(
+  draft: AdoDraft,
+  base?: AdoModuleConfig | null,
+): AdoModuleConfig {
+  const baseWatched: Partial<WatchedQueryConfig> = base?.watched ?? {};
+  const watched: WatchedQueryConfig = {
+    ...baseWatched,
+    assignee_mode: draft.assignee_mode,
+  };
+  // Facets the form DOES model are rebuilt from the draft below; clear the
+  // carried-over values first so a field emptied in the form is truly removed.
+  delete watched.people;
+  delete watched.work_item_types;
+  delete watched.states;
+  delete watched.state_mode;
+  delete watched.area_paths;
+  delete watched.iteration;
   if (draft.assignee_mode === "people" && draft.people.length > 0) {
     watched.people = draft.people;
   }
-  if (draft.states.length > 0) watched.states = draft.states;
+  if (draft.work_item_types.length > 0) {
+    watched.work_item_types = draft.work_item_types;
+  }
+  if (draft.states.length > 0) {
+    watched.states = draft.states;
+    // `include` is the backend default; only the deny-list needs to be explicit.
+    if (draft.state_mode === "exclude") watched.state_mode = "exclude";
+  }
   if (draft.area_paths.length > 0) watched.area_paths = draft.area_paths;
-  if (draft.current_iteration) watched.iteration = "current";
+  if (draft.current_iteration) {
+    watched.iteration = "current";
+  } else if (baseWatched.iteration && baseWatched.iteration !== "current") {
+    // A team/explicit iteration object has no editor here; the toggle being off
+    // means "not @CurrentIteration", not "drop the stored object".
+    watched.iteration = baseWatched.iteration;
+  }
 
   const config: AdoModuleConfig = {
+    ...(base ?? {}),
     org: draft.org.trim(),
     project: draft.project.trim(),
     pat_secret_ref: draft.pat_secret_ref.trim(),
     enabled: draft.enabled,
     watched,
   };
+  delete config.interval_seconds;
   const interval = Number(draft.interval_seconds.trim());
   if (draft.interval_seconds.trim() !== "" && Number.isFinite(interval) && interval > 0) {
     config.interval_seconds = interval;
@@ -302,12 +345,10 @@ export function ModulesPage() {
   );
 
   // Ephemeral, UI-only cascade state (never persisted):
-  //  - `selectedTypes` narrows which work-item types' states are offered.
   //  - `allTypes` is every discovered type, used to load states when the user
-  //    hasn't narrowed to specific types.
+  //    hasn't narrowed the watch to specific types (draft.work_item_types).
   //  - `iterations` is the fetched iteration list (null = unknown / not loaded)
   //    used only to validate the current-iteration toggle.
-  const [selectedTypes, setSelectedTypes] = useState<string[]>([]);
   const [allTypes, setAllTypes] = useState<string[]>([]);
   const [iterations, setIterations] = useState<string[] | null>(null);
 
@@ -323,6 +364,10 @@ export function ModulesPage() {
   // untouched form (safe to adopt server changes) from one the user is editing
   // (must be left alone).
   const loadedDraftRef = useRef<AdoDraft>(EMPTY_DRAFT);
+
+  // The raw stored config as last loaded, so a save can carry through the
+  // facets this form has no editor for (see configFromDraft).
+  const loadedConfigRef = useRef<AdoModuleConfig | null>(null);
 
   // Feeds the PAT picker AND keeps the page's copy of the known names in sync so
   // the does-not-exist warning tracks the same fetch.
@@ -342,6 +387,7 @@ export function ModulesPage() {
       setModules(nextModules);
       const loaded = draftFromConfig(cfg.config);
       loadedDraftRef.current = loaded;
+      loadedConfigRef.current = cfg.config;
       setDraft(loaded);
       setError(null);
     } catch (err) {
@@ -374,6 +420,7 @@ export function ModulesPage() {
           return prev; // user is editing; leave their draft untouched
         }
         loadedDraftRef.current = loaded;
+        loadedConfigRef.current = cfg.config;
         return loaded;
       });
       setError(null);
@@ -412,10 +459,20 @@ export function ModulesPage() {
   const project = draft.project.trim();
 
   // Work-item types are project-scoped; drop any prior type selection whenever
-  // the org/project changes so stale types never drive the states picker.
+  // the org/project CHANGES so stale types never drive the states picker. The
+  // guard skips the initial (empty → loaded) transition — the types now live in
+  // the persisted draft, and clearing them on load would wipe the stored watch.
+  const prevScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    setSelectedTypes([]);
+    const scope = `${org} ${project}`;
+    const prev = prevScopeRef.current;
+    prevScopeRef.current = scope;
     setAllTypes([]);
+    if (prev !== null && prev !== " " && prev !== scope) {
+      setDraft((d) =>
+        d.work_item_types.length > 0 ? { ...d, work_item_types: [] } : d,
+      );
+    }
   }, [org, project]);
 
   // Fetch the project's iterations purely to validate the current-iteration
@@ -459,15 +516,16 @@ export function ModulesPage() {
 
   const loadStates = useCallback(async (): Promise<AsyncComboboxOption[]> => {
     if (!org || !project) return [];
-    // States are per-type: fetch for the narrowed selection, else for every
+    // States are per-type: fetch for the watched selection, else for every
     // discovered type, unioning the results.
-    const types = selectedTypes.length > 0 ? selectedTypes : allTypes;
+    const types =
+      draft.work_item_types.length > 0 ? draft.work_item_types : allTypes;
     if (types.length === 0) return [];
     const perType = await Promise.all(
       types.map((type) => getAdoStates(org, project, type)),
     );
     return uniq(perType.flat()).map((value) => ({ value }));
-  }, [org, project, selectedTypes, allTypes]);
+  }, [org, project, draft.work_item_types, allTypes]);
 
   const loadAreaPaths = useCallback(async (): Promise<AsyncComboboxOption[]> => {
     if (!org || !project) return [];
@@ -510,7 +568,10 @@ export function ModulesPage() {
     setSaveError(null);
     setSaved(false);
     try {
-      await putModuleConfig(ADO_MODULE_ID, configFromDraft(draft));
+      await putModuleConfig(
+        ADO_MODULE_ID,
+        configFromDraft(draft, loadedConfigRef.current),
+      );
       if (!mounted.current) return;
       setSaved(true);
       await refresh();
@@ -780,19 +841,16 @@ export function ModulesPage() {
                 multiselect
                 label="Work item types"
                 aria-label="Work item types"
-                hint="Narrows which states are offered below; not saved."
+                hint="Limits the watch to these types; blank matches any. Also narrows which states are offered below."
                 placeholder="Bug"
-                value={selectedTypes}
-                onChange={(v) => {
-                  setSaved(false);
-                  setSelectedTypes(v);
-                }}
+                value={draft.work_item_types}
+                onChange={(v) => patch({ work_item_types: v })}
                 load={loadTypes}
                 onLoaded={captureTypes}
               />
 
               <AsyncCombobox
-                key={`states-${org}-${project}-${selectedTypes.join("|")}-${allTypes.join("|")}`}
+                key={`states-${org}-${project}-${draft.work_item_types.join("|")}-${allTypes.join("|")}`}
                 multiselect
                 label="States"
                 aria-label="States"
@@ -802,6 +860,26 @@ export function ModulesPage() {
                 onChange={(v) => patch({ states: v })}
                 load={loadStates}
               />
+
+              {draft.states.length > 0 && (
+                <Field label="State mode">
+                  <RadioGroup
+                    value={draft.state_mode}
+                    onChange={(_, d) =>
+                      patch({ state_mode: d.value as AdoDraft["state_mode"] })
+                    }
+                  >
+                    <Radio
+                      value="include"
+                      label="Watch only these states"
+                    />
+                    <Radio
+                      value="exclude"
+                      label="Watch every state except these"
+                    />
+                  </RadioGroup>
+                </Field>
+              )}
 
               <AsyncCombobox
                 key={`areas-${org}-${project}`}

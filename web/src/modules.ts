@@ -42,12 +42,22 @@ export interface WatchedQueryConfig {
   assignee_mode: "me" | "people" | "any";
   /** Identities OR-ed on assignee when `assignee_mode` is `people`. */
   people?: string[];
+  /** Work-item types to OR-match; omitted watches every type. */
+  work_item_types?: string[];
   /** Work-item states to OR-match. */
   states?: string[];
+  /** Whether `states` is an allow-list (`include`, the default) or a deny-list
+   * (`exclude` → every state EXCEPT the listed ones). Ignored when `states` is
+   * empty. */
+  state_mode?: "include" | "exclude";
   /** Area-path roots to match UNDER. */
   area_paths?: string[];
-  /** `current` limits to the current iteration; null/omitted watches all. */
-  iteration?: "current" | null;
+  /** `current` limits to the current iteration; the backend also supports
+   * team/explicit iteration objects (no editor here — preserved on save);
+   * null/omitted watches all. */
+  iteration?: "current" | Record<string, unknown> | null;
+  /** Tags AND-ed on the watch; no editor here — preserved on save. */
+  tags?: string[];
 }
 
 /** The ADO module's persisted config. Mirrors the backend `AdoModuleConfig`. */
@@ -64,6 +74,9 @@ export interface AdoModuleConfig {
   watched?: WatchedQueryConfig;
   /** Overrides the ADO base URL (rarely needed). */
   base_url?: string;
+  /** The additive pull-request poller config. Opaque to this form — preserved
+   * on save. */
+  pull_requests?: Record<string, unknown>;
 }
 
 /**

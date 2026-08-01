@@ -349,6 +349,98 @@ describe("ModulesPage", () => {
     });
   });
 
+  it("round-trips an exclude watch and unmodeled config facets on save", async () => {
+    // The regression this guards: an exclude watch used to DISPLAY as a bare
+    // states list (reading as an include watch) and saving flipped it to one,
+    // while work_item_types and pull_requests were silently dropped.
+    mockGetAdoWorkItemTypes.mockResolvedValue(["Bug", "User Story", "Task"]);
+    mockGetAdoStates.mockResolvedValue(["Closed", "Removed", "Active"]);
+    setConfig({
+      org: "contoso",
+      project: "Platform",
+      pat_secret_ref: "ado_pat",
+      enabled: true,
+      interval_seconds: 60,
+      pull_requests: { enabled: false },
+      watched: {
+        assignee_mode: "any",
+        work_item_types: ["Bug", "User Story"],
+        states: ["Closed", "Removed"],
+        state_mode: "exclude",
+        area_paths: ["Platform\\Backend"],
+      },
+    });
+    render(<ModulesPage />);
+    await waitFor(() => expect(combobox("Organization").value).toBe("contoso"));
+
+    // The deny-list semantics are surfaced, not rendered as an include watch…
+    expect(
+      (screen.getByRole("radio", {
+        name: "Watch every state except these",
+      }) as HTMLInputElement).checked,
+    ).toBe(true);
+    // …and the stored types render as watch tags (no longer ephemeral).
+    expect(screen.getByText("User Story")).toBeTruthy();
+
+    // Saving the untouched form must write back exactly what was stored.
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mockPutModuleConfig).toHaveBeenCalledTimes(1));
+    expect(mockPutModuleConfig).toHaveBeenCalledWith("ado", {
+      org: "contoso",
+      project: "Platform",
+      pat_secret_ref: "ado_pat",
+      enabled: true,
+      interval_seconds: 60,
+      pull_requests: { enabled: false },
+      watched: {
+        assignee_mode: "any",
+        work_item_types: ["Bug", "User Story"],
+        states: ["Closed", "Removed"],
+        state_mode: "exclude",
+        area_paths: ["Platform\\Backend"],
+      },
+    });
+  });
+
+  it("saves types and an exclude state mode chosen in the form", async () => {
+    // Empty option lists so each freeform Enter commits a fresh tag.
+    mockGetAdoWorkItemTypes.mockResolvedValue([]);
+    mockGetAdoStates.mockResolvedValue([]);
+    render(<ModulesPage />);
+    await waitFor(() => expect(combobox("Project").value).toBe("Platform"));
+
+    const types = combobox("Work item types");
+    fireEvent.focus(types);
+    fireEvent.change(types, { target: { value: "Bug" } });
+    fireEvent.keyDown(types, { key: "Enter" });
+
+    // The state-mode picker only appears once a state is selected.
+    expect(screen.queryByRole("radio", { name: "Watch only these states" })).toBeNull();
+    const states = combobox("States");
+    fireEvent.focus(states);
+    fireEvent.change(states, { target: { value: "Closed" } });
+    fireEvent.keyDown(states, { key: "Enter" });
+
+    fireEvent.click(
+      screen.getByRole("radio", { name: "Watch every state except these" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mockPutModuleConfig).toHaveBeenCalledTimes(1));
+    expect(mockPutModuleConfig).toHaveBeenCalledWith("ado", {
+      org: "contoso",
+      project: "Platform",
+      pat_secret_ref: "",
+      enabled: false,
+      watched: {
+        assignee_mode: "any",
+        work_item_types: ["Bug"],
+        states: ["Closed"],
+        state_mode: "exclude",
+      },
+    });
+  });
+
   it("still saves typed values when discovery fails (degrades gracefully)", async () => {
     // Every discovery read rejects — pickers surface the error inline but stay
     // freeform, and the form still saves.
