@@ -142,6 +142,12 @@ steps?, granted_capabilities?, output_kind?}\`.
   value outside the allowed set is a \`400\` at save time. Note
   \`GET /api/wisper/hosts\` does NOT expose isolation levels, so you cannot
   pre-check support — a mismatch surfaces as the dispatch failure.
+- \`resources\` (optional \`{cpus?, memory_mb?, pids?}\`): only forwarded in
+  \`dev\` mode. In \`v1\` mode resources are fixed by the selected offer server-side,
+  so the field is IGNORED at lease creation and \`POST /v1/leases\` NEVER carries
+  \`resources\` or a top-level \`gpus\` (the server rejects either with a \`400\`
+  \`validation_error\`). It is kept in the playbook body for dev-mode use and
+  round-trips through save/list unchanged.
 - \`runner\` (see \`GET /api/runners\`):
   - \`claude-code\` (default): runs Claude Code in the lease against the
     rendered \`prompt_template\`. \`runner_config\`: \`{model?, allowed_tools?}\`
