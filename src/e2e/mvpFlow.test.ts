@@ -36,6 +36,7 @@ import type { NewEvent, PlaybookRecord } from "../interfaces";
 import { createLogger, type Logger } from "../log";
 import { emitEvent } from "../services/eventIntake";
 import { Dispatcher } from "../services/dispatcher";
+import type { HostImageResolver } from "../wisper/catalog";
 import { WisperClient } from "../wisper/client";
 
 import { FakeWisper, type ScriptedUsage } from "./fakeWisper";
@@ -96,10 +97,22 @@ describe("E2E: full MVP flow against a fake wisper", () => {
     fs.rmSync(logDir, { recursive: true, force: true });
   });
 
-  function makeDispatcher(): Dispatcher {
+  function makeDispatcher(mode: "dev" | "v1" = "dev"): Dispatcher {
+    // In v1 mode the client authenticates and resolves the (host, image) NAMES
+    // against the catalog before leasing. Fake both so the dispatcher can exercise
+    // the v1 lease surface without a real wisper.
+    const catalog: HostImageResolver = {
+      resolve: async (hostSelector, imageName) => ({
+        host_id: hostSelector,
+        host_image_id: imageName,
+      }),
+    };
     const wisper = new WisperClient({
       baseUrl: fake.baseUrl,
       hostId: "host-e2e",
+      mode,
+      resolveApiKey: () => "wck_test",
+      catalog,
       timeoutMs: 5000,
       logger: silentLogger(),
     });
@@ -239,6 +252,37 @@ describe("E2E: full MVP flow against a fake wisper", () => {
     // One lease per dispatch, each released, in the same order.
     expect(fake.createRequests).toHaveLength(2);
     expect(fake.deletedLeases).toEqual(["lease-1", "lease-2"]);
+  });
+
+  it("drives a v1-mode dispatch end-to-end: create → exec → release, with no resources/gpus in the v1 body", async () => {
+    fake.scriptRuns([{ exitCode: 0, resultText: "ok", usage: USAGE }]);
+    await seedRule();
+
+    await emitEvent(assignedEvent("v1", "Investigate v1"), db, {
+      logger: silentLogger(),
+    });
+    const queued = await listDispatches("queued", db);
+    expect(queued).toHaveLength(1);
+    const dispatchId = queued[0].id;
+
+    // A v1 dispatcher — the fake enforces the v1 body contract (a POST that
+    // carries `resources` or `gpus` is rejected 400 validation_error) and any
+    // regression there would fail the create call and leave the dispatch failed.
+    const d = makeDispatcher("v1");
+    await drain(d);
+
+    expect((await getDispatch(dispatchId, db))?.status).toBe("done");
+    expect(fake.createRequests).toHaveLength(1);
+    const createBody = fake.createRequests[0];
+    expect(createBody).not.toHaveProperty("resources");
+    expect(createBody).not.toHaveProperty("gpus");
+    expect(createBody.host_id).toBe("host-e2e");
+    // v1 fake mints ids as `lease-<n>` in its v1 response envelope, and the
+    // executor releases exactly the lease it created.
+    expect(fake.deletedLeases).toEqual(["lease-1"]);
+    // The full lifecycle: at least one exec (the streamed agent step) and the
+    // release above.
+    expect(fake.execs.some((e) => e.streaming)).toBe(true);
   });
 
   it("fails the dispatch on a non-zero agent exit but still releases the lease", async () => {

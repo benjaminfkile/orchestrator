@@ -160,7 +160,46 @@ export class FakeWisper {
       return;
     }
 
-    const execMatch = url.match(/^\/dev\/leases\/([^/?]+)\/exec/);
+    if (method === "POST" && url === "/v1/leases") {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      this.createRequests.push(parsed);
+      // Mirror the real wisper-api v1 contract: resources are fixed by the
+      // selected offer server-side, so any body carrying a `resources` object
+      // or a top-level `gpus` is rejected with a 400 validation_error. This is
+      // the shape that RejectClientResourceKnobs enforces on the real server —
+      // the fake enforces it so orchestrator tests catch the drift class.
+      if (
+        Object.prototype.hasOwnProperty.call(parsed, "resources") ||
+        Object.prototype.hasOwnProperty.call(parsed, "gpus")
+      ) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: "validation_error",
+              message: "resources are fixed by the selected offer",
+            },
+          })
+        );
+        return;
+      }
+      const leaseId = `lease-${this.nextLease++}`;
+      const { isolation } = parsed;
+      setTimeout(() => {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: leaseId,
+            wisp_contract_id: `wisp-${leaseId}`,
+            status: "ready",
+            ...(isolation !== undefined ? { isolation } : {}),
+          })
+        );
+      }, this.createDelayMs);
+      return;
+    }
+
+    const execMatch = url.match(/^\/(?:dev|v1)\/leases\/([^/?]+)\/exec/);
     if (method === "POST" && execMatch) {
       const leaseId = decodeURIComponent(execMatch[1]);
       const command = (JSON.parse(body) as { command?: string }).command ?? "";
@@ -177,7 +216,7 @@ export class FakeWisper {
       return;
     }
 
-    const delMatch = url.match(/^\/dev\/leases\/([^/?]+)/);
+    const delMatch = url.match(/^\/(?:dev|v1)\/leases\/([^/?]+)/);
     if (method === "DELETE" && delMatch) {
       this.deletedLeases.push(decodeURIComponent(delMatch[1]));
       res.writeHead(200, { "content-type": "application/json" });

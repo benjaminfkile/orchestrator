@@ -1081,11 +1081,6 @@ export class WisperClient {
       hasEnv: env !== undefined && Object.keys(env).length > 0,
     });
 
-    const sharedResources = {
-      cpus: resources.cpus,
-      memory_mb: resources.memory_mb,
-      pids: resources.pids,
-    };
     // The effective host selector: an explicit per-playbook `host`, else the
     // client's configured host id (`WISPER_HOST_ID`).
     const hostSelector = params.host ?? this.hostId;
@@ -1105,11 +1100,14 @@ export class WisperClient {
         isolation,
         signal
       );
+      // Resources are fixed by the selected offer server-side and MUST NOT be
+      // sent on v1 — POST /v1/leases rejects any body carrying `resources` or a
+      // top-level `gpus`. `CreateLeaseParams.resources` still parameterizes the
+      // dev-mode body (kept below).
       body = {
         host_id: resolved.host_id,
         host_image_id: resolved.host_image_id,
         network,
-        resources: sharedResources,
         ttl_seconds,
         userdata,
         env,
@@ -1121,7 +1119,11 @@ export class WisperClient {
         hostId: hostSelector,
         image,
         network,
-        resources: sharedResources,
+        resources: {
+          cpus: resources.cpus,
+          memory_mb: resources.memory_mb,
+          pids: resources.pids,
+        },
         ttl_seconds,
         userdata,
         env,

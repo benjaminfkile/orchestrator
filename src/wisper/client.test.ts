@@ -975,15 +975,29 @@ describe("WisperClient", () => {
       expect(req.url).toBe("/v1/leases");
       expect(req.headers.authorization).toBe(`Bearer ${API_KEY}`);
       // The v1 body is fully snake_case and carries catalog ids, not `hostId`.
+      // Resources are fixed by the selected offer server-side, so no `resources`
+      // or `gpus` is sent — v1 rejects any body carrying either.
       expect(JSON.parse(req.body)).toEqual({
         host_id: "host-1",
         host_image_id: "ghcr.io/example/runner:latest",
         network: "open",
-        resources: { cpus: 2, memory_mb: 2048, pids: 256 },
         ttl_seconds: 600,
         userdata: "#!/bin/sh\necho hi",
         env: { API_TOKEN: "s3cr3t-value" },
       });
+    });
+
+    it("createLease never sends resources or gpus on v1 (server rejects both)", async () => {
+      mock.respondWith({
+        status: 201,
+        body: { id: "lease-v1", wisp_contract_id: "wisp-v1", status: "ready" },
+      });
+
+      await v1Client().createLease(createParams());
+
+      const sent = JSON.parse(mock.requests[0].body);
+      expect(sent).not.toHaveProperty("resources");
+      expect(sent).not.toHaveProperty("gpus");
     });
 
     it("createLease sends isolation in the v1 body and passes it to the resolver", async () => {
