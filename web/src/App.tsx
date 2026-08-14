@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Button,
   DrawerBody,
@@ -352,15 +352,8 @@ function MobileNav() {
 /** The routed page content, shared by both layouts. */
 function RoutedContent() {
   const styles = useStyles();
-  const mainRef = useRef<HTMLElement>(null);
-  // Shield the scroll region from Fluent's dropdown-open scroll bug (see
-  // scrollGuard.ts for the full mechanism).
-  useEffect(() => {
-    if (!mainRef.current) return;
-    return installListboxScrollGuard(mainRef.current);
-  }, []);
   return (
-    <main ref={mainRef} className={styles.content}>
+    <main className={styles.content}>
       <Routes>
         {NAV_ITEMS.map((item) => {
           if (item.path === "/") {
@@ -408,6 +401,10 @@ function AppShell() {
   const styles = useStyles();
   const { theme } = useTheme();
   const isNarrow = useMediaQuery(NARROW_QUERY);
+  // Shield every scrollable region — the routed content, dialog bodies,
+  // drawers — from Fluent's dropdown-open scroll bug (see scrollGuard.ts).
+  // Installed once at the shell so nested scroll containers are covered too.
+  useEffect(() => installListboxScrollGuard(), []);
   return (
     <FluentProvider
       theme={theme}
