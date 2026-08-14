@@ -309,6 +309,12 @@ export type DispatchStatus =
 /**
  * A persisted dispatch as stored in the `dispatches` table: one queued unit of
  * work pairing an event with the playbook to run against it.
+ *
+ * Lease release bookkeeping (`released_at` and `release_pending`) is present on
+ * every dispatch, terminal or not: the executor's in-line release retries and
+ * the periodic sweep both key on it so a failed release is never abandoned. A
+ * `released_at` of `null` on a row with a non-null `lease_id` means the lease
+ * is still owed to wisper regardless of the dispatch's lifecycle state.
  */
 export interface DispatchRecord {
   id: number;
@@ -320,6 +326,20 @@ export interface DispatchRecord {
   wisp_contract_id: string | null;
   attempts: number;
   error: string | null;
+  /**
+   * Timestamp (ms since epoch) when the lease was successfully released, or
+   * `null` when either no lease was ever created OR the release has not yet
+   * succeeded. The sweep queries for `lease_id IS NOT NULL AND released_at IS
+   * NULL` so a stuck release keeps retrying past the dispatch's terminal state.
+   */
+  released_at: number | null;
+  /**
+   * Set to true when the executor's in-line release retries were exhausted, so
+   * the periodic sweep knows to keep trying. Cleared when the sweep finally
+   * succeeds. `released_at IS NULL` is the actual sweep predicate; this flag is
+   * a display hint (and a way for operators to spot leases stuck needing help).
+   */
+  release_pending: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -338,6 +358,8 @@ export interface NewDispatch {
   wisp_contract_id?: string | null;
   attempts?: number;
   error?: string | null;
+  released_at?: number | null;
+  release_pending?: boolean;
 }
 
 /** Mutable fields of a dispatch. Any omitted field is left unchanged. */
@@ -347,6 +369,8 @@ export interface DispatchUpdate {
   wisp_contract_id?: string | null;
   attempts?: number;
   error?: string | null;
+  released_at?: number | null;
+  release_pending?: boolean;
 }
 
 /**

@@ -21,6 +21,7 @@ import * as playbookRunner from "./20260713000018_playbook_runner";
 import * as snippets from "./20260713000019_snippets";
 import * as playbookHost from "./20260713000020_playbook_host";
 import * as playbookIsolation from "./20260713000021_playbook_isolation";
+import * as dispatchReleaseTracking from "./20260713000022_dispatch_release_tracking";
 
 type Migration = {
   up: (knex: Knex) => Promise<void>;
@@ -58,6 +59,7 @@ const migrations: Record<string, Migration> = {
   "20260713000019_snippets": snippets,
   "20260713000020_playbook_host": playbookHost,
   "20260713000021_playbook_isolation": playbookIsolation,
+  "20260713000022_dispatch_release_tracking": dispatchReleaseTracking,
 };
 
 export const migrationSource: Knex.MigrationSource<string> = {

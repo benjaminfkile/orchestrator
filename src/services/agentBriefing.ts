@@ -236,6 +236,12 @@ rename therefore breaks every reference by design.
   A dispatch held by the run/token budget gate stays \`queued\` annotated with
   \`{waiting_reason: "budget", window_count, budget, next_eligible_at, ...}\` —
   check those fields when a dispatch seems stuck.
+- Lease release bookkeeping: \`released_at\` (ms since epoch or null) is the
+  timestamp of a successful lease release; \`release_pending: true\` marks a row
+  whose lease release is stuck retrying. A periodic sweep runs while the
+  dispatcher is up and reattempts release for any dispatch with a non-null
+  \`lease_id\` and a null \`released_at\`, regardless of the dispatch's terminal
+  status. A wisper "not_found" response is treated as a successful release.
 - Runs: \`GET /api/runs/:id\` -> run + collected output + findings. \`GET
   /api/runs\` also takes \`?limit=\` (1..1000) and \`?status=\` (a dispatch status).
 

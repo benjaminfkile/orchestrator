@@ -36,7 +36,12 @@ import {
   updateDispatch,
 } from "../db/dispatches";
 import { getSetting } from "../db/settings";
-import { runDispatch, type EnvResolver } from "../executor/executor";
+import {
+  DEFAULT_SWEEP_BACKOFF_MS,
+  runDispatch,
+  sweepPendingReleases,
+  type EnvResolver,
+} from "../executor/executor";
 import type { DispatchRecord } from "../interfaces";
 import { log, type Logger } from "../log";
 import type { WisperClient } from "../wisper/client";
@@ -56,6 +61,12 @@ export const MAX_ATTEMPTS_SETTING = "dispatch_max_attempts";
 export const DEFAULT_INTERVAL_SECONDS = 30;
 /** Retry ceiling when `dispatch_max_attempts` is unset. */
 export const DEFAULT_MAX_ATTEMPTS = 3;
+/**
+ * Period, in seconds, of the periodic release sweep the dispatcher arms while
+ * it is running. Matches the executor's per-lease backoff so a stranded lease
+ * gets one retry per sweep tick without hot-looping.
+ */
+export const DEFAULT_SWEEP_INTERVAL_SECONDS = 60;
 
 /** Injected collaborators for a {@link Dispatcher}. */
 export interface DispatcherDeps {
@@ -141,6 +152,13 @@ export class Dispatcher {
   /** Safety-interval handle; undefined while stopped. */
   private timer: ReturnType<typeof setInterval> | undefined;
   /**
+   * Handle for the periodic {@link sweepPendingReleases} timer; undefined
+   * while stopped or when leasing is unconfigured. Runs alongside the
+   * dispatcher loop so a lease whose in-line release failed keeps being
+   * retried until wisper acknowledges.
+   */
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  /**
    * Set by stop(): no new pass starts and no new dispatch is claimed. A freshly
    * constructed dispatcher is not stopped, so a direct {@link Dispatcher.kick}
    * (without a preceding {@link Dispatcher.start}) still drives a pass.
@@ -199,8 +217,38 @@ export class Dispatcher {
     // Never let the safety interval hold the process open on its own.
     this.timer.unref?.();
 
+    // Arm the periodic release sweep so a lease whose in-line release failed
+    // keeps being retried while the dispatcher is running. Best-effort: a
+    // sweep failure logs and moves on — it must never break the drain loop.
+    this.sweepTimer = setInterval(
+      () => void this.runSweep(),
+      DEFAULT_SWEEP_INTERVAL_SECONDS * 1000
+    );
+    this.sweepTimer.unref?.();
+
     this.logger.info("dispatcher started", { intervalSeconds });
     this.kick();
+  }
+
+  /**
+   * Run one release-sweep pass. Wrapped so a failure never propagates out of
+   * the timer callback: release sweeping is housekeeping and must never crash
+   * the process the way an unhandled rejection would.
+   */
+  private async runSweep(): Promise<void> {
+    if (this.stopped || !this.wisper) return;
+    try {
+      await sweepPendingReleases({
+        wisper: this.wisper,
+        db: this.db,
+        logger: this.logger,
+        execTimeoutMs: this.execTimeoutMs,
+        backoffMs: DEFAULT_SWEEP_BACKOFF_MS,
+        now: this.now,
+      });
+    } catch (err) {
+      this.logger.error("release sweep failed", { error: errorMessage(err) });
+    }
   }
 
   /**
@@ -213,6 +261,10 @@ export class Dispatcher {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
+    }
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
     }
     await this.loopPromise;
     this.logger.info("dispatcher stopped");
