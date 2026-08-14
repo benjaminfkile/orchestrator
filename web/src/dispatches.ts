@@ -96,6 +96,8 @@ export interface Dispatch extends Partial<WaitingReason>, Partial<SubjectFields>
   wisp_contract_id: string | null;
   attempts: number;
   error: string | null;
+  released_at: number | null;
+  release_pending: boolean;
   created_at: number;
   updated_at: number;
 }

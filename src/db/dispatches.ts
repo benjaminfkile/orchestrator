@@ -24,6 +24,9 @@ interface DispatchRow {
   wisp_contract_id: string | null;
   attempts: number;
   error: string | null;
+  released_at: number | null;
+  // sqlite stores booleans as 0/1; treat any truthy as true.
+  release_pending: number | boolean | null;
   created_at: number;
   updated_at: number;
 }
@@ -40,6 +43,8 @@ function fromRow(row: DispatchRow): DispatchRecord {
     wisp_contract_id: row.wisp_contract_id,
     attempts: row.attempts,
     error: row.error,
+    released_at: row.released_at ?? null,
+    release_pending: Boolean(row.release_pending),
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -91,6 +96,8 @@ const DISPATCH_SUBJECT_COLUMNS = [
   "dispatches.wisp_contract_id as wisp_contract_id",
   "dispatches.attempts as attempts",
   "dispatches.error as error",
+  "dispatches.released_at as released_at",
+  "dispatches.release_pending as release_pending",
   "dispatches.created_at as created_at",
   "dispatches.updated_at as updated_at",
   "events.type as event_type",
@@ -132,6 +139,8 @@ export async function createDispatch(
       wisp_contract_id: dispatch.wisp_contract_id ?? null,
       attempts: dispatch.attempts ?? 0,
       error: dispatch.error ?? null,
+      released_at: dispatch.released_at ?? null,
+      release_pending: dispatch.release_pending ? 1 : 0,
       created_at: now,
       updated_at: now,
     })
@@ -325,6 +334,10 @@ export async function updateDispatch(
   }
   if (patch.attempts !== undefined) changes.attempts = patch.attempts;
   if ("error" in patch) changes.error = patch.error ?? null;
+  if ("released_at" in patch) changes.released_at = patch.released_at ?? null;
+  if (patch.release_pending !== undefined) {
+    changes.release_pending = patch.release_pending ? 1 : 0;
+  }
   const count = await db<DispatchRow>("dispatches").where({ id }).update(changes);
   if (count === 0) return undefined;
   publishChange("dispatches");
@@ -350,4 +363,21 @@ export async function resetToQueued(
   if (count === 0) return undefined;
   publishChange("dispatches");
   return getDispatch(id, db);
+}
+
+/**
+ * List dispatches whose lease is still owed to wisper — a non-null `lease_id`
+ * with `released_at` still null — regardless of the dispatch's lifecycle state.
+ * Terminal (done/failed) rows are included by design: a successful run whose
+ * release DELETE failed strands a real lease on the host, and the sweep must
+ * keep retrying it until wisper acknowledges.
+ */
+export async function listDispatchesWithPendingRelease(
+  db: Knex = getDb()
+): Promise<DispatchRecord[]> {
+  const rows = await db<DispatchRow>("dispatches")
+    .whereNotNull("lease_id")
+    .whereNull("released_at")
+    .orderBy("id", "asc");
+  return rows.map(fromRow);
 }

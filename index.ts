@@ -6,7 +6,10 @@ import { getConfig } from "./src/config";
 import { getModuleConfig } from "./src/db/moduleConfig";
 import { runMigrations } from "./src/db/migrate";
 import { createSecretEnvResolver } from "./src/executor/envResolver";
-import { reconcileOrphanedDispatches } from "./src/executor/executor";
+import {
+  reconcileOrphanedDispatches,
+  sweepPendingReleases,
+} from "./src/executor/executor";
 import { log } from "./src/log";
 import { ADO_MODULE_ID, createAdoModule } from "./src/modules/ado/poller";
 import {
@@ -43,6 +46,25 @@ async function main() {
     wisper,
     execTimeoutMs: config.wisperExecTimeoutMs,
   });
+
+  // Also sweep for any dispatch (terminal or not) whose lease was never
+  // released: e.g. a done row whose finally-block DELETE lost the race with a
+  // process crash, or a release_pending row left by a prior boot. The
+  // dispatcher will keep running this sweep on a timer once it starts; this
+  // one-shot at boot catches leaks BEFORE any new dispatch runs. Best-effort:
+  // a sweep failure must not block startup.
+  if (wisper) {
+    try {
+      await sweepPendingReleases({
+        wisper,
+        execTimeoutMs: config.wisperExecTimeoutMs,
+      });
+    } catch (err) {
+      log.error("boot-time release sweep failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Trim terminal run history down to the `run_retention_max` cap once at boot,
   // so a lowered cap takes effect immediately rather than only after the next
@@ -115,6 +137,44 @@ async function main() {
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  // Process-level fatal-error guards. A crash on an unhandled rejection or an
+  // uncaught exception would otherwise skip the executor's finally block and
+  // strand any lease it was holding. Best-effort: run the release sweep so any
+  // pending release is attempted one last time, then exit so a supervisor can
+  // restart cleanly (Node's default behavior on these events, made explicit).
+  const emergencySweepAndExit = (kind: string, err: unknown): void => {
+    log.error(kind, { error: err instanceof Error ? err.message : String(err) });
+    const bail = () => process.exit(1);
+    // Guard against never returning: hard-exit after a short budget even if
+    // the sweep itself hangs on the network.
+    const bailTimer = setTimeout(bail, 5000);
+    bailTimer.unref?.();
+    void (async () => {
+      try {
+        if (wisper) {
+          await sweepPendingReleases({
+            wisper,
+            execTimeoutMs: config.wisperExecTimeoutMs,
+          });
+        }
+      } catch (sweepErr) {
+        log.error("emergency release sweep failed", {
+          error:
+            sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+        });
+      } finally {
+        clearTimeout(bailTimer);
+        bail();
+      }
+    })();
+  };
+  process.on("unhandledRejection", (reason) =>
+    emergencySweepAndExit("unhandledRejection", reason)
+  );
+  process.on("uncaughtException", (err) =>
+    emergencySweepAndExit("uncaughtException", err)
+  );
 }
 
 main().catch((err) => {

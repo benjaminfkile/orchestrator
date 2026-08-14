@@ -60,6 +60,8 @@ function dispatch(
     wisp_contract_id: null,
     attempts: 1,
     error: null,
+    released_at: null,
+    release_pending: false,
     created_at: 1_700_000_000_000,
     updated_at: 1_700_000_200_000,
     subject_kind: "workitem",

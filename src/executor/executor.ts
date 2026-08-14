@@ -35,7 +35,12 @@
 import type { Knex } from "knex";
 
 import { getDb } from "../db/db";
-import { getDispatch, listDispatches, updateDispatch } from "../db/dispatches";
+import {
+  getDispatch,
+  listDispatches,
+  listDispatchesWithPendingRelease,
+  updateDispatch,
+} from "../db/dispatches";
 import { getEventById } from "../db/events";
 import { createFinding } from "../db/findings";
 import { getModuleConfig } from "../db/moduleConfig";
@@ -456,6 +461,54 @@ async function resolveDeadlineSeconds(
     }
   }
   return deadline;
+}
+
+/**
+ * Backoff (ms) between the in-line release retries the executor's `finally`
+ * runs before flipping the dispatch to `release_pending`. Small and bounded —
+ * the pipeline holds the dispatch open here, so it must NOT wait long: a real
+ * outage is left to the periodic sweep. Growth is exponential.
+ */
+export const RELEASE_RETRY_BACKOFFS_MS: readonly number[] = [200, 500];
+
+/**
+ * Best-effort release with retries. Treats wisper's `not_found` response
+ * (HTTP 404 — the server no longer knows this lease, or it was already
+ * released) as SUCCESS, since the desired state is achieved. A retryable
+ * {@link WisperApiError} (`host_offline`, `upstream_timeout`, client-side
+ * timeout — see {@link RETRYABLE_CODES}) triggers a bounded backoff-retry;
+ * a non-retryable error returns immediately. Never throws — the caller
+ * inspects `.ok` and either records success or flags for the sweep.
+ */
+export async function attemptLeaseRelease(
+  wisper: WisperClient,
+  leaseId: string,
+  execTimeoutMs: number,
+  backoffsMs: readonly number[] = RELEASE_RETRY_BACKOFFS_MS
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const totalAttempts = backoffsMs.length + 1;
+  let lastError = "";
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    try {
+      await wisper.releaseLease(leaseId, { timeoutMs: execTimeoutMs });
+      return { ok: true };
+    } catch (err) {
+      // A `not_found` reply means wisper has no record of this lease anymore
+      // — either it was already released, or its TTL failsafe reaped it — so
+      // the desired end state is reached and the caller should stop retrying.
+      if (err instanceof WisperApiError && err.code === "not_found") {
+        return { ok: true };
+      }
+      lastError = errorMessage(err);
+      const retryable = err instanceof WisperApiError && err.retryable;
+      if (!retryable) break;
+      // Backoff before the next try; the last attempt has no trailing wait.
+      if (attempt < backoffsMs.length) {
+        await new Promise((resolve) => setTimeout(resolve, backoffsMs[attempt]));
+      }
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 /**
@@ -918,19 +971,34 @@ export async function runDispatch(
     detachExternalSignal();
     dispatchLog.close();
     // HARD RULE: whenever a lease was created it is released on EVERY path.
-    // Best-effort — release errors are logged, never rethrown — and without the
-    // caller's signal so an aborted run still frees its lease.
+    // In-line: try the DELETE, retry a couple of times on retryable errors
+    // (host_offline/upstream_timeout/client-side timeout), then either mark
+    // released_at on success OR flip release_pending so the periodic sweep
+    // keeps retrying. A `not_found` response is treated as success (the lease
+    // is gone by the desired definition). Never rethrows — the release path
+    // is intentionally decoupled from the run's success/failure outcome, and
+    // does NOT carry the caller's signal so an aborted run still frees its
+    // lease. Release shares the exec-timeout window (see WisperClient
+    // defaults); it is passed explicitly because the client's
+    // construction-time timeout is the longer create-lease ceiling.
     if (leaseId !== null) {
-      try {
-        // Release shares the exec timeout window (see WisperClient defaults); it
-        // is passed explicitly because the client's construction-time timeout is
-        // the longer create-lease ceiling.
-        await deps.wisper.releaseLease(leaseId, { timeoutMs: execTimeoutMs });
+      const outcome = await attemptLeaseRelease(
+        deps.wisper,
+        leaseId,
+        execTimeoutMs
+      );
+      if (outcome.ok) {
+        await updateDispatch(
+          dispatchId,
+          { released_at: Date.now(), release_pending: false },
+          db
+        );
         logger.info("lease released", { leaseId });
-      } catch (releaseErr) {
-        logger.error("lease release failed", {
+      } else {
+        await updateDispatch(dispatchId, { release_pending: true }, db);
+        logger.error("lease release failed; marked release_pending", {
           leaseId,
-          error: errorMessage(releaseErr),
+          error: outcome.error,
         });
       }
     }
@@ -980,9 +1048,15 @@ export interface ReconcileDeps {
  * Recover from an unclean shutdown. Every dispatch left in an in-flight state
  * ({@link ORPHANED_ON_RESTART}) is marked `failed` with error
  * `orphaned_by_restart`, and any lease it still held is released best-effort — a
- * release error is logged and never rethrown, matching the pipeline's lease
- * hygiene. Call this ONCE on boot, after migrations and before the dispatcher
- * loop starts, so no half-run dispatch is ever picked back up mid-pipeline.
+ * release error flips `release_pending` so the periodic sweep keeps retrying,
+ * matching the pipeline's lease hygiene. Call this ONCE on boot, after
+ * migrations and before the dispatcher loop starts, so no half-run dispatch is
+ * ever picked back up mid-pipeline.
+ *
+ * A dispatch left in `leasing` with NO lease_id means the process died between
+ * flipping to `leasing` and the createLease response landing: a lease may exist
+ * server-side that we no longer have a handle for, and the only backstop is the
+ * lease TTL. That is a loud warning here, not a silent skip.
  *
  * Returns the number of dispatches reconciled and logs a one-line summary.
  */
@@ -1005,24 +1079,47 @@ export async function reconcileOrphanedDispatches(
       { status: "failed", error: "orphaned_by_restart" },
       db
     );
-    if (!dispatch.lease_id) continue;
+    if (!dispatch.lease_id) {
+      // A `leasing` orphan with NO lease_id is a crash mid-createLease: the
+      // server may have provisioned a lease we never saw the id of. Warn
+      // loudly — only the lease TTL can catch this — so the operator can
+      // notice and cross-check the wisper host.
+      if (dispatch.status === "leasing") {
+        logger.warn(
+          "orphaned dispatch in 'leasing' with no lease_id; a server-side lease may exist that only the TTL failsafe will reap",
+          { dispatchId: dispatch.id }
+        );
+      }
+      continue;
+    }
     if (!deps.wisper) {
       logger.warn("orphaned lease left to TTL failsafe (wisper unconfigured)", {
         dispatchId: dispatch.id,
         leaseId: dispatch.lease_id,
       });
+      // No wisper client → we cannot succeed OR set released_at. Leave it flagged
+      // so the sweep tries once leasing is configured.
+      await updateDispatch(dispatch.id, { release_pending: true }, db);
       continue;
     }
-    try {
-      await deps.wisper.releaseLease(dispatch.lease_id, {
-        timeoutMs: execTimeoutMs,
-      });
+    const outcome = await attemptLeaseRelease(
+      deps.wisper,
+      dispatch.lease_id,
+      execTimeoutMs
+    );
+    if (outcome.ok) {
+      await updateDispatch(
+        dispatch.id,
+        { released_at: Date.now(), release_pending: false },
+        db
+      );
       leasesReleased += 1;
-    } catch (releaseErr) {
-      logger.error("orphaned lease release failed", {
+    } else {
+      await updateDispatch(dispatch.id, { release_pending: true }, db);
+      logger.error("orphaned lease release failed; marked release_pending", {
         dispatchId: dispatch.id,
         leaseId: dispatch.lease_id,
-        error: errorMessage(releaseErr),
+        error: outcome.error,
       });
     }
   }
@@ -1032,4 +1129,99 @@ export async function reconcileOrphanedDispatches(
     leasesReleased,
   });
   return orphans.length;
+}
+
+/** Injected collaborators for {@link sweepPendingReleases}. */
+export interface SweepDeps {
+  /** Wisper client used to release stranded leases. Required — the sweep is a no-op without one. */
+  wisper: WisperClient;
+  /** Knex handle; defaults to the process singleton. */
+  db?: Knex;
+  /** Logger; defaults to the shared process logger. */
+  logger?: Logger;
+  /**
+   * Per-call timeout in ms for the release attempts. Defaults to
+   * {@link DEFAULT_EXEC_TIMEOUT_MS}.
+   */
+  execTimeoutMs?: number;
+  /**
+   * Wall clock, injectable for deterministic tests; defaults to `Date.now`.
+   * Used to compute the per-lease backoff window against
+   * {@link SweepDeps.backoffMs}.
+   */
+  now?: () => number;
+  /**
+   * Minimum interval, in ms, between sweep attempts for the SAME lease. A
+   * dead host must not hot-loop: after a failed release the sweep waits at
+   * least this long before trying that lease again. Judged against the row's
+   * `updated_at` (which the failing update above bumps). Defaults to 60_000.
+   */
+  backoffMs?: number;
+}
+
+/**
+ * Default per-lease backoff between sweep attempts: a stranded lease is retried
+ * no more often than every {@link DEFAULT_SWEEP_BACKOFF_MS}ms while wisper keeps
+ * failing, so a persistently offline host does not hot-loop.
+ */
+export const DEFAULT_SWEEP_BACKOFF_MS = 60_000;
+
+/**
+ * Sweep for dispatches whose lease is still owed to wisper — a non-null
+ * `lease_id` with `released_at` still null — and attempt to release each. A
+ * per-lease cooldown ({@link SweepDeps.backoffMs}, default
+ * {@link DEFAULT_SWEEP_BACKOFF_MS}) throttles retries against a dead host so
+ * the sweep never hot-loops. Returns the number of leases released this pass.
+ *
+ * Safe to run alongside the executor: `runDispatch`'s in-line release path
+ * writes `released_at` on success, so a lease that finished releasing between
+ * the sweep query and the sweep call simply becomes a `not_found` on wisper's
+ * side — {@link attemptLeaseRelease} treats that as success.
+ */
+export async function sweepPendingReleases(
+  deps: SweepDeps
+): Promise<number> {
+  const db = deps.db ?? getDb();
+  const logger = deps.logger ?? log;
+  const execTimeoutMs = deps.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const now = deps.now ?? Date.now;
+  const backoffMs = deps.backoffMs ?? DEFAULT_SWEEP_BACKOFF_MS;
+
+  const pending = await listDispatchesWithPendingRelease(db);
+  let released = 0;
+  const nowMs = now();
+  for (const dispatch of pending) {
+    if (dispatch.lease_id === null) continue; // narrows for the type checker
+    // Per-lease backoff: if the last attempt was within `backoffMs`, skip this
+    // pass. `updated_at` is bumped by the failing update above, so it doubles
+    // as a "last tried at" clock for the pending-release cohort.
+    if (dispatch.release_pending && nowMs - dispatch.updated_at < backoffMs) {
+      continue;
+    }
+    const outcome = await attemptLeaseRelease(
+      deps.wisper,
+      dispatch.lease_id,
+      execTimeoutMs
+    );
+    if (outcome.ok) {
+      await updateDispatch(
+        dispatch.id,
+        { released_at: now(), release_pending: false },
+        db
+      );
+      released += 1;
+      logger.info("sweep released stranded lease", {
+        dispatchId: dispatch.id,
+        leaseId: dispatch.lease_id,
+      });
+    } else {
+      await updateDispatch(dispatch.id, { release_pending: true }, db);
+      logger.warn("sweep release still failing; keeping release_pending", {
+        dispatchId: dispatch.id,
+        leaseId: dispatch.lease_id,
+        error: outcome.error,
+      });
+    }
+  }
+  return released;
 }

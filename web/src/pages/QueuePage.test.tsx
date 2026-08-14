@@ -48,6 +48,8 @@ function dispatch(overrides: Partial<Dispatch> & Pick<Dispatch, "id">): Dispatch
     wisp_contract_id: null,
     attempts: 0,
     error: null,
+    released_at: null,
+    release_pending: false,
     created_at: 1_700_000_000_000,
     updated_at: 1_700_000_000_000,
     ...overrides,

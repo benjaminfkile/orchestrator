@@ -20,7 +20,12 @@ import { createLogger, type Logger } from "../log";
 import { ModuleRegistry } from "../modules/registry";
 import { WisperClient } from "../wisper/client";
 
-import { reconcileOrphanedDispatches, runDispatch } from "./executor";
+import {
+  attemptLeaseRelease,
+  reconcileOrphanedDispatches,
+  runDispatch,
+  sweepPendingReleases,
+} from "./executor";
 
 /** A single request the fake wisper server observed. */
 interface CapturedExec {
@@ -61,10 +66,21 @@ class FakeWisper {
   readonly createBodies: Record<string, unknown>[] = [];
   readonly execs: CapturedExec[] = [];
   readonly releasedLeases: string[] = [];
+  /** Every DELETE that arrived — including the ones the fake failed. */
+  readonly releaseAttempts: string[] = [];
 
   private plan: ExecPlan = { exitCode: 0 };
   private syncPlan: (command: string) => SyncResult = () => ({ exitCode: 0 });
   private createFailure: { status: number; body: unknown } | null = null;
+  /**
+   * Per-lease queue of release responses. Each entry is applied to the NEXT
+   * DELETE against that lease; when the queue is empty the fake responds 200
+   * (the default happy-path). Used to script "fail once then succeed" flows.
+   */
+  private releaseResponses: Map<
+    string,
+    Array<{ status: number; body: unknown }>
+  > = new Map();
   private nextLease = 1;
   private leaseOs: "linux" | "windows" | null = null;
   private server!: http.Server;
@@ -72,6 +88,20 @@ class FakeWisper {
 
   planExec(plan: ExecPlan): void {
     this.plan = plan;
+  }
+
+  /**
+   * Queue one canned release response for the next DELETE against `leaseId`.
+   * Call multiple times to script a sequence. Once the queue is drained, later
+   * releases succeed as usual.
+   */
+  planReleaseResponse(
+    leaseId: string,
+    response: { status: number; body: unknown }
+  ): void {
+    const queue = this.releaseResponses.get(leaseId) ?? [];
+    queue.push(response);
+    this.releaseResponses.set(leaseId, queue);
   }
 
   /**
@@ -170,7 +200,20 @@ class FakeWisper {
 
     const delMatch = url.match(/^\/dev\/leases\/([^/?]+)/);
     if (method === "DELETE" && delMatch) {
-      this.releasedLeases.push(decodeURIComponent(delMatch[1]));
+      const leaseId = decodeURIComponent(delMatch[1]);
+      this.releaseAttempts.push(leaseId);
+      const queue = this.releaseResponses.get(leaseId);
+      const scripted = queue?.shift();
+      if (scripted) {
+        res.writeHead(scripted.status, { "content-type": "application/json" });
+        res.end(
+          typeof scripted.body === "string"
+            ? scripted.body
+            : JSON.stringify(scripted.body)
+        );
+        return;
+      }
+      this.releasedLeases.push(leaseId);
       res.writeHead(200, { "content-type": "application/json" });
       res.end("");
       return;
@@ -1484,6 +1527,249 @@ describe("runDispatch pipeline", () => {
     await expect(runDispatch(9999, deps())).rejects.toThrow(/not found/);
   });
 
+  describe("lease release retry and sweep", () => {
+    it("happy path: sets released_at, does not flip release_pending, and needs no sweep", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      const dispatchId = await seedDispatch();
+      const result = await runDispatch(dispatchId, deps());
+      expect(result.status).toBe("done");
+
+      const persisted = await getDispatch(dispatchId, db);
+      expect(persisted?.released_at).not.toBeNull();
+      expect(persisted?.release_pending).toBe(false);
+      expect(fake.releaseAttempts).toEqual(["lease-1"]);
+
+      // A subsequent sweep must find nothing to do (no additional DELETE).
+      const before = fake.releaseAttempts.length;
+      const released = await sweepPendingReleases({
+        wisper: client(),
+        db,
+        logger: silentLogger(),
+      });
+      expect(released).toBe(0);
+      expect(fake.releaseAttempts.length).toBe(before);
+    });
+
+    it("retryable failure retries in-line, then succeeds, no sweep needed", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      // First DELETE fails with a retryable code; the in-line retry succeeds.
+      fake.planReleaseResponse("lease-1", {
+        status: 504,
+        body: {
+          error: {
+            code: "upstream_timeout",
+            message: "upstream timed out",
+            request_id: "r-1",
+          },
+        },
+      });
+
+      const dispatchId = await seedDispatch();
+      const result = await runDispatch(dispatchId, deps());
+      expect(result.status).toBe("done");
+
+      const persisted = await getDispatch(dispatchId, db);
+      expect(persisted?.released_at).not.toBeNull();
+      expect(persisted?.release_pending).toBe(false);
+      expect(fake.releaseAttempts).toEqual(["lease-1", "lease-1"]);
+      expect(fake.releasedLeases).toEqual(["lease-1"]);
+    });
+
+    it("in-line retries exhausted: release_pending set, sweep succeeds later, released_at recorded", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      // Both the initial call and every in-line retry (there are 2 backoffs =>
+      // 3 total attempts) fail with a retryable code, so the executor flips
+      // release_pending. Then the sweep succeeds.
+      for (let i = 0; i < 3; i++) {
+        fake.planReleaseResponse("lease-1", {
+          status: 409,
+          body: {
+            error: {
+              code: "host_offline",
+              message: "host is offline",
+              request_id: `r-${i}`,
+            },
+          },
+        });
+      }
+
+      const dispatchId = await seedDispatch();
+      const result = await runDispatch(dispatchId, deps());
+      // The run itself still resolves `done` — release failure is orthogonal.
+      expect(result.status).toBe("done");
+
+      let persisted = await getDispatch(dispatchId, db);
+      expect(persisted?.released_at).toBeNull();
+      expect(persisted?.release_pending).toBe(true);
+      expect(fake.releaseAttempts.length).toBe(3); // in-line: 1 + 2 retries
+
+      // Now run the sweep with backoff = 0 so it does not skip us for the
+      // per-lease cooldown. The next DELETE (no more scripted responses) 200s.
+      const released = await sweepPendingReleases({
+        wisper: client(),
+        db,
+        logger: silentLogger(),
+        backoffMs: 0,
+      });
+      expect(released).toBe(1);
+
+      persisted = await getDispatch(dispatchId, db);
+      expect(persisted?.released_at).not.toBeNull();
+      expect(persisted?.release_pending).toBe(false);
+      expect(fake.releasedLeases).toEqual(["lease-1"]);
+    });
+
+    it("wisper 404 not_found is treated as a successful release", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      fake.planReleaseResponse("lease-1", {
+        status: 404,
+        body: {
+          error: {
+            code: "not_found",
+            message: "no such lease",
+            request_id: "r-nf",
+          },
+        },
+      });
+
+      const dispatchId = await seedDispatch();
+      const result = await runDispatch(dispatchId, deps());
+      expect(result.status).toBe("done");
+
+      const persisted = await getDispatch(dispatchId, db);
+      expect(persisted?.released_at).not.toBeNull();
+      expect(persisted?.release_pending).toBe(false);
+      // Only ONE DELETE was sent — the 404 was accepted and no retry ran.
+      expect(fake.releaseAttempts).toEqual(["lease-1"]);
+    });
+
+    it("attemptLeaseRelease: not-found returns ok without retry", async () => {
+      fake.planReleaseResponse("lease-XYZ", {
+        status: 404,
+        body: {
+          error: { code: "not_found", message: "gone", request_id: "r-1" },
+        },
+      });
+      const outcome = await attemptLeaseRelease(client(), "lease-XYZ", 2000);
+      expect(outcome.ok).toBe(true);
+      expect(fake.releaseAttempts).toEqual(["lease-XYZ"]);
+    });
+
+    it("attemptLeaseRelease: non-retryable error returns error immediately", async () => {
+      // A validation_error is non-retryable, so no in-line retry should happen.
+      fake.planReleaseResponse("lease-Y", {
+        status: 400,
+        body: {
+          error: {
+            code: "validation_error",
+            message: "bad",
+            request_id: "r-y",
+          },
+        },
+      });
+      const outcome = await attemptLeaseRelease(client(), "lease-Y", 2000);
+      expect(outcome.ok).toBe(false);
+      expect(fake.releaseAttempts).toEqual(["lease-Y"]);
+    });
+
+    it("boot sweep releases a terminal dispatch that still holds a lease", async () => {
+      // Simulate the state left behind by a crashed process: a `done` dispatch
+      // whose lease was never released (released_at null) and never marked
+      // release_pending. The sweep must still pick it up.
+      const event = await insertEvent(
+        {
+          source: "moduleA",
+          type: "thing.changed",
+          subject_kind: "widget",
+          subject_ref: "1",
+        },
+        db
+      );
+      const playbook = await createPlaybook(
+        { name: "pb-sweep-done", image: "img", ttl_seconds: 600 },
+        db
+      );
+      const dispatch = await createDispatch(
+        {
+          event_id: event.id,
+          playbook_id: playbook.id,
+          status: "done",
+          lease_id: "lease-stranded",
+        },
+        db
+      );
+
+      const released = await sweepPendingReleases({
+        wisper: client(),
+        db,
+        logger: silentLogger(),
+        // No release_pending is set, so the backoff branch does not apply.
+      });
+      expect(released).toBe(1);
+      expect(fake.releasedLeases).toEqual(["lease-stranded"]);
+
+      const persisted = await getDispatch(dispatch.id, db);
+      expect(persisted?.released_at).not.toBeNull();
+      expect(persisted?.release_pending).toBe(false);
+      // Terminal status is preserved.
+      expect(persisted?.status).toBe("done");
+    });
+
+    it("sweep respects per-lease backoff for release_pending rows", async () => {
+      const event = await insertEvent(
+        {
+          source: "moduleA",
+          type: "thing.changed",
+          subject_kind: "widget",
+          subject_ref: "1",
+        },
+        db
+      );
+      const playbook = await createPlaybook(
+        { name: "pb-sweep-backoff", image: "img", ttl_seconds: 600 },
+        db
+      );
+      const dispatch = await createDispatch(
+        {
+          event_id: event.id,
+          playbook_id: playbook.id,
+          status: "failed",
+          lease_id: "lease-cooldown",
+          release_pending: true,
+        },
+        db
+      );
+
+      // With a 10-minute cooldown vs. an immediate call, the sweep must skip
+      // this row entirely — no DELETE fires against wisper.
+      const released = await sweepPendingReleases({
+        wisper: client(),
+        db,
+        logger: silentLogger(),
+        backoffMs: 600_000,
+      });
+      expect(released).toBe(0);
+      expect(fake.releaseAttempts).toHaveLength(0);
+
+      // The row is unchanged: still pending, still no released_at.
+      const persisted = await getDispatch(dispatch.id, db);
+      expect(persisted?.release_pending).toBe(true);
+      expect(persisted?.released_at).toBeNull();
+    });
+  });
+
   describe("reconcileOrphanedDispatches", () => {
     let seedSeq = 0;
 
@@ -1584,6 +1870,39 @@ describe("runDispatch pipeline", () => {
       expect(d?.error).toBe("orphaned_by_restart");
       // No client, so nothing was released.
       expect(fake.releasedLeases).toHaveLength(0);
+    });
+
+    it("logs a loud warning for a 'leasing' orphan with no lease_id (mid-createLease crash)", async () => {
+      // Simulate a process death between flipping to 'leasing' and the
+      // createLease response landing: the row is 'leasing' with no lease_id,
+      // and a lease may exist server-side that only the TTL can catch.
+      const dispatchId = await seedInState("leasing", null);
+
+      const lines: string[] = [];
+      const logger = createLogger({
+        sink: (l) => lines.push(l),
+        clock: () => 0,
+      });
+      const count = await reconcileOrphanedDispatches({
+        wisper: client(),
+        db,
+        logger,
+      });
+
+      expect(count).toBe(1);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("orphaned dispatch in 'leasing' with no lease_id") &&
+            l.includes(String(dispatchId))
+        )
+      ).toBe(true);
+      // The dispatch is still failed with orphaned_by_restart, and no DELETE was
+      // sent (nothing to release).
+      const d = await getDispatch(dispatchId, db);
+      expect(d?.status).toBe("failed");
+      expect(d?.error).toBe("orphaned_by_restart");
+      expect(fake.releaseAttempts).toHaveLength(0);
     });
 
     it("returns 0 and releases nothing when there is nothing to reconcile", async () => {
