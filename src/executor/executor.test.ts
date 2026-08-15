@@ -1684,6 +1684,66 @@ describe("runDispatch pipeline", () => {
       expect(fake.releaseAttempts).toEqual(["lease-Y"]);
     });
 
+    it("sweep NEVER releases a lease belonging to an in-flight dispatch (regression)", async () => {
+      // Regression: before task #59 the sweep query filtered only on lease_id
+      // and released_at, with no status filter. An in-flight run's row (status
+      // 'running'/'collecting', release_pending false, released_at null) also
+      // matched, so the periodic sweep would DELETE the lease while the agent
+      // was still using it. The status filter blocks that.
+      for (const inFlight of ["leasing", "running", "collecting"] as const) {
+        const event = await insertEvent(
+          {
+            source: "moduleA",
+            type: "thing.changed",
+            subject_kind: "widget",
+            subject_ref: `inflight-${inFlight}`,
+          },
+          db
+        );
+        const playbook = await createPlaybook(
+          {
+            name: `pb-sweep-inflight-${inFlight}`,
+            image: "img",
+            ttl_seconds: 600,
+          },
+          db
+        );
+        const dispatch = await createDispatch(
+          {
+            event_id: event.id,
+            playbook_id: playbook.id,
+            status: inFlight,
+            lease_id: `lease-inflight-${inFlight}`,
+          },
+          db
+        );
+
+        const released = await sweepPendingReleases({
+          wisper: client(),
+          db,
+          logger: silentLogger(),
+          // Rule out the backoff branch as the reason we saw no release.
+          backoffMs: 0,
+        });
+        expect(released).toBe(0);
+        // No DELETE was sent to wisper for this in-flight lease.
+        expect(fake.releaseAttempts).not.toContain(
+          `lease-inflight-${inFlight}`
+        );
+        expect(fake.releasedLeases).not.toContain(
+          `lease-inflight-${inFlight}`
+        );
+
+        // The row is fully untouched — status, lease binding, and release
+        // bookkeeping all as seeded. `runDispatch` still owns the release path.
+        const persisted = await getDispatch(dispatch.id, db);
+        expect(persisted?.status).toBe(inFlight);
+        expect(persisted?.lease_id).toBe(`lease-inflight-${inFlight}`);
+        expect(persisted?.released_at).toBeNull();
+        expect(persisted?.release_pending).toBe(false);
+      }
+    });
+
     it("boot sweep releases a terminal dispatch that still holds a lease", async () => {
       // Simulate the state left behind by a crashed process: a `done` dispatch
       // whose lease was never released (released_at null) and never marked
