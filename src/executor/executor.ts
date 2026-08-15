@@ -1167,16 +1167,21 @@ export interface SweepDeps {
 export const DEFAULT_SWEEP_BACKOFF_MS = 60_000;
 
 /**
- * Sweep for dispatches whose lease is still owed to wisper — a non-null
- * `lease_id` with `released_at` still null — and attempt to release each. A
- * per-lease cooldown ({@link SweepDeps.backoffMs}, default
+ * Sweep for dispatches whose lease is still owed to wisper and whose dispatch
+ * is already in a terminal state (`done`/`failed`) — see
+ * {@link listDispatchesWithPendingRelease} for the exact predicate. A per-lease
+ * cooldown ({@link SweepDeps.backoffMs}, default
  * {@link DEFAULT_SWEEP_BACKOFF_MS}) throttles retries against a dead host so
  * the sweep never hot-loops. Returns the number of leases released this pass.
  *
- * Safe to run alongside the executor: `runDispatch`'s in-line release path
- * writes `released_at` on success, so a lease that finished releasing between
- * the sweep query and the sweep call simply becomes a `not_found` on wisper's
- * side — {@link attemptLeaseRelease} treats that as success.
+ * Safe to run alongside the executor precisely BECAUSE of the terminal-status
+ * filter: an in-flight dispatch's lease is owned by `runDispatch`'s own
+ * release path (which writes `released_at` in its finally block), and the
+ * sweep is prohibited from touching it. Terminal rows are the sweep's
+ * exclusive domain — either a successful run whose in-line release DELETE
+ * failed, or a `failed` row left behind by {@link reconcileOrphanedDispatches}
+ * (which flips crashed in-flight rows to `failed` before the periodic sweep
+ * ever runs).
  */
 export async function sweepPendingReleases(
   deps: SweepDeps

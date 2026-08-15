@@ -367,10 +367,16 @@ export async function resetToQueued(
 
 /**
  * List dispatches whose lease is still owed to wisper — a non-null `lease_id`
- * with `released_at` still null — regardless of the dispatch's lifecycle state.
- * Terminal (done/failed) rows are included by design: a successful run whose
- * release DELETE failed strands a real lease on the host, and the sweep must
- * keep retrying it until wisper acknowledges.
+ * with `released_at` still null — AND that have already reached a terminal
+ * state (`done` or `failed`). The status filter is load-bearing: an in-flight
+ * dispatch (`leasing`/`running`/`collecting`) also matches "has a lease and no
+ * released_at", but its lease is being actively used by `runDispatch`, which
+ * owns the release path itself and writes `released_at` in its own finally
+ * block. The sweep must NEVER touch those — releasing a lease out from under a
+ * running pipeline would kill it silently. Terminal rows are the sweep's
+ * exclusive domain: a `done` run whose release DELETE failed, or a `failed`
+ * row left behind by `reconcileOrphanedDispatches` (which flips crashed
+ * in-flight rows to `failed` before the sweep ever runs).
  */
 export async function listDispatchesWithPendingRelease(
   db: Knex = getDb()
@@ -378,6 +384,7 @@ export async function listDispatchesWithPendingRelease(
   const rows = await db<DispatchRow>("dispatches")
     .whereNotNull("lease_id")
     .whereNull("released_at")
+    .whereIn("status", ["done", "failed"])
     .orderBy("id", "asc");
   return rows.map(fromRow);
 }
