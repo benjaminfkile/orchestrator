@@ -90,13 +90,22 @@ function agentArgvHead(config: ClaudeCodeConfig): string[] {
 /**
  * The linux agent command: the `claude` argv joined with spaces, with the prompt
  * as a single POSIX-single-quoted trailing argument. wisp wraps linux execs in
- * `/bin/sh -c`, so single-quoting yields exactly one literal argument.
+ * `/bin/sh -c`, so single-quoting yields exactly one literal argument, and an
+ * `IS_SANDBOX=1` env prefix applies to just the `claude` invocation.
+ *
+ * The `IS_SANDBOX=1` prefix is the CLI's documented container escape hatch for
+ * `--dangerously-skip-permissions`: without it `claude` hard-refuses to run under
+ * root/sudo ("cannot be used with root/sudo privileges for security reasons"),
+ * and wisp container execs run as root. Every wisp lease is by definition a
+ * container/VM sandbox, so this is unconditionally correct for linux leases.
  */
 function buildLinuxAgentCommand(
   config: ClaudeCodeConfig,
   prompt: string
 ): string {
-  return [...agentArgvHead(config), shellQuote(prompt)].join(" ");
+  return ["IS_SANDBOX=1", ...agentArgvHead(config), shellQuote(prompt)].join(
+    " "
+  );
 }
 
 /**

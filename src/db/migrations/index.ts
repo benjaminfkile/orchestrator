@@ -23,6 +23,7 @@ import * as playbookHost from "./20260713000020_playbook_host";
 import * as playbookIsolation from "./20260713000021_playbook_isolation";
 import * as dispatchReleaseTracking from "./20260713000022_dispatch_release_tracking";
 import * as seedSmokeTestPlaybook from "./20260713000023_seed_smoke_test_playbook";
+import * as smokeTestInstallClaudeNativeInstaller from "./20260713000024_smoke_test_install_claude_native_installer";
 
 type Migration = {
   up: (knex: Knex) => Promise<void>;
@@ -62,6 +63,8 @@ const migrations: Record<string, Migration> = {
   "20260713000021_playbook_isolation": playbookIsolation,
   "20260713000022_dispatch_release_tracking": dispatchReleaseTracking,
   "20260713000023_seed_smoke_test_playbook": seedSmokeTestPlaybook,
+  "20260713000024_smoke_test_install_claude_native_installer":
+    smokeTestInstallClaudeNativeInstaller,
 };
 
 export const migrationSource: Knex.MigrationSource<string> = {

@@ -962,6 +962,18 @@ trusted.
    If it drives all the way to a `done` run with findings you know
    auth / lease / installs / network / claude / notifications all work.
 
+   Two shell-behavior facts the live test on 2026-08-16 confirmed, worth
+   knowing if you author your own steps: `az repos list` auto-installs the
+   `azure-devops` extension on first use (so no separate `az extension add`
+   step is needed), and each wisp exec is a **fresh non-login `/bin/sh`
+   process** with no shared env, cwd, or profile — so nothing exported in
+   one step survives to the next, and the install-claude step therefore
+   `ln -sf`s the native-installer binary into `/usr/local/bin` rather than
+   relying on a `PATH` export. Root-refusal in the agent step is handled by
+   the runner, which prefixes the linux `claude` invocation with
+   `IS_SANDBOX=1` (the CLI's documented container escape hatch); no playbook
+   config is required for it.
+
 8. **Watch a dispatch run.** When the poller emits a matching event, a dispatch is
    enqueued and the dispatcher drains it. Follow it:
 
