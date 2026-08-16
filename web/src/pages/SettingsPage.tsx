@@ -11,6 +11,9 @@ import {
   Field,
   Input,
   makeStyles,
+  MessageBar,
+  MessageBarBody,
+  MessageBarTitle,
   Radio,
   RadioGroup,
   Spinner,
@@ -209,6 +212,17 @@ const useStyles = makeStyles({
     flexDirection: "column",
     gap: tokens.spacingVerticalM,
     marginBottom: tokens.spacingVerticalL,
+  },
+  wisperKeyCallout: {
+    marginBottom: tokens.spacingVerticalM,
+  },
+  wisperKeyOk: {
+    display: "flex",
+    alignItems: "center",
+    gap: tokens.spacingHorizontalS,
+    marginBottom: tokens.spacingVerticalM,
+    color: tokens.colorPaletteGreenForeground1,
+    fontSize: tokens.fontSizeBase200,
   },
   empty: {
     color: tokens.colorNeutralForeground3,
@@ -682,6 +696,34 @@ export function SettingsPage() {
         <Title3 as="h2" className={styles.sectionTitle}>
           Secrets
         </Title3>
+
+        {system?.wisperMode === "v1" && !system.wisperApiKeyPresent && (
+          <MessageBar
+            intent="warning"
+            layout="multiline"
+            className={styles.wisperKeyCallout}
+            aria-label="Wisper API key required"
+          >
+            <MessageBarBody>
+              <MessageBarTitle>Wisper API key required</MessageBarTitle> Add a
+              secret named <code>WISPER_API_KEY</code> — a{" "}
+              <code>wck_…</code> consumer key minted in wisper-web. Without it
+              this orchestrator cannot rent leases from wisper-api. The value
+              is write-only; presence only is shown here.
+            </MessageBarBody>
+          </MessageBar>
+        )}
+        {system?.wisperMode === "v1" && system.wisperApiKeyPresent && (
+          <Text
+            as="p"
+            className={styles.wisperKeyOk}
+            role="status"
+            data-testid="wisper-api-key-configured"
+          >
+            Wisper API key configured (satisfied by the{" "}
+            <code>WISPER_API_KEY</code> secret).
+          </Text>
+        )}
 
         <div className={styles.secretForm}>
           {secretError && (

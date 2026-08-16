@@ -203,6 +203,49 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("shows an inline callout in the Secrets section when v1 mode is missing WISPER_API_KEY", async () => {
+    mockGetSystemInfo.mockResolvedValue({
+      wisperBaseUrl: "http://localhost:8080",
+      wisperHostId: "host-abc",
+      wisperMode: "v1",
+      wisperApiKeyPresent: false,
+    });
+    render(<SettingsPage />);
+    // The callout names the secret verbatim so the user knows exactly what to add.
+    const alert = await screen.findByLabelText("Wisper API key required");
+    expect(within(alert).getByText("WISPER_API_KEY")).toBeTruthy();
+    // Presence-only: no configured state indicator when the key is missing.
+    expect(screen.queryByTestId("wisper-api-key-configured")).toBeNull();
+  });
+
+  it("shows a subtle confirmation in the Secrets section when the key is present", async () => {
+    mockGetSystemInfo.mockResolvedValue({
+      wisperBaseUrl: "http://localhost:8080",
+      wisperHostId: "host-abc",
+      wisperMode: "v1",
+      wisperApiKeyPresent: true,
+    });
+    render(<SettingsPage />);
+    const confirmation = await screen.findByTestId("wisper-api-key-configured");
+    expect(confirmation.textContent).toContain("WISPER_API_KEY");
+    // Value-safe: neither the callout nor confirmation ever fetches a value —
+    // it only renders the flag the system endpoint exposes.
+    expect(screen.queryByLabelText("Wisper API key required")).toBeNull();
+  });
+
+  it("does not show either callout in dev mode (leasing has no key requirement)", async () => {
+    mockGetSystemInfo.mockResolvedValue({
+      wisperBaseUrl: "http://localhost:8080",
+      wisperHostId: "host-abc",
+      wisperMode: "dev",
+      wisperApiKeyPresent: false,
+    });
+    render(<SettingsPage />);
+    await screen.findByRole("table", { name: "Secrets" });
+    expect(screen.queryByLabelText("Wisper API key required")).toBeNull();
+    expect(screen.queryByTestId("wisper-api-key-configured")).toBeNull();
+  });
+
   it("lists stored secret names", async () => {
     render(<SettingsPage />);
     const table = await screen.findByRole("table", { name: "Secrets" });

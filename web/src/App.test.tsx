@@ -52,12 +52,17 @@ vi.mock("./modules", async (importOriginal) => ({
 }));
 
 // The Settings route loads its own data layer on mount; stub it too. Behavior
-// lives in SettingsPage.test.tsx.
+// lives in SettingsPage.test.tsx. The default snapshot is a fully-configured
+// v1 install so the app-wide SystemStatusBanner stays silent for the shell
+// tests below (its own tests exercise the warning states).
 vi.mock("./settings", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./settings")>()),
-  getSystemInfo: vi
-    .fn()
-    .mockResolvedValue({ wisperBaseUrl: "http://localhost:8080", wisperHostId: null }),
+  getSystemInfo: vi.fn().mockResolvedValue({
+    wisperBaseUrl: "http://localhost:8080",
+    wisperHostId: "host-abc",
+    wisperMode: "v1",
+    wisperApiKeyPresent: true,
+  }),
   getSettings: vi.fn().mockResolvedValue({}),
   listSecrets: vi.fn().mockResolvedValue([]),
 }));
