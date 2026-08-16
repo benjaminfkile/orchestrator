@@ -33,7 +33,7 @@ describe("playbooks repo", () => {
     file = tempDbFile();
     db = createDb(file);
     await runMigrations(db);
-    // Start from an empty table: migrations seed a built-in `researcher`
+    // Start from an empty table: migrations seed a built-in smoke-test
     // playbook, but these tests exercise CRUD against a clean slate.
     await db("playbooks").del();
   });

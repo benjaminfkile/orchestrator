@@ -27,6 +27,9 @@ describe("notifiers repo", () => {
     file = tempDbFile();
     db = createDb(file);
     await runMigrations(db);
+    // Migrations seed a built-in `desktop` notifier; clear the table so
+    // id-ordering and count assertions below are deterministic.
+    await db("notifiers").del();
   });
 
   afterEach(async () => {

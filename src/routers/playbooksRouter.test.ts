@@ -31,8 +31,9 @@ describe("playbooks router", () => {
     file = tempDbFile();
     db = createDb(file);
     await runMigrations(db);
-    // Migrations seed a built-in `researcher` playbook; start from a clean
-    // table so id-ordering and count assertions are deterministic.
+    // Migrations seed a built-in smoke-test playbook (see the
+    // 20260713000023 seed); start from a clean table so id-ordering and
+    // count assertions here are deterministic.
     await db("playbooks").del();
     setDb(db);
   });

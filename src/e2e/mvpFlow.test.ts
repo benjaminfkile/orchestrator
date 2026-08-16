@@ -3,11 +3,11 @@
  * external services.
  *
  * It wires the real pipeline together against a temp SQLite DB and the
- * {@link FakeWisper} dev server: the seeded `researcher` playbook (pointed at the
- * fake via the `default_lease_image` setting), a rule matching
- * `ado.workitem.assigned`, injected (stubbed) secrets, and the real
- * {@link emitEvent} → {@link Dispatcher} → {@link runDispatch} path. It asserts the
- * three MVP scenarios end-to-end:
+ * {@link FakeWisper} dev server: the seeded `smoke-test-clone-and-claude-linux`
+ * playbook (pointed at the fake via the `default_lease_image` setting), a rule
+ * matching `ado.workitem.assigned`, injected (stubbed) secrets — including the
+ * step-only `ADO_PAT` — and the real {@link emitEvent} → {@link Dispatcher} →
+ * {@link runDispatch} path. It asserts the three MVP scenarios end-to-end:
  *
  *   1. one matching event → a queued dispatch driven to `done`, with a run row
  *      (exit 0 + usage) and findings persisted from the scripted NOTES_TO_SAVE,
@@ -53,7 +53,7 @@ function tempDir(prefix: string): string {
 /** The scripted secret store the executor resolves the playbook's env against. */
 const SECRETS: Record<string, string> = {
   CLAUDE_CODE_OAUTH_TOKEN: "oauth-token-stub",
-  GIT_TOKEN: "git-token-stub",
+  ADO_PAT: "ado-pat-stub",
 };
 const resolveEnv: EnvResolver = (name) => SECRETS[name];
 
@@ -69,7 +69,7 @@ describe("E2E: full MVP flow against a fake wisper", () => {
   let db: Knex;
   let dbDir: string;
   let logDir: string;
-  let researcher: PlaybookRecord;
+  let playbook: PlaybookRecord;
 
   beforeEach(async () => {
     fake = new FakeWisper();
@@ -79,13 +79,24 @@ describe("E2E: full MVP flow against a fake wisper", () => {
     db = createDb(path.join(dbDir, "test.sqlite"));
     await runMigrations(db);
 
-    // Point the seeded researcher playbook's `setting:default_lease_image` image
-    // at a concrete (arbitrary) reference so leasing resolves.
+    // Point the seeded playbook's `setting:default_lease_image` image at a
+    // concrete (arbitrary) reference so leasing resolves.
     await setSetting("default_lease_image", "ghcr.io/acme/agent:latest", db);
 
-    const playbook = (await listPlaybooks(db)).find((p) => p.name === "researcher");
-    if (!playbook) throw new Error("seed researcher playbook missing");
-    researcher = playbook;
+    // Clear the seeded rules (the smoke-test dispatch rules and the
+    // run.started/run.completed notify rules) so the test controls exactly
+    // which rules exist — otherwise a synthetic event tagged with the
+    // playbook name would fire a second dispatch through the seeded rule,
+    // and every run would fan out through the seeded desktop notifier.
+    await db("rules").delete();
+
+    const seeded = (await listPlaybooks(db)).find(
+      (p) => p.name === "smoke-test-clone-and-claude-linux"
+    );
+    if (!seeded) {
+      throw new Error("seed smoke-test-clone-and-claude-linux playbook missing");
+    }
+    playbook = seeded;
 
     logDir = tempDir("orch-e2e-logs-");
   });
@@ -138,17 +149,22 @@ describe("E2E: full MVP flow against a fake wisper", () => {
       type: "ado.workitem.assigned",
       subject_kind: "workitem",
       subject_ref: subjectRef,
-      payload: { repo_url: "github.com/acme/widget.git", title },
+      payload: {
+        title,
+        api_url: `https://dev.azure.com/acme/_apis/wit/workItems/${subjectRef}`,
+        area_path: "Acme\\Widget\\Sub",
+        tags: ["smoke-test-clone-and-claude-linux"],
+      },
     };
   }
 
-  /** A rule that fires the researcher playbook on `ado.workitem.assigned`. */
+  /** A rule that fires the seeded playbook on `ado.workitem.assigned`. */
   async function seedRule(): Promise<void> {
     await createRule(
       {
         name: "assigned-workitems",
         match: { type: "ado.workitem.assigned" },
-        dispatch: [{ playbook_id: researcher.id }],
+        dispatch: [{ playbook_id: playbook.id }],
       },
       db
     );
@@ -183,7 +199,7 @@ describe("E2E: full MVP flow against a fake wisper", () => {
     const queued = await listDispatches("queued", db);
     expect(queued).toHaveLength(1);
     const dispatchId = queued[0].id;
-    expect(queued[0].playbook_id).toBe(researcher.id);
+    expect(queued[0].playbook_id).toBe(playbook.id);
 
     // Drive the executor: the dispatch runs to completion.
     const d = makeDispatcher();
