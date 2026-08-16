@@ -23,6 +23,9 @@ describe("notifiers router", () => {
     file = tempDbFile();
     db = createDb(file);
     await runMigrations(db);
+    // Migrations seed a built-in `desktop` notifier; drop it so id-ordering
+    // and count assertions here are deterministic.
+    await db("notifiers").del();
     setDb(db);
   });
 

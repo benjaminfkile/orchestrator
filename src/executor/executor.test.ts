@@ -728,6 +728,77 @@ describe("runDispatch pipeline", () => {
       ).toEqual([{ name: "PAT", inject: "step-only" }]);
     });
 
+    it("keeps ADO_PAT out of createLease env when running the SEEDED smoke-test playbook", async () => {
+      // Regression guard: even if the seed migration is ever edited, ADO_PAT
+      // must remain step-only, i.e. resolvable in step template rendering but
+      // never handed to createLease as part of the lease env.
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      fake.planSync(() => ({ exitCode: 0 }));
+      await setSetting("default_lease_image", "ghcr.io/example/img:1", db);
+
+      const seeded = await db("playbooks")
+        .where({ name: "smoke-test-clone-and-claude-linux" })
+        .first<{ id: number }>();
+      expect(seeded).toBeDefined();
+
+      const event = await insertEvent(
+        {
+          source: "ado",
+          type: "ado.workitem.assigned",
+          subject_kind: "workitem",
+          subject_ref: "42",
+          payload: {
+            api_url: "https://dev.azure.com/acme/_apis/wit/workItems/42",
+            area_path: "Acme\\Widget\\Sub",
+            tags: ["smoke-test-clone-and-claude-linux"],
+            title: "smoke",
+          },
+        },
+        db
+      );
+      const dispatch = await createDispatch(
+        { event_id: event.id, playbook_id: seeded!.id },
+        db
+      );
+
+      const secrets: Record<string, string> = {
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-value",
+        ADO_PAT: "pat-value-only-in-step",
+      };
+      const result = await runDispatch(dispatch.id, {
+        ...deps(),
+        resolveEnv: (name) => secrets[name],
+      });
+      expect(result.status).toBe("done");
+
+      const leaseEnv = fake.createBodies[0].env as Record<string, string>;
+      // The plain-string CLAUDE token is forwarded; the step-only PAT is not.
+      expect(leaseEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-value");
+      expect(leaseEnv.ADO_PAT).toBeUndefined();
+      expect(Object.values(leaseEnv)).not.toContain("pat-value-only-in-step");
+
+      // The clone pre-step DID splice the PAT into its rendered command, and
+      // the scrub step DOES rewrite the remote URL to strip embedded creds —
+      // both are behaviors owned by the seed's step templates.
+      const clone = fake.execs.find((e) =>
+        e.command.includes("az repos list")
+      );
+      expect(clone?.command).toContain("pat-value-only-in-step");
+      const scrub = fake.execs.find((e) =>
+        e.command.includes("git remote set-url origin")
+      );
+      expect(scrub?.command).toContain(
+        "sed 's|https://[^@]*@|https://|'"
+      );
+      // The scrub step also verifies the remote no longer carries an @-form.
+      expect(scrub?.command).toContain(
+        "if git config --get remote.origin.url | grep -q '@'"
+      );
+    });
+
     it("preserves order across mixed shapes", () => {
       const raw: unknown[] = [
         "OAUTH_TOKEN",

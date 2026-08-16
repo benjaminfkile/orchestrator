@@ -54,8 +54,14 @@ describe("playbook runner migration", () => {
   });
 
   it("defaults new rows to the claude-code runner with an empty config", async () => {
-    // The seeded researcher went through the backfill; both its fields survive.
-    const seeded = await db("playbooks").where({ name: "researcher" }).first();
+    // The seeded smoke-test playbook is inserted post-018 with the current
+    // column set, so it always carries the defaulted (runner, runner_config).
+    // Assert on it directly rather than depending on the 018 backfill path,
+    // which no longer sees the built-in seed on a fresh DB (the researcher
+    // row is removed by 023 as part of the same latest() pass).
+    const seeded = await db("playbooks")
+      .where({ name: "smoke-test-clone-and-claude-linux" })
+      .first();
     expect(seeded.runner).toBe("claude-code");
     expect(JSON.parse(seeded.runner_config)).toEqual({});
   });

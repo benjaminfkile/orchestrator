@@ -2,8 +2,8 @@
 
 Event-driven lease orchestrator. It watches external systems (Azure DevOps
 first), matches what it sees against user-configured **rules**, and runs
-data-driven **playbooks** (e.g. a "researcher") inside short-lived container
-**leases** rented from a locally running [wisper-api](https://github.com/benjaminfkile/wisper-api)
+data-driven **playbooks** (e.g. the seeded first-launch smoke test) inside
+short-lived container **leases** rented from a locally running [wisper-api](https://github.com/benjaminfkile/wisper-api)
 (which brokers them down to [wisp](https://github.com/benjaminfkile/wisp) via
 [wisp-agent](https://github.com/benjaminfkile/wisp-agent)).
 
@@ -334,7 +334,7 @@ as TEXT; writes are whitelisted to the keys the core actually reads.
 
 | Key | Default | Effect |
 |---|---|---|
-| `default_lease_image` | *(none — required)* | Concrete image the seed `researcher` playbook resolves via its `setting:default_lease_image` reference. A dispatch fails if unset. |
+| `default_lease_image` | *(none — required)* | Concrete image the seeded `smoke-test-clone-and-claude-linux` playbook resolves via its `setting:default_lease_image` reference. A dispatch fails if unset. |
 | `dispatch_concurrency` | `1` | In-flight dispatch cap. Values > 1 are clamped to 1 (single-flight for now). |
 | `dispatcher_interval_seconds` | `30` | Safety-net tick cadence for the dispatcher loop. |
 | `dispatch_max_attempts` | `3` | Max attempts before a retryable failure gives up. |
@@ -349,12 +349,13 @@ as TEXT; writes are whitelisted to the keys the core actually reads.
 ### Secrets
 
 Referenced **by name** from playbook `env_requirements` and module config; the
-values live only in the encrypted store. The seed `researcher` playbook requires:
+values live only in the encrypted store. The seeded
+`smoke-test-clone-and-claude-linux` playbook requires:
 
 | Secret name | Used by | Purpose |
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | agent step | Authenticates the `claude` CLI inside the lease. |
-| `GIT_TOKEN` | `clone repository` pre-step | Injected into the clone URL (`https://x-access-token:<token>@…`). |
+| `ADO_PAT` | `clone first repo in project` pre-step (**step-only**) | Passed to `az repos list` via `AZURE_DEVOPS_EXT_PAT` and spliced into the clone URL. Delivered as `{name: "ADO_PAT", inject: "step-only"}` so it renders into the pre-step template but never lands in the lease environment — the agent step running inside the lease has no way to read it. The seeded playbook's third pre-step scrubs the credential from the git remote and clears `~/.azure`. |
 
 **Lease-env vs step-only secrets.** Each `env_requirements` entry is either a
 plain string (the legacy shape) or an object `{name, inject: "step-only"}`. Both
@@ -611,8 +612,8 @@ playbook. The shapes below are examples — fill in your own org/team values:
 
 - New backlog item → a triage playbook: `ado.workitem.created` where
   `iteration_path =~ Backlog`.
-- Your team's bugs/stories (created **or** moved into your area) → a researcher:
-  `ado.workitem.created` **and** `ado.workitem.area_changed` where
+- Your team's bugs/stories (created **or** moved into your area) → a review
+  playbook: `ado.workitem.created` **and** `ado.workitem.area_changed` where
   `area_path =~ ^Your\\Team\\Area` and `work_item_type` is `Bug` / `User Story`.
 - A teammate opens a PR → a build/test playbook: `ado.pullrequest.created`.
 
@@ -818,9 +819,11 @@ A minimal end-to-end setup once the backend is up and the ADO module is
 configured (Modules page or step 5 of the runbook below):
 
 1. **Store the credentials as secrets** (Settings → Secrets, or `PUT
-   /api/secrets`): at least `CLAUDE_CODE_OAUTH_TOKEN`, plus `GIT_TOKEN` for
-   private clones and the ADO PAT. Optionally add `ANTHROPIC_API_KEY` so the
-   Model picker can list models (otherwise it falls back to `CLAUDE_CODE_OAUTH_TOKEN`).
+   /api/secrets`): at least `CLAUDE_CODE_OAUTH_TOKEN` and `ADO_PAT` (both
+   used by the seeded first-launch smoke test — the PAT is delivered
+   step-only, so it renders into the clone pre-step but never lands in the
+   lease environment). Optionally add `ANTHROPIC_API_KEY` so the Model
+   picker can list models (otherwise it falls back to `CLAUDE_CODE_OAUTH_TOKEN`).
 2. **Set `default_lease_image`** on the Settings page to your allow-listed runner
    image, and click **Resolve from ADO** on `identity_me` so `@Me` rules resolve.
 3. **Create a playbook** (Playbooks → *New*). The drawer groups the lease shape
@@ -902,7 +905,8 @@ trusted.
    claude setup-token          # prints a CLAUDE_CODE_OAUTH_TOKEN
    ```
 
-   Store it (and a git token, if the researcher will clone private repos):
+   Store it plus an ADO PAT (Work Items Read + Code Read — the seeded smoke
+   test uses the PAT to list a project's repos and clone the first one):
 
    ```sh
    curl -X PUT http://127.0.0.1:3007/api/secrets \
@@ -910,24 +914,27 @@ trusted.
      -d '{"key":"CLAUDE_CODE_OAUTH_TOKEN","value":"<token>"}'
    curl -X PUT http://127.0.0.1:3007/api/secrets \
      -H 'content-type: application/json' \
-     -d '{"key":"GIT_TOKEN","value":"<git-token>"}'
+     -d '{"key":"ADO_PAT","value":"<ado-pat>"}'
    ```
 
-5. **Configure the ado module** (see the wiring-status note above). Store the ADO
-   PAT as a secret, then point the module at your org/project:
+   In `v1` wisper mode you also need `WISPER_API_KEY` (the `wck_live_*`
+   consumer key from wisper-api) stored the same way, or leasing stays idle.
+
+5. **Configure the ado module** (see the wiring-status note above), pointing
+   the module at the same PAT you just stored:
 
    ```sh
-   curl -X PUT http://127.0.0.1:3007/api/secrets \
-     -H 'content-type: application/json' \
-     -d '{"key":"ado_pat","value":"<ado-pat>"}'
    curl -X PUT http://127.0.0.1:3007/api/modules/ado/config \
      -H 'content-type: application/json' \
-     -d '{"org":"acme","project":"platform","pat_secret_ref":"ado_pat",
+     -d '{"org":"acme","project":"platform","pat_secret_ref":"ADO_PAT",
           "enabled":true,"interval_seconds":60,
           "watched":{"assignee_mode":"me","states":["Active"]}}'
    ```
 
-6. **Set the default lease image** to the reference from step 2:
+6. **Set the default lease image** to the reference from step 2. The seeded
+   `smoke-test-clone-and-claude-linux` playbook resolves its image through
+   `setting:default_lease_image` at dispatch time; a dispatch fails if the
+   setting is missing.
 
    ```sh
    curl -X PUT http://127.0.0.1:3007/api/settings \
@@ -935,17 +942,25 @@ trusted.
      -d '{"key":"default_lease_image","value":"ghcr.io/acme/agent:latest"}'
    ```
 
-7. **Create a rule** that dispatches the seed `researcher` playbook (id from `GET
-   /api/playbooks`). This one fires on any assignment and forwards a `repo_url`
-   the clone step needs:
+7. **Fire the first-launch smoke test.** The seeded `smoke test:
+   ado.workitem.*` rules already dispatch the seeded playbook the instant
+   any observed work item carries the `smoke-test-clone-and-claude-linux`
+   tag, and the seeded `Smoke test started` / `Smoke test finished` notify
+   rules push a desktop toast on both edges. So the trigger is:
 
-   ```sh
-   curl -X POST http://127.0.0.1:3007/api/rules \
-     -H 'content-type: application/json' \
-     -d '{"name":"research on assignment","enabled":true,
-          "match":{"source":"ado","type":"ado.workitem.assigned"},
-          "dispatch":[{"playbook_id":1}]}'
    ```
+   Tag any work item the ADO module watches with the string
+   smoke-test-clone-and-claude-linux and save it. The next touch of that
+   item (an edit, a state change, an assignment) will match a seeded rule
+   and dispatch the smoke test.
+   ```
+
+   The playbook installs the Azure CLI, uses `ADO_PAT` to list the project's
+   repositories, clones the first one into `./work`, scrubs the credential
+   from the git remote (and clears `~/.azure`), installs the `claude` CLI,
+   and asks the agent to explore the cloned repository and report findings.
+   If it drives all the way to a `done` run with findings you know
+   auth / lease / installs / network / claude / notifications all work.
 
 8. **Watch a dispatch run.** When the poller emits a matching event, a dispatch is
    enqueued and the dispatcher drains it. Follow it:

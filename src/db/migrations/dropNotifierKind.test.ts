@@ -40,6 +40,9 @@ describe("drop notifier kind migration", () => {
     // bare down() would revert the newest one instead.
     await db.migrate.down({ name: "20260713000017_drop_notifier_kind" });
     expect(await db.schema.hasColumn("notifiers", "kind")).toBe(true);
+    // Clear the seeded `desktop` notifier so id-ordering / name assertions
+    // below are deterministic; this test cares about the rows it inserts.
+    await db("notifiers").del();
 
     await db("notifiers").insert([
       {
