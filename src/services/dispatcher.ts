@@ -37,6 +37,7 @@ import {
 } from "../db/dispatches";
 import { getSetting } from "../db/settings";
 import {
+  attemptLeaseRelease,
   DEFAULT_SWEEP_BACKOFF_MS,
   runDispatch,
   sweepPendingReleases,
@@ -44,7 +45,7 @@ import {
 } from "../executor/executor";
 import type { DispatchRecord } from "../interfaces";
 import { log, type Logger } from "../log";
-import type { WisperClient } from "../wisper/client";
+import { DEFAULT_EXEC_TIMEOUT_MS, type WisperClient } from "../wisper/client";
 
 import { evaluateRunBudget } from "./runBudget";
 import { emitRunEvent, emitRunStartedEvent } from "./runEvents";
@@ -409,18 +410,7 @@ export class Dispatcher {
       this.db
     );
     await updateDispatch(dispatch.id, { attempts }, this.db);
-    if (attempts < maxAttempts) {
-      // resetToQueued clears the stale lease/contract handles and returns the row
-      // to `queued`; it keeps `attempts`, so the counter survives the retry.
-      // A failure that will be retried is NOT terminal, so no event is emitted.
-      await resetToQueued(dispatch.id, this.db);
-      this.logger.warn("dispatch failed (retryable); requeued", {
-        dispatchId: dispatch.id,
-        attempts,
-        maxAttempts,
-        error: outcome.error,
-      });
-    } else {
+    if (attempts >= maxAttempts) {
       this.logger.warn("dispatch failed (retryable); retries exhausted", {
         dispatchId: dispatch.id,
         attempts,
@@ -429,7 +419,67 @@ export class Dispatcher {
       });
       // Retries exhausted → this failure is now terminal: emit `run.failed`.
       await this.emitTerminalEvent(outcome, "failed");
+      return;
     }
+
+    // NEVER requeue while the row still holds an unreleased lease. The
+    // executor's `finally` already ran its bounded in-line release retries; if
+    // they exhausted (lease_id set, released_at null, release_pending true)
+    // and we resetToQueued now, lease_id is nulled and the handle to a
+    // still-billed lease is lost — the periodic sweep only touches TERMINAL
+    // rows, and the row is about to go back to `queued`, so nothing would ever
+    // release it before wisper's TTL failsafe fires. Try one more inline
+    // release; on success proceed with resetToQueued as today. If it still
+    // fails, convert THIS attempt to terminal `failed` (row is already
+    // `failed` from recordFailure; release_pending stays set from the
+    // executor's finally). A run whose release is failing is strong evidence
+    // the host/wisper path is unhealthy — retrying the whole dispatch
+    // immediately is unlikely to succeed and not worth leaking a billed lease.
+    if (outcome.lease_id !== null && outcome.released_at === null) {
+      const releaseOutcome = await attemptLeaseRelease(
+        this.wisper,
+        outcome.lease_id,
+        this.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS
+      );
+      if (releaseOutcome.ok) {
+        // Record the successful late release on the row so the sweep never
+        // considers it. resetToQueued will null both anyway, but this keeps
+        // the row consistent in case anything reads it in between.
+        await updateDispatch(
+          dispatch.id,
+          { released_at: this.now(), release_pending: false },
+          this.db
+        );
+      } else {
+        this.logger.warn(
+          "dispatch failed (retryable); lease release still failing, keeping terminal",
+          {
+            dispatchId: dispatch.id,
+            leaseId: outcome.lease_id,
+            attempts,
+            maxAttempts,
+            error: outcome.error,
+            releaseError: releaseOutcome.error,
+          }
+        );
+        // Row is already `failed` from recordFailure and release_pending is
+        // set by the executor's finally — the sweep now owns chasing the
+        // release. Emit the terminal event and stop; do NOT requeue.
+        await this.emitTerminalEvent(outcome, "failed");
+        return;
+      }
+    }
+
+    // resetToQueued clears the stale lease/contract handles and returns the row
+    // to `queued`; it keeps `attempts`, so the counter survives the retry.
+    // A failure that will be retried is NOT terminal, so no event is emitted.
+    await resetToQueued(dispatch.id, this.db);
+    this.logger.warn("dispatch failed (retryable); requeued", {
+      dispatchId: dispatch.id,
+      attempts,
+      maxAttempts,
+      error: outcome.error,
+    });
   }
 
   /**
