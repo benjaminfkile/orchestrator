@@ -110,10 +110,15 @@ describe("smoke-test install-claude native-installer migration (024)", () => {
         (p) => p.name === PLAYBOOK_NAME
       )!;
       const steps = smoke.steps as Step[];
+      // runMigrations applies everything through 025, which splices the
+      // leak-hunt step between scrub and install-claude on the pristine seed.
+      // The 024 rewrite is orthogonal to that splice — it only touches the
+      // install-claude step's command_template, not the surrounding order.
       expect(steps.map((s) => s.label)).toEqual([
         "install azure cli",
         "clone first repo in project",
         "scrub credentials (step-only PAT never survives past this step)",
+        "hunt for credential leaks (fatal if the scrub or step-only injection regresses)",
         "install claude code",
       ]);
     });

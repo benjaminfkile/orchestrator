@@ -88,13 +88,17 @@ describe("smoke-test playbook seed migration (023)", () => {
         name: "ADO_PAT",
         inject: "step-only",
       });
-      // Four ordered pre steps: install az, clone, scrub, install claude.
+      // Five ordered pre steps: install az, clone, scrub, leak-hunt (added
+      // by 025 on top of the 023 seed via the pristine-row guard), install
+      // claude. runMigrations here applies EVERY migration, so the final
+      // shape reflects the composed 023+024+025 state on a fresh DB.
       const steps = smoke.steps as Array<Record<string, unknown>>;
-      expect(steps).toHaveLength(4);
+      expect(steps).toHaveLength(5);
       expect(steps.map((s) => s.label)).toEqual([
         "install azure cli",
         "clone first repo in project",
         "scrub credentials (step-only PAT never survives past this step)",
+        "hunt for credential leaks (fatal if the scrub or step-only injection regresses)",
         "install claude code",
       ]);
       for (const step of steps) expect(step.phase).toBe("pre");
