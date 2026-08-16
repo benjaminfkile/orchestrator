@@ -47,7 +47,7 @@ import { log, type Logger } from "../log";
 import type { WisperClient } from "../wisper/client";
 
 import { evaluateRunBudget } from "./runBudget";
-import { emitRunEvent } from "./runEvents";
+import { emitRunEvent, emitRunStartedEvent } from "./runEvents";
 import { pruneRunRetention } from "./runRetention";
 
 /** The `app_settings` key for the (currently clamped) worker count. */
@@ -367,6 +367,12 @@ export class Dispatcher {
     // Guarded already by kick()/drainToEmpty, but keep the type honest.
     if (!this.wisper) return;
 
+    // The dispatch has been claimed (queued → leasing) and is about to execute.
+    // Feed a `run.started` event back into the pipeline so a rule can notify
+    // (or chain) when a long-running dispatch actually begins. Skipped/dropped
+    // dispatches never reach this point, so nothing bogus is emitted.
+    await this.emitStartedEvent(dispatch);
+
     const outcome = await runDispatch(dispatch.id, {
       wisper: this.wisper,
       resolveEnv: this.resolveEnv,
@@ -423,6 +429,29 @@ export class Dispatcher {
       });
       // Retries exhausted → this failure is now terminal: emit `run.failed`.
       await this.emitTerminalEvent(outcome, "failed");
+    }
+  }
+
+  /**
+   * Emit the `run.started` callback event ({@link emitRunStartedEvent}) for a
+   * just-claimed dispatch, passing this dispatcher as the kick target so any
+   * rule-driven chained dispatch is picked up promptly.
+   *
+   * Emission MUST NEVER break the drain loop: any failure here (a DB read error,
+   * a rule-engine throw) is caught and logged, and the run still proceeds.
+   */
+  private async emitStartedEvent(dispatch: DispatchRecord): Promise<void> {
+    try {
+      await emitRunStartedEvent(dispatch, {
+        db: this.db,
+        dispatcher: this,
+        logger: this.logger,
+      });
+    } catch (err) {
+      this.logger.error("failed to emit run.started event", {
+        dispatchId: dispatch.id,
+        error: errorMessage(err),
+      });
     }
   }
 

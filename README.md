@@ -182,39 +182,46 @@ secret — never silently dropped.
 
 ### Run-lifecycle callbacks
 
-When a dispatch reaches a **terminal** state the dispatcher feeds a generic event
-back into the orchestrator's own intake (`src/services/runEvents.ts`), so rules
-can react to a run's outcome and chain further playbooks. This is a callback built
-from existing machinery — no new tables, no new transport. Only terminal outcomes
-fire: `done` → **`run.completed`**, `failed` → **`run.failed`**. A failure that is
-about to be retried does **not** emit — only the final give-up does.
+The dispatcher feeds two kinds of generic events back into the orchestrator's
+own intake (`src/services/runEvents.ts`) so rules can react to a dispatch's
+lifecycle and notify or chain further playbooks. This is a callback built from
+existing machinery — no new tables, no new transport.
+
+- **`run.started`** — fires once when the dispatcher hands a **claimed** dispatch
+  to the executor. Dispatches that never start (dropped by a cap, held by the
+  run/token budget gate, or blocked by the chain-depth cap) emit nothing.
+- **`run.completed`** — fires on a terminal `done`.
+- **`run.failed`** — fires on a terminal `failed` (never before a retry — only
+  the final give-up emits).
 
 Every callback event carries `source` **`orchestrator`**, copies the originating
-event's `subject_kind`/`subject_ref`, has a null `dedupe_key`, and its payload
-summarizes the run:
+event's `subject_kind`/`subject_ref`, and has a null `dedupe_key`. `run.started`
+carries a start-time subset of the terminal payload — no `status`, `exit_code`,
+`error`, `findings`, `findings_count`, `collected`, `duration_ms`,
+`total_tokens`, or `run_id` (nothing is created until the run actually finishes):
 
 | Payload field | Meaning |
 |---|---|
-| `dispatch_id` | The dispatch that just terminated. |
-| `run_id` | Latest run's id, or `null` if the dispatch failed before any run opened. |
+| `dispatch_id` | The dispatch. |
+| `run_id` | Latest run's id, or `null` if the dispatch failed before any run opened (terminal only). |
 | `playbook_id` · `playbook_name` | The dispatched playbook (`playbook_name` `null` if it was deleted). |
 | `rule_id` | Rule that enqueued the dispatch, or `null` for a manual dispatch. |
-| `status` | `"done"` or `"failed"` — mirrors the event type. |
-| `exit_code` | The agent step's exit code, or `null`. |
-| `error` | The dispatch's failure message, or `null`. |
-| `findings` | Array of `{content, tags}` findings the run recorded. |
-| `findings_count` | Number of findings — handy as a criterion. |
-| `collected` | The run's collected output, or `null`. |
-| `duration_ms` · `total_tokens` | Run duration and summed token usage, or `null`. |
+| `status` | `"done"` or `"failed"` — mirrors the event type (terminal only). |
+| `exit_code` | The agent step's exit code, or `null` (terminal only). |
+| `error` | The dispatch's failure message, or `null` (terminal only). |
+| `findings` | Array of `{content, tags}` findings the run recorded (terminal only). |
+| `findings_count` | Number of findings — handy as a criterion (terminal only). |
+| `collected` | The run's collected output, or `null` (terminal only). |
+| `duration_ms` · `total_tokens` | Run duration and summed token usage, or `null` (terminal only). |
 | `origin` | `{event_id, source, type, subject_kind, subject_ref}` of the triggering event. |
 | `chain_depth` | One greater than the originating event's depth — the loop guard. |
 
 **Chain-loop guard.** Because a `run.*` event can itself match a rule that
-dispatches another run, each callback increments `chain_depth`, and intake's
-`dispatch_max_chain_depth` gate (default **3**) creates **no** dispatches once an
-event's `chain_depth` reaches the cap — so a react-to-your-own-run rule cannot
-loop forever. Events without a numeric `chain_depth` (every producer event) are
-treated as depth 0.
+dispatches another run, every run-lifecycle callback — `run.started` included —
+increments `chain_depth`, and intake's `dispatch_max_chain_depth` gate (default
+**3**) creates **no** dispatches once an event's `chain_depth` reaches the cap —
+so a react-to-your-own-run rule cannot loop forever. Events without a numeric
+`chain_depth` (every producer event) are treated as depth 0.
 
 Example rule that chains a second playbook off a completed run only when it
 produced findings:

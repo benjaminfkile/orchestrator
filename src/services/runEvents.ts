@@ -1,16 +1,17 @@
 /**
  * Run-lifecycle callback events.
  *
- * When a dispatch reaches a TERMINAL state the dispatcher calls {@link emitRunEvent}
- * to feed a generic event back into the orchestrator's own pipeline
- * ({@link emitEvent}), so user-configured rules can react to a run's outcome and
- * dispatch further playbooks. This is a callback mechanism built entirely from
- * existing machinery — it introduces no new tables and no new transport.
+ * The dispatcher feeds two kinds of generic events back into the orchestrator's
+ * own pipeline ({@link emitEvent}) so user-configured rules can react to a
+ * dispatch's lifecycle: {@link emitRunStartedEvent} fires once when a claimed
+ * dispatch begins executing, and {@link emitRunEvent} fires once when it reaches
+ * a TERMINAL state (`done`/`failed`). Both are callbacks built entirely from
+ * existing machinery — no new tables and no new transport.
  *
- * Per the architecture principle this module is domain-neutral: `run.completed`
- * and `run.failed` are pipeline-stage strings describing the dispatch's terminal
- * status, never a branch on user intent. All meaning lives in the rules a user
- * writes against these event types.
+ * Per the architecture principle this module is domain-neutral: `run.started`,
+ * `run.completed`, and `run.failed` are pipeline-stage strings describing the
+ * dispatch's lifecycle, never a branch on user intent. All meaning lives in the
+ * rules a user writes against these event types.
  *
  * Chain safety: each emitted event carries a `chain_depth` one greater than the
  * originating event's, and the intake's `dispatch_max_chain_depth` gate refuses
@@ -32,6 +33,8 @@ import { emitEvent, type Kickable } from "./eventIntake";
 
 /** Event `source` every run-lifecycle callback is recorded under. */
 export const RUN_EVENT_SOURCE = "orchestrator";
+/** Event `type` emitted when a claimed dispatch begins executing. */
+export const RUN_STARTED_TYPE = "run.started";
 /** Event `type` emitted when a dispatch finishes successfully. */
 export const RUN_COMPLETED_TYPE = "run.completed";
 /** Event `type` emitted when a dispatch fails terminally (no retry pending). */
@@ -148,6 +151,77 @@ export async function emitRunEvent(
     {
       source: RUN_EVENT_SOURCE,
       type,
+      subject_kind: event.subject_kind,
+      subject_ref: event.subject_ref,
+      dedupe_key: null,
+      payload,
+    },
+    db,
+    { dispatcher: deps.dispatcher, logger }
+  );
+}
+
+/**
+ * Build and emit the run-lifecycle callback event for a dispatch that has just
+ * begun executing (the dispatcher has claimed the row and it has transitioned
+ * out of `queued`). Produces a `run.started` event whose payload MIRRORS
+ * {@link emitRunEvent}'s shape minus the terminal-only fields (no `status`,
+ * `exit_code`, `error`, `findings`/`findings_count`, `collected`, `duration_ms`,
+ * `total_tokens`) and with no `run_id` — a run row is only created on success,
+ * so nothing exists to reference at start time.
+ *
+ * The event copies the originating event's `subject_kind`/`subject_ref`, carries
+ * a null `dedupe_key`, and its `chain_depth` is incremented from the origin's
+ * so the intake's `dispatch_max_chain_depth` gate treats a rule matching
+ * `run.started` exactly like one matching `run.completed`/`run.failed` — a rule
+ * that dispatches on `run.started` cannot loop forever.
+ *
+ * The event is emitted through the normal intake ({@link emitEvent}) so rules
+ * match it and any resulting dispatch is enqueued and the dispatcher kicked.
+ * A caller MUST wrap this so an emit failure never breaks the drain loop; a
+ * missing playbook row degrades to `playbook_name: null` (never fatal).
+ */
+export async function emitRunStartedEvent(
+  dispatch: DispatchRecord,
+  deps: EmitRunEventDeps = {}
+): Promise<void> {
+  const db = deps.db ?? getDb();
+  const logger = deps.logger ?? log;
+
+  const event = await getEventById(dispatch.event_id, db);
+  if (!event) {
+    // The originating event is the source of the subject and origin block; with
+    // it gone there is nothing meaningful to emit. This is not expected (events
+    // are never deleted), so surface it and skip rather than emit a hollow event.
+    logger.warn("skipping run.started event: originating event not found", {
+      dispatchId: dispatch.id,
+      eventId: dispatch.event_id,
+    });
+    return;
+  }
+
+  const playbook = await getPlaybook(dispatch.playbook_id, db);
+  const originDepth = readChainDepth(event.payload) ?? 0;
+
+  const payload = {
+    dispatch_id: dispatch.id,
+    playbook_id: dispatch.playbook_id,
+    playbook_name: playbook ? playbook.name : null,
+    rule_id: dispatch.rule_id,
+    origin: {
+      event_id: event.id,
+      source: event.source,
+      type: event.type,
+      subject_kind: event.subject_kind,
+      subject_ref: event.subject_ref,
+    },
+    chain_depth: originDepth + 1,
+  };
+
+  await emitEvent(
+    {
+      source: RUN_EVENT_SOURCE,
+      type: RUN_STARTED_TYPE,
       subject_kind: event.subject_kind,
       subject_ref: event.subject_ref,
       dedupe_key: null,

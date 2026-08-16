@@ -85,15 +85,20 @@ Key invariants you must respect:
     \`subject_kind\` \`monitor\`, \`subject_ref\` \`<id>\`, \`dedupe_key\`
     \`datadog:monitor:<id>:<group>\`. The \`event_dedupe_cooldown_seconds\` setting
     then suppresses re-storms of the same subject.
-- Run-lifecycle events (source \`orchestrator\`): \`run.completed\` / \`run.failed\`
-  fire on terminal dispatch outcomes. Payload: \`{dispatch_id, run_id,
+- Run-lifecycle events (source \`orchestrator\`): \`run.started\` fires once when
+  the dispatcher hands a claimed dispatch to the executor (never for dispatches
+  that stay queued or are dropped by a cap/gate); \`run.completed\` / \`run.failed\`
+  fire on terminal dispatch outcomes. \`run.started\` payload: \`{dispatch_id,
+  playbook_id, playbook_name, rule_id, origin, chain_depth}\` — the start-time
+  subset, with no terminal fields. Terminal payload: \`{dispatch_id, run_id,
   playbook_id, playbook_name, rule_id, status, exit_code, error, findings,
   findings_count, collected, duration_ms, total_tokens, origin, chain_depth}\`.
   \`origin\` is an OBJECT describing the triggering event — \`{event_id, source,
   type, subject_kind, subject_ref}\` — so a chaining rule matches e.g.
   \`payload.origin.subject_ref\`; \`findings\` is \`[{content, tags}]\`.
-  Rules can match these to CHAIN playbooks; the \`dispatch_max_chain_depth\`
-  setting (default 3) caps runaway chains.
+  Rules can match these to notify or CHAIN playbooks; the
+  \`dispatch_max_chain_depth\` setting (default 3) caps runaway chains for every
+  run-lifecycle event (\`run.started\` included).
 
 ## Rules — \`GET/POST /api/rules\`, \`GET/PATCH/DELETE /api/rules/:id\`, \`POST /api/rules/:id/enable|disable\`
 
