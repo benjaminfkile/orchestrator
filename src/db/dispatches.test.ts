@@ -13,6 +13,7 @@ import {
   getDispatch,
   getDispatchWithSubject,
   listDispatches,
+  listDispatchesWithPendingRelease,
   listDispatchesWithSubject,
   resetToQueued,
   updateDispatch,
@@ -225,6 +226,108 @@ describe("dispatches repo", () => {
     const claimed = await claimNextQueuedDispatch(db);
     expect(claimed?.id).toBe(created.id);
   });
+
+  it(
+    "resetToQueued clears release tracking from the prior attempt: released_at " +
+      "and release_pending both reset",
+    async () => {
+      // Attempt 1: leased, ran, released successfully — the finally block
+      // stamped released_at on the row before the retry decision.
+      const created = await newQueued();
+      await updateDispatch(
+        created.id,
+        {
+          status: "failed",
+          lease_id: "lease-1",
+          wisp_contract_id: "wc-1",
+          attempts: 1,
+          released_at: 1_000,
+          release_pending: false,
+        },
+        db
+      );
+
+      const reset = await resetToQueued(created.id, db);
+
+      expect(reset?.status).toBe("queued");
+      expect(reset?.lease_id).toBeNull();
+      expect(reset?.wisp_contract_id).toBeNull();
+      // The load-bearing invariant: release tracking describes the CURRENT
+      // lease attempt, so nulling the handles must also null these.
+      expect(reset?.released_at).toBeNull();
+      expect(reset?.release_pending).toBe(false);
+    }
+  );
+
+  it("resetToQueued preserves the attempts counter", async () => {
+    const created = await newQueued();
+    await updateDispatch(
+      created.id,
+      {
+        status: "failed",
+        lease_id: "lease-1",
+        wisp_contract_id: "wc-1",
+        attempts: 3,
+        error: "boom",
+      },
+      db
+    );
+
+    const reset = await resetToQueued(created.id, db);
+    // The retry counter must survive across the requeue — that's what caps
+    // total attempts. rule_id/playbook_id/event_id are also untouched.
+    expect(reset?.attempts).toBe(3);
+    expect(reset?.playbook_id).toBe(created.playbook_id);
+    expect(reset?.event_id).toBe(created.event_id);
+  });
+
+  it(
+    "regression: a retried dispatch whose second lease's release fails is " +
+      "still visible to the pending-release sweep",
+    async () => {
+      // Attempt 1: leased, ran, host died, finally-block released the lease
+      // — released_at is stamped on the row. Dispatcher then requeues:
+      const created = await newQueued();
+      await updateDispatch(
+        created.id,
+        {
+          status: "failed",
+          lease_id: "lease-1",
+          wisp_contract_id: "wc-1",
+          attempts: 1,
+          released_at: 1_000,
+          release_pending: false,
+        },
+        db
+      );
+      await resetToQueued(created.id, db);
+
+      // Attempt 2: a NEW lease is acquired and its release later fails, so
+      // the executor flips release_pending. Before the fix, the stale
+      // released_at from attempt 1 would still sit on the row, hiding this
+      // leaked lease from the sweep forever.
+      const claimed = await claimNextQueuedDispatch(db);
+      expect(claimed?.id).toBe(created.id);
+      await updateDispatch(
+        created.id,
+        {
+          status: "failed",
+          lease_id: "lease-2",
+          wisp_contract_id: "wc-2",
+          attempts: 2,
+          release_pending: true,
+        },
+        db
+      );
+
+      const pending = await listDispatchesWithPendingRelease(db);
+      expect(pending.map((d) => d.id)).toContain(created.id);
+      const row = pending.find((d) => d.id === created.id);
+      expect(row?.lease_id).toBe("lease-2");
+      expect(row?.released_at).toBeNull();
+      expect(row?.release_pending).toBe(true);
+    }
+  );
 
   it("returns undefined when resetting a missing dispatch", async () => {
     expect(await resetToQueued(9999, db)).toBeUndefined();
