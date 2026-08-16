@@ -235,7 +235,7 @@ describe("buildAgentCommand", () => {
       "it's a test"
     );
     expect(command).toBe(
-      "claude --print --dangerously-skip-permissions --output-format stream-json --verbose 'it'\\''s a test'"
+      "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose 'it'\\''s a test'"
     );
   });
 
@@ -245,11 +245,39 @@ describe("buildAgentCommand", () => {
     const legacy = buildAgentCommand(playbook, prompt);
     expect(buildAgentCommand(playbook, prompt, null)).toBe(legacy);
     expect(buildAgentCommand(playbook, prompt, "linux")).toBe(legacy);
-    // Sanity: the linux shape is the historical single-line POSIX-quoted form.
+    // Sanity: the linux shape is the historical single-line POSIX-quoted form,
+    // now prefixed with IS_SANDBOX=1 (the CLI's container escape hatch for
+    // --dangerously-skip-permissions when running under root, which every wisp
+    // container exec is).
     expect(legacy).toBe(
-      "claude --print --dangerously-skip-permissions --output-format stream-json --verbose " +
+      "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose " +
         "--model sonnet --allowedTools Read,Bash 'line one\nline '\\''two'\\'''"
     );
+  });
+
+  it("linux command starts with IS_SANDBOX=1 env prefix (root-refusal escape hatch)", () => {
+    for (const os of [undefined, null, "linux" as const]) {
+      const command = buildAgentCommand(
+        { model: null, allowed_tools: null },
+        "hi",
+        os ?? null
+      );
+      // The prefix comes first so /bin/sh -c applies it as a one-shot env
+      // assignment to just the `claude` invocation.
+      expect(command.startsWith("IS_SANDBOX=1 claude ")).toBe(true);
+    }
+  });
+
+  it("windows command carries no IS_SANDBOX prefix (shape unchanged)", () => {
+    const command = buildAgentCommand(
+      { model: null, allowed_tools: null },
+      "unused on windows",
+      "windows"
+    );
+    // The prefix belongs only on the linux shape — the whole windows command
+    // is base64 (no env-prefix syntax), and windows leases don't hit the
+    // linux root-refusal path.
+    expect(command).not.toContain("IS_SANDBOX");
   });
 
   describe("windows shape", () => {
