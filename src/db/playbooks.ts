@@ -1,6 +1,7 @@
 import type { Knex } from "knex";
 
 import type {
+  EnvRequirement,
   GrantedCapability,
   LeaseIsolation,
   NewPlaybook,
@@ -48,7 +49,7 @@ function fromRow(row: PlaybookRow): PlaybookRecord {
     prompt_template: row.prompt_template,
     runner: row.runner,
     runner_config: JSON.parse(row.runner_config) as Record<string, unknown>,
-    env_requirements: JSON.parse(row.env_requirements) as string[],
+    env_requirements: JSON.parse(row.env_requirements) as EnvRequirement[],
     steps: JSON.parse(row.steps) as unknown[],
     granted_capabilities: JSON.parse(
       row.granted_capabilities

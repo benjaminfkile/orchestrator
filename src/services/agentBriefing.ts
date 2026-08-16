@@ -125,7 +125,8 @@ Body: \`{name, enabled?, match?, dispatch?, notify?}\`.
 
 Body (required: name, image, ttl_seconds): \`{name, image, host?, isolation?,
 ttl_seconds, resources?{cpus,memory_mb,pids}, network? ("open"|"none"),
-userdata_template?, prompt_template?, runner?, runner_config?, env_requirements?,
+userdata_template?, prompt_template?, runner?, runner_config?,
+env_requirements? (array of \`"NAME"\` or \`{name, inject: "step-only"}\`),
 steps?, granted_capabilities?, output_kind?}\`.
 - \`image\`: literal image ref, or \`setting:<key>\` resolved from app settings at
   dispatch time (convention: \`setting:default_lease_image\`).
@@ -167,11 +168,20 @@ steps?, granted_capabilities?, output_kind?}\`.
 - \`steps\`: \`[{phase: "pre"|"collect", command_template, label}]\` — \`pre\` runs
   before the agent (e.g. git clone), \`collect\` after success; collect stdout is
   saved on the run keyed by label.
-- \`env_requirements\`: secret NAMES injected into the lease env; a missing
-  secret fails the dispatch before leasing. Reference them in templates as
-  \`{{env.NAME}}\`. IMPORTANT: the agent inside the lease only knows a variable
-  exists if the prompt says so — state available env var names in
-  \`prompt_template\`.
+- \`env_requirements\`: required secret NAMES. Each entry is EITHER a plain
+  string (the legacy shape — the resolved secret is injected into the lease env
+  AND available to server-side \`{{env.NAME}}\` template rendering) OR an object
+  \`{name, inject: "step-only"}\` (the resolved secret is available to server-side
+  template rendering ONLY — it is NEVER placed in the lease env, so the agent
+  step running inside the lease cannot read it from its process environment). A
+  missing secret fails the dispatch before leasing under both shapes. Reference
+  the secret in templates as \`{{env.NAME}}\`. Use \`inject: "step-only"\` for
+  one-shot credentials (e.g. a PAT that a \`pre\` step's \`git clone\` needs once);
+  the value still appears in that step's rendered command sent to wisper, but
+  does not persist in the lease env for the whole run. IMPORTANT: the agent
+  inside the lease only knows a lease-env variable exists if the prompt says so
+  — state available env var names in \`prompt_template\` (do NOT advertise
+  \`step-only\` names, they are not there).
 - Template substitution (prompt/userdata/step/script templates):
   \`{{event.type}}\`, \`{{event.source}}\`, \`{{event.subject_ref}}\`,
   \`{{payload.<dotted.path>}}\`, \`{{env.NAME}}\`. Unknown tokens render empty.

@@ -217,6 +217,58 @@ describe("playbooks router", () => {
       expect(res.status).toBe(400);
     });
 
+    it("accepts env_requirements as strings AND {name, inject: 'step-only'} objects", async () => {
+      // Mixed shapes: the plain string is the legacy lease-env form; the object
+      // is a step-only secret rendered into step templates without ever landing
+      // in the lease env at dispatch time.
+      const res = await request(app)
+        .post("/api/playbooks")
+        .send({
+          ...VALID,
+          env_requirements: [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            { name: "ADO_PAT", inject: "step-only" },
+          ],
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.env_requirements).toEqual([
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        { name: "ADO_PAT", inject: "step-only" },
+      ]);
+    });
+
+    it("400s when env_requirements holds an object with an unknown inject mode", async () => {
+      const res = await request(app)
+        .post("/api/playbooks")
+        .send({
+          ...VALID,
+          env_requirements: [{ name: "X", inject: "lease" }],
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("inject");
+    });
+
+    it("400s when env_requirements holds an object with no name", async () => {
+      const res = await request(app)
+        .post("/api/playbooks")
+        .send({
+          ...VALID,
+          env_requirements: [{ inject: "step-only" }],
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("name");
+    });
+
+    it("400s when env_requirements holds an unknown key", async () => {
+      const res = await request(app)
+        .post("/api/playbooks")
+        .send({
+          ...VALID,
+          env_requirements: [{ name: "X", inject: "step-only", extra: 1 }],
+        });
+      expect(res.status).toBe(400);
+    });
+
     it("409s on a duplicate name", async () => {
       await createPlaybook(VALID, db);
       const res = await request(app).post("/api/playbooks").send(VALID);

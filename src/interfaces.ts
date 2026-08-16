@@ -205,6 +205,43 @@ export interface GrantedCapability {
 }
 
 /**
+ * One entry in a playbook's `env_requirements`. Two forms are accepted (all
+ * tolerantly parsed — see `parseEnvRequirements`):
+ *
+ *   - a plain `string` (the legacy shape) — the resolved secret is BOTH injected
+ *     into the lease environment AND available to server-side `{{env.NAME}}`
+ *     template rendering in step commands, userdata, prompts, and the script
+ *     runner's command template. This is what every existing playbook uses.
+ *   - an object `{name, inject: "step-only"}` — the resolved secret is available
+ *     to server-side `{{env.NAME}}` template rendering but is NEVER placed into
+ *     the lease env. Use this for one-shot credentials (e.g. a PAT that a `pre`
+ *     step's `git clone` needs once) so the agent step running inside the lease
+ *     cannot read the value out of its process environment. The trade-off is
+ *     documented at {@link EnvRequirementObject.inject}.
+ *
+ * The distinction lives entirely in delivery — resolution and missing-secret
+ * handling are identical for both forms (unmet names are collected and reported
+ * together, and the dispatch fails BEFORE any lease is created).
+ */
+export type EnvRequirement = string | EnvRequirementObject;
+
+/**
+ * Object form of an {@link EnvRequirement}: a required secret that is NOT
+ * injected into the lease environment. Only `inject: "step-only"` is defined
+ * today; other values are rejected on save (and skipped on tolerant parse).
+ *
+ * Trade-off: a step-only secret still appears in the RENDERED command string
+ * sent to wisper for the one exec that references it — visible in the container
+ * process's cmdline while that step runs. That is accepted: the goal is that the
+ * value does not PERSIST in the lease environment for the whole run, where an
+ * LLM with shell access could read it out at any time.
+ */
+export interface EnvRequirementObject {
+  name: string;
+  inject: "step-only";
+}
+
+/**
  * A persisted playbook as stored in the `playbooks` table. The JSON columns
  * (`resources`, `runner_config`, `env_requirements`, `steps`,
  * `granted_capabilities`) are parsed; on disk they are JSON-encoded TEXT columns.
@@ -238,7 +275,7 @@ export interface PlaybookRecord {
   prompt_template: string;
   runner: string;
   runner_config: Record<string, unknown>;
-  env_requirements: string[];
+  env_requirements: EnvRequirement[];
   steps: unknown[];
   granted_capabilities: GrantedCapability[];
   output_kind: string;
@@ -265,7 +302,7 @@ export interface NewPlaybook {
   prompt_template?: string;
   runner?: string;
   runner_config?: Record<string, unknown>;
-  env_requirements?: string[];
+  env_requirements?: EnvRequirement[];
   steps?: unknown[];
   granted_capabilities?: GrantedCapability[];
   output_kind?: string;
@@ -286,7 +323,7 @@ export interface PlaybookUpdate {
   prompt_template?: string;
   runner?: string;
   runner_config?: Record<string, unknown>;
-  env_requirements?: string[];
+  env_requirements?: EnvRequirement[];
   steps?: unknown[];
   granted_capabilities?: GrantedCapability[];
   output_kind?: string;

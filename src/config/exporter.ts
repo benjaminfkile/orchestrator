@@ -7,7 +7,9 @@ import { listRules } from "../db/rules";
 import { getAllSettings } from "../db/settings";
 import { listSnippets } from "../db/snippets";
 import { DEFAULT_LEASE_IMAGE_SETTING } from "../executor/executor";
+import { envRequirementName } from "../executor/executor";
 import type {
+  EnvRequirement,
   LeaseIsolation,
   PlaybookRecord,
   SnippetKind,
@@ -80,7 +82,7 @@ export interface ExportedPlaybook {
   prompt_template: string;
   runner: string;
   runner_config: Record<string, unknown>;
-  env_requirements: string[];
+  env_requirements: EnvRequirement[];
   steps: unknown[];
   granted_capabilities: unknown[];
   output_kind: string;
@@ -328,8 +330,8 @@ export async function exportConfig(
     }
   };
   for (const p of exportedPlaybooks) {
-    for (const name of p.env_requirements) {
-      addUse(name, `playbook:${p.key} (env)`);
+    for (const req of p.env_requirements) {
+      addUse(envRequirementName(req), `playbook:${p.key} (env)`);
     }
   }
   for (const entry of moduleConfigs) {

@@ -48,6 +48,28 @@ export interface GrantedCapability {
   config?: Record<string, unknown>;
 }
 
+/**
+ * One entry in a playbook's `env_requirements`. Two accepted shapes:
+ *   - a plain `string` — resolved secret is injected into the lease env AND
+ *     available to `{{env.NAME}}` server-side template rendering.
+ *   - `{name, inject: "step-only"}` — resolved secret is available to server-
+ *     side template rendering ONLY; NEVER placed in the lease env. Use for
+ *     one-shot credentials so the agent step inside the lease cannot read the
+ *     value from its process environment.
+ * Missing-secret handling is identical for both forms.
+ */
+export type EnvRequirement = string | { name: string; inject: "step-only" };
+
+/** The name of a required secret, regardless of entry shape. */
+export function envRequirementName(req: EnvRequirement): string {
+  return typeof req === "string" ? req : req.name;
+}
+
+/** True when the entry is the step-only object form. */
+export function isStepOnlyEnvRequirement(req: EnvRequirement): boolean {
+  return typeof req === "object" && req.inject === "step-only";
+}
+
 /** A playbook record as returned by `GET /api/playbooks`, id ascending. */
 export interface PlaybookRecord {
   id: number;
@@ -79,7 +101,7 @@ export interface PlaybookRecord {
    * editor for any other runner.
    */
   runner_config: Record<string, unknown>;
-  env_requirements: string[];
+  env_requirements: EnvRequirement[];
   steps: PlaybookStep[];
   granted_capabilities: GrantedCapability[];
   output_kind: string;
@@ -105,7 +127,7 @@ export interface NewPlaybook {
   prompt_template?: string;
   runner?: string;
   runner_config?: Record<string, unknown>;
-  env_requirements?: string[];
+  env_requirements?: EnvRequirement[];
   steps?: PlaybookStep[];
   granted_capabilities?: GrantedCapability[];
   output_kind?: string;
