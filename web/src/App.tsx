@@ -43,6 +43,7 @@ import { SnippetsPage } from "./pages/SnippetsPage";
 import { NotificationBell } from "./components/NotificationBell";
 import { NotificationsProvider } from "./components/NotificationsProvider";
 import { ChangesProvider } from "./components/ChangesProvider";
+import { SystemStatusBanner } from "./components/SystemStatusBanner";
 
 // Below this width the persistent rail collapses into a top app bar + drawer.
 // Kept in one place so the layout switch and any future styling agree.
@@ -145,10 +146,20 @@ const useStyles = makeStyles({
     backgroundColor: tokens.colorNeutralBackground1Selected,
     fontWeight: tokens.fontWeightSemibold,
   },
+  // Column wrapper for the main region: fixed banner slot on top, scrollable
+  // routed content below. Keeps a warning banner visible while the user
+  // scrolls the page it applies to.
+  contentColumn: {
+    flexGrow: 1,
+    display: "flex",
+    flexDirection: "column",
+    minHeight: 0,
+  },
   content: {
     flexGrow: 1,
     padding: `${tokens.spacingVerticalXL} ${tokens.spacingHorizontalXL}`,
     overflowY: "auto",
+    minHeight: 0,
   },
 });
 
@@ -415,7 +426,10 @@ function AppShell() {
       <NotificationsProvider>
         <ChangesProvider>
           {isNarrow ? <MobileNav /> : <SideNav />}
-          <RoutedContent />
+          <div className={styles.contentColumn}>
+            <SystemStatusBanner />
+            <RoutedContent />
+          </div>
         </ChangesProvider>
       </NotificationsProvider>
     </FluentProvider>
