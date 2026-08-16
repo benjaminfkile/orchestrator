@@ -257,6 +257,12 @@ rename therefore breaks every reference by design.
   dispatcher is up and reattempts release for any dispatch with a non-null
   \`lease_id\` and a null \`released_at\`, regardless of the dispatch's terminal
   status. A wisper "not_found" response is treated as a successful release.
+- A retryable dispatch failure is NEVER requeued while it still holds an
+  unreleased lease: the dispatcher tries one more inline release first, and if
+  that also fails it leaves the row \`failed\` with \`release_pending\` set (the
+  sweep then chases the release) instead of requeueing — a stuck release is
+  strong evidence the host/wisper path is unhealthy, and requeueing would drop
+  the lease handle so the lease would run to wisper's TTL failsafe, billed.
 - Runs: \`GET /api/runs/:id\` -> run + collected output + findings. \`GET
   /api/runs\` also takes \`?limit=\` (1..1000) and \`?status=\` (a dispatch status).
 

@@ -16,6 +16,7 @@ import { createPlaybook } from "../db/playbooks";
 import { createRule } from "../db/rules";
 import { createRun } from "../db/runs";
 import { setSetting } from "../db/settings";
+import { sweepPendingReleases } from "../executor/executor";
 import { createLogger, type Logger } from "../log";
 import { WisperClient } from "../wisper/client";
 
@@ -42,10 +43,21 @@ class FakeWisper {
   /** The rendered command of every streaming (agent) exec, in wire order. */
   readonly streamCommands: string[] = [];
   readonly releasedLeases: string[] = [];
+  /** Every DELETE the fake observed — including the ones it failed. */
+  readonly releaseAttempts: string[] = [];
 
   private plans: ExecPlan[] = [{ exitCode: 0 }];
   private streamCount = 0;
   private nextLease = 1;
+  /**
+   * Per-lease queue of scripted release responses. Each entry answers the NEXT
+   * DELETE against that lease; once the queue drains the fake responds 200
+   * (the happy default). Lets a test say "fail this lease's release N times".
+   */
+  private releaseResponses: Map<
+    string,
+    Array<{ status: number; body: unknown }>
+  > = new Map();
   private server!: http.Server;
   baseUrl = "";
 
@@ -53,6 +65,20 @@ class FakeWisper {
   planExecs(plans: ExecPlan[]): void {
     this.plans = plans.length > 0 ? plans : [{ exitCode: 0 }];
     this.streamCount = 0;
+  }
+
+  /**
+   * Queue one canned release response for the next DELETE against `leaseId`.
+   * Call multiple times to script a sequence; once the queue empties, later
+   * DELETEs succeed as usual.
+   */
+  planReleaseResponse(
+    leaseId: string,
+    response: { status: number; body: unknown }
+  ): void {
+    const queue = this.releaseResponses.get(leaseId) ?? [];
+    queue.push(response);
+    this.releaseResponses.set(leaseId, queue);
   }
 
   private planForStream(): ExecPlan {
@@ -112,7 +138,19 @@ class FakeWisper {
 
     const delMatch = url.match(/^\/dev\/leases\/([^/?]+)/);
     if (method === "DELETE" && delMatch) {
-      this.releasedLeases.push(decodeURIComponent(delMatch[1]));
+      const leaseId = decodeURIComponent(delMatch[1]);
+      this.releaseAttempts.push(leaseId);
+      const scripted = this.releaseResponses.get(leaseId)?.shift();
+      if (scripted) {
+        res.writeHead(scripted.status, { "content-type": "application/json" });
+        res.end(
+          typeof scripted.body === "string"
+            ? scripted.body
+            : JSON.stringify(scripted.body)
+        );
+        return;
+      }
+      this.releasedLeases.push(leaseId);
       res.writeHead(200, { "content-type": "application/json" });
       res.end("");
       return;
@@ -322,6 +360,124 @@ describe("Dispatcher", () => {
     // One failure was counted; the retry then succeeded.
     expect(dispatch?.attempts).toBe(1);
     expect(fake.createBodies).toHaveLength(2);
+    // The retryable-failure branch requeued cleanly: no extra "one more inline
+    // release" was needed because the executor's in-line release succeeded.
+    // Two attempts, two leases created, two leases released (the retry's exec
+    // also succeeded, so its release ran too).
+    expect(fake.releasedLeases).toEqual(["lease-1", "lease-2"]);
+  });
+
+  it("retryable failure with a failed inline release: one more inline release, then requeued", async () => {
+    // Attempt 1: agent fails retryably (host_offline) AND every one of the
+    // executor's in-line release retries (there are 2 backoffs => 3 total
+    // attempts) also fails with a retryable code. The dispatcher must then
+    // try one more inline release before requeueing; that extra one succeeds,
+    // so the retry runs and eventually succeeds.
+    fake.planExecs([{ errorCode: "host_offline" }, { exitCode: 0 }]);
+    for (let i = 0; i < 3; i++) {
+      fake.planReleaseResponse("lease-1", {
+        status: 409,
+        body: {
+          error: {
+            code: "host_offline",
+            message: "host is offline",
+            request_id: `r-${i}`,
+          },
+        },
+      });
+    }
+
+    const id = await seedDispatch("1");
+    const d = makeDispatcher();
+    await drain(d);
+
+    const dispatch = await getDispatch(id, db);
+    expect(dispatch?.status).toBe("done");
+    // Retry succeeded, so only the first attempt's failure was counted.
+    expect(dispatch?.attempts).toBe(1);
+    // Two leases were created (one per attempt); the retry's lease released
+    // cleanly, and the first lease also eventually released via the
+    // dispatcher's extra inline release call.
+    expect(fake.createBodies).toHaveLength(2);
+    // lease-1 saw 4 DELETEs: 3 from the executor's in-line retries (all
+    // failing), plus the extra ONE from the dispatcher (which succeeded).
+    // lease-2 saw exactly ONE (its normal happy-path release).
+    const l1Attempts = fake.releaseAttempts.filter((l) => l === "lease-1").length;
+    const l2Attempts = fake.releaseAttempts.filter((l) => l === "lease-2").length;
+    expect(l1Attempts).toBe(4);
+    expect(l2Attempts).toBe(1);
+    // Both leases were eventually released.
+    expect(fake.releasedLeases.sort()).toEqual(["lease-1", "lease-2"]);
+    // No release_pending left on the row.
+    expect(dispatch?.release_pending).toBe(false);
+    expect(dispatch?.released_at).not.toBeNull();
+  });
+
+  it("retryable failure whose release keeps failing: dispatch converts to terminal failed with release_pending, sweep recovers", async () => {
+    // Attempt 1: agent fails retryably (host_offline) AND every release DELETE
+    // ever aimed at lease-1 fails — the executor's in-line retries AND the
+    // dispatcher's extra `attemptLeaseRelease` (which itself does internal
+    // backoff retries) all get scripted failures. The dispatcher must then
+    // convert the dispatch to TERMINAL failed rather than requeueing (which
+    // would drop the lease handle). The row stays release_pending; a
+    // subsequent sweep recovers the lease when wisper starts answering again.
+    fake.planExecs([{ errorCode: "host_offline" }]);
+    // Script 6 = 3 (executor in-line retries) + 3 (dispatcher's extra
+    // attemptLeaseRelease's internal retries) failing DELETEs, so every
+    // release attempt against lease-1 before the sweep is a hard failure.
+    for (let i = 0; i < 6; i++) {
+      fake.planReleaseResponse("lease-1", {
+        status: 409,
+        body: {
+          error: {
+            code: "host_offline",
+            message: "host is offline",
+            request_id: `r-${i}`,
+          },
+        },
+      });
+    }
+
+    const id = await seedDispatch("1");
+    const d = makeDispatcher();
+    await drain(d);
+
+    // Dispatch is terminal failed (not requeued), still holding an unreleased
+    // lease handle with release_pending set.
+    let dispatch = await getDispatch(id, db);
+    expect(dispatch?.status).toBe("failed");
+    expect(dispatch?.error).toContain("host_offline");
+    expect(dispatch?.lease_id).toBe("lease-1");
+    expect(dispatch?.released_at).toBeNull();
+    expect(dispatch?.release_pending).toBe(true);
+    // Attempts counter still bumped for the attempt that just failed.
+    expect(dispatch?.attempts).toBe(1);
+    // Only ONE dispatch attempt ever created a lease — we did NOT requeue.
+    expect(fake.createBodies).toHaveLength(1);
+    // No second dispatch attempt kicked off.
+    expect(fake.streamCommands).toHaveLength(1);
+    // 6 DELETEs against lease-1: 3 in-line (executor) + 3 (dispatcher's
+    // extra attemptLeaseRelease's own bounded retries). All were the
+    // scripted failures, so releasedLeases is empty at this point.
+    expect(fake.releaseAttempts.filter((l) => l === "lease-1").length).toBe(6);
+    expect(fake.releasedLeases).toEqual([]);
+
+    // Now drive the real sweep — wisper is answering again (scripted
+    // responses are drained, so the next DELETE 200s). backoffMs=0 rules
+    // out the per-lease cooldown.
+    const released = await sweepPendingReleases({
+      wisper: client(),
+      db,
+      logger: silentLogger(),
+      backoffMs: 0,
+    });
+    expect(released).toBe(1);
+
+    dispatch = await getDispatch(id, db);
+    expect(dispatch?.status).toBe("failed");
+    expect(dispatch?.released_at).not.toBeNull();
+    expect(dispatch?.release_pending).toBe(false);
+    expect(fake.releasedLeases).toEqual(["lease-1"]);
   });
 
   it("does not retry a non-retryable failure (terminal immediately)", async () => {
