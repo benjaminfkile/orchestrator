@@ -472,9 +472,11 @@ describe("PlaybooksPage", () => {
       (screen.getByRole("textbox", { name: "Prompt template" }) as HTMLTextAreaElement)
         .value,
     ).toBe("Investigate {{payload.title}}");
-    // Existing tag values are prefilled and rendered.
+    // Existing tag values are prefilled and rendered. The env requirement's
+    // name appears both as a picker tag and in the per-entry toggle row below,
+    // so it renders more than once.
     expect(screen.getByText("Bash")).toBeTruthy();
-    expect(screen.getByText("ADO_PAT")).toBeTruthy();
+    expect(screen.getAllByText("ADO_PAT").length).toBeGreaterThan(0);
 
     fireEvent.change(name, { target: { value: "Renamed" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));

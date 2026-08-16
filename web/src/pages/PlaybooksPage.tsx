@@ -20,6 +20,7 @@ import {
   mergeClasses,
   Select,
   Spinner,
+  Switch,
   Table,
   TableBody,
   TableCell,
@@ -49,11 +50,14 @@ import {
   createPlaybook,
   DEFAULT_RUNNER,
   deletePlaybook,
+  envRequirementName,
   getPlaybookUsage,
+  isStepOnlyEnvRequirement,
   LEASE_ISOLATION_LEVELS,
   listPlaybooks,
   listRunners,
   updatePlaybook,
+  type EnvRequirement,
   type GrantedCapability,
   type LeaseIsolation,
   type NewPlaybook,
@@ -180,6 +184,25 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: tokens.spacingVerticalS,
+  },
+  // Per-env-requirement rows rendered under the multi-select picker so a user
+  // can toggle each selected secret to step-only mode (see EnvRequirement).
+  envRows: {
+    display: "flex",
+    flexDirection: "column",
+    gap: tokens.spacingVerticalXS,
+    paddingLeft: tokens.spacingHorizontalM,
+    borderLeft: `${tokens.strokeWidthThick} solid ${tokens.colorNeutralStroke2}`,
+  },
+  envRow: {
+    display: "flex",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: tokens.spacingHorizontalM,
+  },
+  envHint: {
+    fontSize: tokens.fontSizeBase200,
+    color: tokens.colorNeutralForeground3,
   },
   steps: {
     display: "flex",
@@ -357,7 +380,7 @@ interface DraftState {
   command_template: string;
   // Raw JSON textarea backing the fallback config editor for an unknown runner.
   runner_config_text: string;
-  env_requirements: string[];
+  env_requirements: EnvRequirement[];
   granted_capabilities: CapabilityDraft[];
   steps: StepDraft[];
   prompt_template: string;
@@ -735,7 +758,9 @@ export function PlaybooksPage() {
     () =>
       secretNames === null
         ? []
-        : draft.env_requirements.filter((n) => !secretNames.includes(n)),
+        : draft.env_requirements
+            .map(envRequirementName)
+            .filter((n) => !secretNames.includes(n)),
     [secretNames, draft.env_requirements],
   );
 
@@ -794,6 +819,36 @@ export function PlaybooksPage() {
     },
     [],
   );
+
+  // Reconcile the multi-select against the current requirements: retained names
+  // keep their inject mode, freshly-picked names default to the plain-string
+  // (lease-env) shape, dropped names fall away. Order follows the picker's
+  // selection order so the toggle rows below match what the user sees selected.
+  const onEnvRequirementsChange = useCallback((next: string[]) => {
+    setDraft((prev) => {
+      const existing = new Map<string, EnvRequirement>();
+      for (const req of prev.env_requirements) {
+        existing.set(envRequirementName(req), req);
+      }
+      return {
+        ...prev,
+        env_requirements: next.map((name) => existing.get(name) ?? name),
+      };
+    });
+  }, []);
+
+  // Toggle one requirement between the plain-string form (injected into the
+  // lease env) and the `{name, inject: "step-only"}` form (available only to
+  // server-side template rendering).
+  const setEnvStepOnly = useCallback((name: string, stepOnly: boolean) => {
+    setDraft((prev) => ({
+      ...prev,
+      env_requirements: prev.env_requirements.map((req) => {
+        if (envRequirementName(req) !== name) return req;
+        return stepOnly ? { name, inject: "step-only" } : name;
+      }),
+    }));
+  }, []);
 
   // Splice a prompt snippet's `{{snippet.<name>}}` token into prompt_template at
   // the caret so users can stack and position them freely; when no live caret is
@@ -1338,10 +1393,40 @@ export function PlaybooksPage() {
                     label="Env requirements"
                     aria-label="Env requirements"
                     placeholder="Pick or type a secret name"
-                    value={draft.env_requirements}
-                    onChange={(next) => set("env_requirements", next)}
+                    value={draft.env_requirements.map(envRequirementName)}
+                    onChange={onEnvRequirementsChange}
                     load={loadSecretOptions}
                   />
+                  {draft.env_requirements.length > 0 && (
+                    <div className={styles.envRows}>
+                      {draft.env_requirements.map((req) => {
+                        const name = envRequirementName(req);
+                        const stepOnly = isStepOnlyEnvRequirement(req);
+                        return (
+                          <div key={name} className={styles.envRow}>
+                            <Text as="span" className={styles.mono}>
+                              {name}
+                            </Text>
+                            <Switch
+                              label="Step-only (do not inject into lease env)"
+                              aria-label={`${name} step-only`}
+                              checked={stepOnly}
+                              onChange={(_, d) =>
+                                setEnvStepOnly(name, d.checked)
+                              }
+                            />
+                          </div>
+                        );
+                      })}
+                      <Text as="p" className={styles.envHint}>
+                        Step-only secrets render into {"{{env.NAME}}"} in step
+                        commands but are never placed in the lease env, so the
+                        agent step can’t read them. Use for one-shot credentials
+                        (e.g. a PAT for a <code>pre</code> step’s
+                        <code> git clone</code>).
+                      </Text>
+                    </div>
+                  )}
                   {unknownEnvNames.length > 0 && (
                     <Text as="p" className={styles.warn} role="note">
                       Not yet in the secret store: {unknownEnvNames.join(", ")}. Add{" "}

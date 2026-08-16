@@ -8,6 +8,7 @@ import {
 } from "../db/playbooks";
 import {
   LEASE_ISOLATION_LEVELS,
+  type EnvRequirement,
   type LeaseIsolation,
   type PlaybookUpdate,
 } from "../interfaces";
@@ -22,7 +23,6 @@ import {
   HttpError,
   isPlainObject,
   optionalString,
-  optionalStringArray,
   parseIdParam,
   rejectUnknownKeys,
   requireBody,
@@ -213,6 +213,46 @@ function validateIsolation(value: unknown): void {
   }
 }
 
+/**
+ * Validate an optional `env_requirements` array. Each entry is either a
+ * non-empty string (the legacy shape — inject into the lease env) or an object
+ * `{name, inject: "step-only"}` (available to server-side template rendering
+ * but NOT injected into the lease env). Any other shape is a 400 at save time
+ * so a misconfiguration is caught here, before it can quietly become a
+ * silently-skipped requirement at dispatch time (see `parseEnvRequirements`).
+ */
+function validateEnvRequirements(value: unknown): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "env_requirements must be an array");
+  }
+  value.forEach((entry, i) => {
+    if (typeof entry === "string") {
+      if (entry.length === 0) {
+        throw new HttpError(
+          400,
+          `env_requirements[${i}] must be a non-empty string`
+        );
+      }
+      return;
+    }
+    if (!isPlainObject(entry)) {
+      throw new HttpError(
+        400,
+        `env_requirements[${i}] must be a string or an object`
+      );
+    }
+    rejectUnknownKeys(entry, ["name", "inject"], `env_requirements[${i}]`);
+    requireString(entry.name, `env_requirements[${i}].name`);
+    if (entry.inject !== "step-only") {
+      throw new HttpError(
+        400,
+        `env_requirements[${i}].inject must be "step-only"`
+      );
+    }
+  });
+}
+
 /** Validate the fields shared by create and patch; `require` gates required ones. */
 function validateCommon(body: Record<string, unknown>): void {
   validateHost(body.host);
@@ -223,7 +263,7 @@ function validateCommon(body: Record<string, unknown>): void {
   optionalString(body.output_kind, "output_kind");
   validateRunner(body.runner);
   validateRunnerConfig(body.runner_config);
-  optionalStringArray(body.env_requirements, "env_requirements");
+  validateEnvRequirements(body.env_requirements);
   validateResources(body.resources);
   validateSteps(body.steps);
   validateGrantedCapabilities(body.granted_capabilities);
@@ -255,7 +295,7 @@ function optionalFields(body: Record<string, unknown>): PlaybookUpdate {
     out.runner_config = body.runner_config as Record<string, unknown>;
   }
   if (body.env_requirements !== undefined) {
-    out.env_requirements = body.env_requirements as string[];
+    out.env_requirements = body.env_requirements as EnvRequirement[];
   }
   if (body.steps !== undefined) out.steps = body.steps as unknown[];
   if (body.granted_capabilities !== undefined) {

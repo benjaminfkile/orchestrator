@@ -50,6 +50,7 @@ import { getSetting } from "../db/settings";
 import type {
   DispatchRecord,
   DispatchStatus,
+  EnvRequirement,
   EventRecord,
   GrantedCapability,
   PlaybookStep,
@@ -231,6 +232,61 @@ async function resolveCapabilityContext(
 /** True for a non-null, non-array object value. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Parse a playbook's `env_requirements` array into typed {@link EnvRequirement}s,
+ * preserving order. Two shapes per entry are accepted:
+ *   - a plain string — the legacy shape; the resolved secret is injected into
+ *     the lease environment AND available to template rendering.
+ *   - `{name: string, inject: "step-only"}` — the resolved secret is available
+ *     to server-side template rendering (`{{env.NAME}}` in step commands,
+ *     userdata, prompt, and the script runner's command template) but is NOT
+ *     placed into the lease env, so a persistent agent step running inside the
+ *     lease cannot read it out of its process environment. See
+ *     {@link EnvRequirement}.
+ * Any entry that is neither shape (an object with a missing/bad `name`, an
+ * unknown `inject` value, a null, an array, etc.) is SKIPPED rather than fatal
+ * — the core stays tolerant of malformed config, like {@link parseSteps} and
+ * the rest of the template pipeline. Plain strings are passed through unchanged
+ * for full backward compatibility with every existing playbook row.
+ */
+export function parseEnvRequirements(raw: unknown[]): EnvRequirement[] {
+  const out: EnvRequirement[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      out.push(item);
+      continue;
+    }
+    if (!isRecord(item)) continue;
+    const { name, inject } = item;
+    if (typeof name !== "string" || name.length === 0) continue;
+    if (inject === "step-only") {
+      out.push({ name, inject: "step-only" });
+    }
+    // Any other `inject` value (or a missing one on the object form) is skipped
+    // rather than defaulting silently — an unknown mode is a misconfiguration.
+  }
+  return out;
+}
+
+/**
+ * The name of a required secret, regardless of the entry shape. Used wherever
+ * the core needs just the NAMES of a playbook's `env_requirements` (e.g. the
+ * capability-context resolver's `envNames`, the missing-secret error message).
+ */
+export function envRequirementName(req: EnvRequirement): string {
+  return typeof req === "string" ? req : req.name;
+}
+
+/**
+ * True when a resolved secret for this requirement should be forwarded into the
+ * lease environment. The plain-string form (the legacy shape) always is; the
+ * object form with `inject: "step-only"` is not. A missing/unknown mode never
+ * reaches here — `parseEnvRequirements` skips those.
+ */
+export function envRequirementInLeaseEnv(req: EnvRequirement): boolean {
+  return typeof req === "string" || req.inject !== "step-only";
 }
 
 /**
@@ -671,15 +727,28 @@ export async function runDispatch(
     // Resolve every required secret BEFORE renting a lease: an unmet
     // requirement must fail the dispatch without ever creating a lease. All
     // missing names are collected and reported together, and the error carries
-    // only the NAMES — never a resolved value.
+    // only the NAMES — never a resolved value. Both entry shapes resolve the
+    // same way; the only difference is delivery (see below): a step-only entry
+    // is EXCLUDED from `leaseInjectableEnv` so its value never lands in the
+    // lease process environment.
+    const requirements = parseEnvRequirements(playbook.env_requirements);
     const env: Record<string, string> = {};
+    const leaseInjectableEnv: Record<string, string> = {};
     const missing: string[] = [];
-    for (const name of playbook.env_requirements) {
+    for (const req of requirements) {
+      const name = envRequirementName(req);
       const value = await deps.resolveEnv(name);
       if (value === undefined) {
         missing.push(name);
-      } else {
-        env[name] = value;
+        continue;
+      }
+      // `env` is the map templates render against and the redaction set masks —
+      // it carries EVERY resolved value regardless of delivery mode, so a
+      // step-only secret spliced into a rendered command still gets masked in
+      // logs even though the lease env below never sees it.
+      env[name] = value;
+      if (envRequirementInLeaseEnv(req)) {
+        leaseInjectableEnv[name] = value;
       }
     }
     if (missing.length > 0) {
@@ -709,7 +778,7 @@ export async function runDispatch(
     const capabilityContext = await resolveCapabilityContext(
       playbook.granted_capabilities,
       promptEvent,
-      playbook.env_requirements,
+      requirements.map(envRequirementName),
       deps.registry ?? getRuntime().registry,
       db,
       logger
@@ -745,13 +814,17 @@ export async function runDispatch(
       runner.maxWindowsPromptChars !== undefined &&
       prompt.length > runner.maxWindowsPromptChars;
 
-    // The lease env is the resolved secrets PLUS, unless oversized, the rendered
-    // prompt under the runner's prompt env var. This map is deliberately distinct
-    // from `env` (the secrets used for masking and step rendering): the prompt is
-    // not a secret, so it must never enter maskSecrets — masking it would redact
-    // the whole log. A command shape that ignores this variable (the linux shape
-    // passes the prompt as an argv argument) makes carrying it there harmless.
-    const leaseEnv: Record<string, string> = { ...env };
+    // The lease env is the resolved secrets — EXCLUDING any marked
+    // `inject: "step-only"` (see `parseEnvRequirements`), so a one-shot secret
+    // used in a `pre` step's command_template never persists in the container
+    // environment for the agent step to read — PLUS, unless oversized, the
+    // rendered prompt under the runner's prompt env var. This map is
+    // deliberately distinct from `env` (the map templates render against and
+    // maskSecrets redacts): the prompt is not a secret, so it must never enter
+    // maskSecrets — masking it would redact the whole log. A command shape that
+    // ignores this variable (the linux shape passes the prompt as an argv
+    // argument) makes carrying it there harmless.
+    const leaseEnv: Record<string, string> = { ...leaseInjectableEnv };
     if (runner.promptEnvVar && !promptTooLargeForWindows) {
       leaseEnv[runner.promptEnvVar] = prompt;
     }

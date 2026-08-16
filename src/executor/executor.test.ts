@@ -22,6 +22,7 @@ import { WisperClient } from "../wisper/client";
 
 import {
   attemptLeaseRelease,
+  parseEnvRequirements,
   reconcileOrphanedDispatches,
   runDispatch,
   sweepPendingReleases,
@@ -590,6 +591,171 @@ describe("runDispatch pipeline", () => {
     expect(fake.createBodies[0].env).toMatchObject({
       SECRET_TOKEN: "s3cr3t",
       REGION: "westus",
+    });
+  });
+
+  describe("step-only env_requirements", () => {
+    it("renders {{env.NAME}} into a pre-step command but excludes the value from the lease env", async () => {
+      // The pre step succeeds so the pipeline continues to the agent + release,
+      // which lets us assert on the lease env AND the rendered command in one run.
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      fake.planSync(() => ({ exitCode: 0 }));
+
+      // Two secrets: a plain-string entry that should reach the lease env, and
+      // a step-only entry that should be rendered into the pre step but never
+      // placed in the lease env for the agent to read.
+      const dispatchId = await seedDispatch({
+        env_requirements: [
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          { name: "ADO_PAT", inject: "step-only" },
+        ],
+        steps: [
+          {
+            phase: "pre",
+            label: "clone",
+            command_template:
+              "git clone https://x-access-token:{{env.ADO_PAT}}@example.com/repo.git",
+          },
+        ],
+      });
+      const secrets: Record<string, string> = {
+        CLAUDE_CODE_OAUTH_TOKEN: "oauth-token-value",
+        ADO_PAT: "one-shot-pat-value",
+      };
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: (name) => secrets[name],
+      });
+
+      expect(result.status).toBe("done");
+
+      // The lease env carries the plain-string secret AND the runner's prompt
+      // env var, but the step-only secret is nowhere to be found.
+      const env = fake.createBodies[0].env as Record<string, string>;
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-token-value");
+      expect(env.ADO_PAT).toBeUndefined();
+      // Sanity: the exec bodies wisper received also don't leak the value via any
+      // other env delivery (the assertion above already covers this, but this is
+      // the property the whole feature exists to guarantee).
+      expect(Object.values(env)).not.toContain("one-shot-pat-value");
+
+      // The pre step's command DID render the step-only secret's value — that's
+      // the point: it's spliced into the one exec that needs it.
+      const preExec = fake.execs.find((e) => e.command.startsWith("git clone"));
+      expect(preExec?.command).toBe(
+        "git clone https://x-access-token:one-shot-pat-value@example.com/repo.git"
+      );
+    });
+
+    it("fails BEFORE leasing when a step-only secret is missing, and names it", async () => {
+      const dispatchId = await seedDispatch({
+        env_requirements: [{ name: "ADO_PAT", inject: "step-only" }],
+        steps: [
+          {
+            phase: "pre",
+            label: "clone",
+            command_template: "clone {{env.ADO_PAT}}",
+          },
+        ],
+      });
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: () => undefined,
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("ADO_PAT");
+      // Missing secrets fail before any lease is created (identical to the
+      // plain-string form) — no exec, no release.
+      expect(fake.createBodies).toHaveLength(0);
+      expect(fake.releasedLeases).toHaveLength(0);
+      expect(fake.execs).toHaveLength(0);
+    });
+
+    it("redacts step-only secret VALUES from the dispatch log even though they are absent from the lease env", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      fake.planSync(() => ({ stdout: "one-shot-pat-value echoed\n" }));
+
+      const dispatchId = await seedDispatch({
+        env_requirements: [{ name: "ADO_PAT", inject: "step-only" }],
+        steps: [
+          {
+            phase: "pre",
+            label: "clone",
+            command_template: "clone --token {{env.ADO_PAT}}",
+          },
+        ],
+      });
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: (name) =>
+          name === "ADO_PAT" ? "one-shot-pat-value" : undefined,
+      });
+
+      expect(result.status).toBe("done");
+
+      // wisper saw the fully rendered command (that's the whole point of a step-
+      // only secret: it flows through the one exec that needs it)...
+      expect(
+        fake.execs.some((e) => e.command.includes("one-shot-pat-value"))
+      ).toBe(true);
+
+      // ...but the dispatch log only ever saw the masked form — for both the
+      // command line and the step's echoed stdout — proving step-only values
+      // are still in the redaction set.
+      const runs = await listRuns(dispatchId, db);
+      const logText = fs.readFileSync(runs[0].log_path as string, "utf8");
+      expect(logText).not.toContain("one-shot-pat-value");
+      expect(logText).toContain("clone --token ***");
+      expect(logText).toContain("*** echoed");
+    });
+  });
+
+  describe("parseEnvRequirements", () => {
+    it("passes plain strings through unchanged", () => {
+      expect(parseEnvRequirements(["A", "B_TOKEN"])).toEqual(["A", "B_TOKEN"]);
+    });
+
+    it("accepts {name, inject: 'step-only'} objects", () => {
+      expect(
+        parseEnvRequirements([{ name: "PAT", inject: "step-only" }])
+      ).toEqual([{ name: "PAT", inject: "step-only" }]);
+    });
+
+    it("preserves order across mixed shapes", () => {
+      const raw: unknown[] = [
+        "OAUTH_TOKEN",
+        { name: "PAT", inject: "step-only" },
+        "REGION",
+      ];
+      expect(parseEnvRequirements(raw)).toEqual([
+        "OAUTH_TOKEN",
+        { name: "PAT", inject: "step-only" },
+        "REGION",
+      ]);
+    });
+
+    it("skips malformed entries (no fatal errors — mirrors parseSteps)", () => {
+      const raw: unknown[] = [
+        "GOOD",
+        null,
+        42,
+        { name: "" },
+        { name: "NO_INJECT" },
+        { name: "BAD_MODE", inject: "lease" },
+        { name: "OK", inject: "step-only" },
+        [],
+      ];
+      expect(parseEnvRequirements(raw)).toEqual([
+        "GOOD",
+        { name: "OK", inject: "step-only" },
+      ]);
     });
   });
 

@@ -356,6 +356,31 @@ values live only in the encrypted store. The seed `researcher` playbook requires
 | `CLAUDE_CODE_OAUTH_TOKEN` | agent step | Authenticates the `claude` CLI inside the lease. |
 | `GIT_TOKEN` | `clone repository` pre-step | Injected into the clone URL (`https://x-access-token:<token>@…`). |
 
+**Lease-env vs step-only secrets.** Each `env_requirements` entry is either a
+plain string (the legacy shape) or an object `{name, inject: "step-only"}`. Both
+forms are resolved the same way (a missing name fails the dispatch before any
+lease is created), but they differ in **delivery**:
+
+- A **plain string** entry is injected into the lease environment AND is
+  available to server-side `{{env.NAME}}` template rendering (in
+  `userdata_template`, `prompt_template`, step `command_template`s, and the
+  script runner's `command_template`). This is what every existing playbook
+  uses.
+- A **`{name, inject: "step-only"}`** entry is available to server-side
+  `{{env.NAME}}` template rendering ONLY. Its value is **never** placed into the
+  lease env. Use this for one-shot credentials that a `pre` step needs once
+  (e.g. an ADO PAT interpolated into a `git clone` URL) so the agent step
+  running inside the lease cannot read the value out of its process environment
+  — a persistent LLM with shell access would otherwise see every value in the
+  container env for the whole run.
+
+Trade-off: a step-only secret still appears in the RENDERED command string sent
+to wisper for the one exec that uses it, so it is briefly visible in the
+container process's cmdline while that step runs. That is accepted; the goal is
+that it does not PERSIST in the lease environment for later steps (and the
+agent step) to read. Redaction covers step-only values in the dispatch log
+identically to lease-env values.
+
 The ADO module additionally reads a PAT under whatever name you set as its
 `pat_secret_ref` (e.g. `ado_pat`).
 
