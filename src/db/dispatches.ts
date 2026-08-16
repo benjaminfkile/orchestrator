@@ -346,9 +346,17 @@ export async function updateDispatch(
 
 /**
  * Return a dispatch to the `queued` state so it can be reclaimed — used to
- * retry after a transient failure. Clears the stale lease/contract handles and
- * bumps `updated_at`. Returns the updated record, or `undefined` if no dispatch
- * with `id` exists.
+ * retry after a transient failure. Clears the stale lease/contract handles AND
+ * the release-tracking columns (`released_at`, `release_pending`), then bumps
+ * `updated_at`. Returns the updated record, or `undefined` if no dispatch with
+ * `id` exists.
+ *
+ * The release-tracking columns describe the CURRENT lease attempt; the handles
+ * they refer to were just cleared, so leaving a prior attempt's `released_at`
+ * behind would let a leaked lease from a LATER attempt slip past the sweep
+ * (which requires `released_at IS NULL AND lease_id IS NOT NULL`). Nulling
+ * `released_at` here does not create phantom sweep work because `lease_id` is
+ * simultaneously nulled and the sweep requires both.
  */
 export async function resetToQueued(
   id: number,
@@ -358,6 +366,8 @@ export async function resetToQueued(
     status: "queued",
     lease_id: null,
     wisp_contract_id: null,
+    released_at: null,
+    release_pending: 0,
     updated_at: Date.now(),
   });
   if (count === 0) return undefined;
