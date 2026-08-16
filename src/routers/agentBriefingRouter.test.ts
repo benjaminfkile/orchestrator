@@ -39,6 +39,7 @@ describe("GET /api/agent-briefing", () => {
       "/api/events/facets",
       "/api/config/export",
       "NOTES_TO_SAVE",
+      "run.started",
       "run.completed",
       "run_budget_per_hour",
       "{{payload.",

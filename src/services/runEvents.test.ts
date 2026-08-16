@@ -14,7 +14,13 @@ import { createRule } from "../db/rules";
 import { createRun } from "../db/runs";
 import type { DispatchRecord, EventRecord } from "../interfaces";
 
-import { emitRunEvent, RUN_COMPLETED_TYPE, RUN_FAILED_TYPE } from "./runEvents";
+import {
+  emitRunEvent,
+  emitRunStartedEvent,
+  RUN_COMPLETED_TYPE,
+  RUN_FAILED_TYPE,
+  RUN_STARTED_TYPE,
+} from "./runEvents";
 
 function tempDbFile(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orch-run-events-"));
@@ -226,6 +232,91 @@ describe("runEvents.emitRunEvent", () => {
       exit_code: 0,
       duration_ms: 30,
     });
+  });
+
+  it("emits run.started with the start-time payload subset (no terminal fields)", async () => {
+    const event = await seedEvent({ chain_depth: 2, title: "T" });
+    const playbookId = await seedPlaybookId("investigator");
+    const rule = await createRule({ name: "origin-rule" }, db);
+    const dispatch = await createDispatch(
+      {
+        event_id: event.id,
+        rule_id: rule.id,
+        playbook_id: playbookId,
+        status: "leasing",
+      },
+      db
+    );
+
+    await emitRunStartedEvent(dispatch, { db });
+
+    const emitted = await emittedEvent(db);
+    expect(emitted.source).toBe("orchestrator");
+    expect(emitted.type).toBe(RUN_STARTED_TYPE);
+    expect(emitted.subject_kind).toBe("widget");
+    expect(emitted.subject_ref).toBe("42");
+    expect(emitted.dedupe_key).toBeNull();
+    // Payload is the terminal shape MINUS the terminal-only fields: no
+    // run_id/status/exit_code/error/findings/collected/duration/tokens.
+    expect(emitted.payload).toEqual({
+      dispatch_id: dispatch.id,
+      playbook_id: playbookId,
+      playbook_name: "investigator",
+      rule_id: rule.id,
+      origin: {
+        event_id: event.id,
+        source: "moduleA",
+        type: "thing.changed",
+        subject_kind: "widget",
+        subject_ref: "42",
+      },
+      chain_depth: 3,
+    });
+  });
+
+  it("run.started increments chain_depth like the terminal events", async () => {
+    const event = await seedEvent({ chain_depth: 4 });
+    const playbookId = await seedPlaybookId();
+    const dispatch = await createDispatch(
+      { event_id: event.id, playbook_id: playbookId, status: "leasing" },
+      db
+    );
+
+    await emitRunStartedEvent(dispatch, { db });
+
+    const emitted = await emittedEvent(db);
+    expect((emitted.payload as { chain_depth: number }).chain_depth).toBe(5);
+  });
+
+  it("run.started matches rules against the callback event and enqueues a chained dispatch", async () => {
+    const event = await seedEvent({});
+    const playbookId = await seedPlaybookId();
+    const dispatch = await createDispatch(
+      { event_id: event.id, playbook_id: playbookId, status: "leasing" },
+      db
+    );
+
+    const reactionPlaybook = await seedPlaybookId("reaction");
+    await createRule(
+      {
+        name: "on-started",
+        match: { source: "orchestrator", type: RUN_STARTED_TYPE },
+        dispatch: [{ playbook_id: reactionPlaybook }],
+      },
+      db
+    );
+
+    let kicks = 0;
+    await emitRunStartedEvent(dispatch, {
+      db,
+      dispatcher: { kick: () => (kicks += 1) },
+    });
+
+    const chained = (await listDispatches("queued", db)).filter(
+      (d: DispatchRecord) => d.playbook_id === reactionPlaybook
+    );
+    expect(chained).toHaveLength(1);
+    expect(kicks).toBe(1);
   });
 
   it("matches rules against the callback event and enqueues a chained dispatch", async () => {

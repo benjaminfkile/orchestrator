@@ -10,7 +10,10 @@ import { createDb } from "../db/db";
 import { createDispatch, getDispatch, listDispatches } from "../db/dispatches";
 import { insertEvent, listEvents } from "../db/events";
 import { runMigrations } from "../db/migrate";
+import { listNotifications } from "../db/notificationLog";
+import { createNotifier } from "../db/notifiers";
 import { createPlaybook } from "../db/playbooks";
+import { createRule } from "../db/rules";
 import { createRun } from "../db/runs";
 import { setSetting } from "../db/settings";
 import { createLogger, type Logger } from "../log";
@@ -538,6 +541,144 @@ describe("Dispatcher", () => {
     });
     // No failure event for a successful run.
     expect(await callbackEvents("run.failed")).toHaveLength(0);
+  });
+
+  it("emits run.started exactly once per dispatch begun, before the run terminates", async () => {
+    fake.planExecs([{ exitCode: 0 }]);
+    const id = await seedDispatch("1");
+
+    const d = makeDispatcher();
+    await drain(d);
+
+    const started = await callbackEvents("run.started");
+    expect(started).toHaveLength(1);
+    expect(started[0].payload).toMatchObject({
+      dispatch_id: id,
+      chain_depth: 1,
+    });
+    // Start-time payload carries no terminal fields.
+    const payload = started[0].payload as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("status");
+    expect(payload).not.toHaveProperty("exit_code");
+    expect(payload).not.toHaveProperty("findings");
+    expect(payload).not.toHaveProperty("duration_ms");
+    expect(payload).not.toHaveProperty("run_id");
+    // playbook_name/dispatch_id are visible on run.started (per acceptance 233).
+    expect(payload.dispatch_id).toBe(id);
+    expect(typeof payload.playbook_name).toBe("string");
+  });
+
+  it("emits no run.started for a queued dispatch the dispatcher never claims (budget-held)", async () => {
+    // A budget of 1 with a prior in-window run holds the queued dispatch: it
+    // never transitions to leasing, so run.started must not fire.
+    fake.planExecs([{ exitCode: 0 }]);
+    await setSetting("run_budget_per_hour", "1", db);
+    await setSetting("run_budget_window_minutes", "60", db);
+
+    const clock = 5_000_000;
+    // Pre-seed a completed run inside the window so the gate is tripped from
+    // the first pass: the queued dispatch stays queued, unclaimed.
+    const priorEvent = await insertEvent(
+      {
+        source: "m",
+        type: "t",
+        subject_kind: "k",
+        subject_ref: "prior",
+        payload: {},
+      },
+      db
+    );
+    const priorPb = await createPlaybook(
+      { name: "prior", image: "img", ttl_seconds: 600, prompt_template: "p" },
+      db
+    );
+    const priorDispatch = await createDispatch(
+      { event_id: priorEvent.id, playbook_id: priorPb.id, status: "done" },
+      db
+    );
+    await createRun(
+      { dispatch_id: priorDispatch.id, started_at: clock },
+      db
+    );
+
+    const id = await seedDispatch("1");
+    const d = new Dispatcher({
+      wisper: client(),
+      db,
+      logger: silentLogger(),
+      logBaseDir: logDir,
+      now: () => clock,
+    });
+    await drain(d);
+
+    // Never claimed → still queued, no lease created, no run.started emitted.
+    expect((await getDispatch(id, db))?.status).toBe("queued");
+    expect(fake.createBodies).toHaveLength(0);
+    expect(await callbackEvents("run.started")).toHaveLength(0);
+  });
+
+  it("fires a notifier attached to a rule matching run.started", async () => {
+    fake.planExecs([{ exitCode: 0 }]);
+
+    // Seed the target playbook up front so we can bind the rule by name.
+    const event = await insertEvent(
+      {
+        source: "moduleA",
+        type: "thing.changed",
+        subject_kind: "widget",
+        subject_ref: "1",
+        payload: {},
+      },
+      db
+    );
+    const playbook = await createPlaybook(
+      {
+        name: "smoke-test",
+        image: "img",
+        ttl_seconds: 600,
+        prompt_template: "S={{ event.subject_ref }}",
+      },
+      db
+    );
+    const dispatch = await createDispatch(
+      { event_id: event.id, playbook_id: playbook.id },
+      db
+    );
+
+    // Notifier rendered against the run.started event; matched by playbook_name.
+    const notifier = await createNotifier(
+      {
+        name: "start-notify",
+        title_template: "started {{ payload.playbook_name }}",
+        body_template: "dispatch {{ payload.dispatch_id }}",
+      },
+      db
+    );
+    await createRule(
+      {
+        name: "notify-on-start",
+        match: {
+          source: "orchestrator",
+          type: "run.started",
+          criteria: { playbook_name: "smoke-test" },
+        },
+        notify: [{ notifier_id: notifier.id }],
+      },
+      db
+    );
+
+    const d = makeDispatcher();
+    await drain(d);
+
+    expect((await getDispatch(dispatch.id, db))?.status).toBe("done");
+    const notifications = await listNotifications({}, db);
+    // Exactly one notification for the run.started callback (nothing else matches).
+    const starts = notifications.filter(
+      (n) => n.title === `started smoke-test`
+    );
+    expect(starts).toHaveLength(1);
+    expect(starts[0].body).toBe(`dispatch ${dispatch.id}`);
+    expect(starts[0].notifier_id).toBe(notifier.id);
   });
 
   it("emits run.failed once for a non-retryable terminal failure", async () => {
