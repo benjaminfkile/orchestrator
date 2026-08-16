@@ -260,10 +260,11 @@ describe("dispatches router", () => {
   describe("POST /api/dispatches/:id/retry", () => {
     it("requeues a failed dispatch, resets attempts, and kicks the dispatcher", async () => {
       const id = await seedDispatch("failed", 3);
-      // give it a stale lease/contract to prove they are cleared
+      // give it a stale (already-released) lease/contract to prove the
+      // handles AND the release tracking are cleared for the fresh attempt
       await updateDispatch(
         id,
-        { lease_id: "lease-1", wisp_contract_id: "c-1" },
+        { lease_id: "lease-1", wisp_contract_id: "c-1", released_at: 111 },
         db
       );
 
@@ -276,12 +277,37 @@ describe("dispatches router", () => {
       expect(res.body.attempts).toBe(0);
       expect(res.body.lease_id).toBeNull();
       expect(res.body.wisp_contract_id).toBeNull();
+      expect(res.body.released_at).toBeNull();
+      expect(res.body.release_pending).toBe(false);
       expect(res.body.error).toBeNull();
       expect(kicked).toBe(1);
 
       const reloaded = await getDispatch(id, db);
       expect(reloaded?.status).toBe("queued");
       expect(reloaded?.attempts).toBe(0);
+      expect(reloaded?.released_at).toBeNull();
+      expect(reloaded?.release_pending).toBe(false);
+    });
+
+    it("409s while the dispatch still holds an unreleased lease (sweep owns it)", async () => {
+      const id = await seedDispatch("failed");
+      // lease_id set, released_at null = release still pending; requeueing
+      // would drop the handle out of the sweep's predicate and leak the lease.
+      await updateDispatch(
+        id,
+        { lease_id: "lease-unreleased", release_pending: true },
+        db
+      );
+
+      const res = await request(app).post(`/api/dispatches/${id}/retry`);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/release/i);
+
+      // untouched: still failed, lease handle and release flag intact
+      const reloaded = await getDispatch(id, db);
+      expect(reloaded?.status).toBe("failed");
+      expect(reloaded?.lease_id).toBe("lease-unreleased");
+      expect(reloaded?.release_pending).toBe(true);
     });
 
     it("409s when the dispatch is not failed", async () => {

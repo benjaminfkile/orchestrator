@@ -47,9 +47,12 @@ async function main() {
     execTimeoutMs: config.wisperExecTimeoutMs,
   });
 
-  // Also sweep for any dispatch (terminal or not) whose lease was never
+  // Also sweep for any TERMINAL (done/failed) dispatch whose lease was never
   // released: e.g. a done row whose finally-block DELETE lost the race with a
-  // process crash, or a release_pending row left by a prior boot. The
+  // process crash, or a release_pending row left by a prior boot. (In-flight
+  // rows are excluded by the sweep's status filter — their lease is owned by
+  // the running pipeline, and reconcileOrphanedDispatches has already failed
+  // any rows stranded by the previous process by this point.) The
   // dispatcher will keep running this sweep on a timer once it starts; this
   // one-shot at boot catches leaks BEFORE any new dispatch runs. Best-effort:
   // a sweep failure must not block startup.

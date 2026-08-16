@@ -47,8 +47,9 @@ Key invariants you must respect:
   criteria, prompts, templates, event-type strings) — never ask to change code.
 - Send ONLY documented keys. The rules/playbooks/snippets/notifiers/dispatches
   write endpoints (and the datadog config PUT) reject unknown body keys with a
-  400 naming the offender; a few others (settings, secrets, ADO config) do not,
-  so a typo there can persist silently — double-check those bodies yourself.
+  400 naming the offender; secrets and the ADO config do not, so a typo there
+  can persist silently — double-check those bodies yourself. Settings
+  whitelists the \`key\` (unknown keys 400) but ignores extra body properties.
 - Secrets are write-only: you can set and reference them by NAME, never read a
   value back. Never echo a secret value the user gives you into any other field.
 
@@ -85,9 +86,10 @@ Key invariants you must respect:
     \`subject_kind\` \`monitor\`, \`subject_ref\` \`<id>\`, \`dedupe_key\`
     \`datadog:monitor:<id>:<group>\`. The \`event_dedupe_cooldown_seconds\` setting
     then suppresses re-storms of the same subject.
-- Run-lifecycle events (source \`orchestrator\`): \`run.started\` fires once when
-  the dispatcher hands a claimed dispatch to the executor (never for dispatches
-  that stay queued or are dropped by a cap/gate); \`run.completed\` / \`run.failed\`
+- Run-lifecycle events (source \`orchestrator\`): \`run.started\` fires each time
+  the dispatcher hands a claimed dispatch to the executor — a retried dispatch
+  emits it once per attempt (never for dispatches that stay queued or are
+  dropped by a cap/gate); \`run.completed\` / \`run.failed\`
   fire on terminal dispatch outcomes. \`run.started\` payload: \`{dispatch_id,
   playbook_id, playbook_name, rule_id, origin, chain_depth}\` — the start-time
   subset, with no terminal fields. Terminal payload: \`{dispatch_id, run_id,
@@ -157,7 +159,10 @@ steps?, granted_capabilities?, output_kind?}\`.
 - \`runner\` (see \`GET /api/runners\`):
   - \`claude-code\` (default): runs Claude Code in the lease against the
     rendered \`prompt_template\`. \`runner_config\`: \`{model?, allowed_tools?}\`
-    (models list: \`GET /api/anthropic/models\`).
+    (models list: \`GET /api/anthropic/models\`). On linux leases the command is
+    prefixed \`IS_SANDBOX=1\` so the claude CLI accepts
+    \`--dangerously-skip-permissions\` under root (wisp execs run as root); an
+    image only needs \`claude\` reachable on the default PATH.
   - \`script\`: no LLM — \`runner_config.command_template\` (required; a missing/
     empty one fails the dispatch BEFORE leasing) is rendered
     and run as the agent step; its stdout is the run's result text. Exit 0 =
@@ -253,10 +258,14 @@ rename therefore breaks every reference by design.
   check those fields when a dispatch seems stuck.
 - Lease release bookkeeping: \`released_at\` (ms since epoch or null) is the
   timestamp of a successful lease release; \`release_pending: true\` marks a row
-  whose lease release is stuck retrying. A periodic sweep runs while the
-  dispatcher is up and reattempts release for any dispatch with a non-null
-  \`lease_id\` and a null \`released_at\`, regardless of the dispatch's terminal
-  status. A wisper "not_found" response is treated as a successful release.
+  whose lease release is stuck retrying. A release sweep runs once at boot and
+  periodically while the dispatcher is up; it reattempts release for any
+  TERMINAL (\`done\`/\`failed\`) dispatch with a non-null \`lease_id\` and a null
+  \`released_at\` — in-flight dispatches are never touched (their lease is owned
+  by the running pipeline, which releases it itself). A wisper "not_found"
+  response is treated as a successful release. \`POST /api/dispatches/:id/retry\`
+  refuses (409) while a failed dispatch still holds an unreleased lease — wait
+  for the sweep (typically under a minute), then retry.
 - A retryable dispatch failure is NEVER requeued while it still holds an
   unreleased lease: the dispatcher tries one more inline release first, and if
   that also fails it leaves the row \`failed\` with \`release_pending\` set (the
@@ -377,6 +386,26 @@ rename therefore breaks every reference by design.
   - \`datadog.get_monitor\` — one monitor's definition + current group states.
     Config \`{monitor_id?}\`; defaults to the event subject (a monitor id) when
     unset. Renders name, query, thresholds, options, states, url.
+
+## Seeded first-launch content
+
+- A fresh install ships working example content: the
+  \`smoke-test-clone-and-claude-linux\` playbook (env: \`CLAUDE_CODE_OAUTH_TOKEN\`
+  lease-injected + \`ADO_PAT\` step-only; pre steps install the azure CLI, clone
+  the org's first repo, scrub the credential, run a FATAL credential-leak hunt,
+  and install the claude CLI), seven \`smoke test: ado.workitem.*\` dispatch
+  rules that fire when a work item's \`tags\` contains the playbook name, a
+  \`desktop\` notifier, and three notify rules ("Smoke test started/finished/
+  failed") on its \`run.started\`/\`run.completed\`/\`run.failed\` events.
+- Tagging any watched work item \`smoke-test-clone-and-claude-linux\` therefore
+  fires an end-to-end pipeline test (event -> rule -> lease -> agent ->
+  findings -> release) with toasts on start, success, and failure. The leak
+  hunt exits non-zero — failing the dispatch loudly — if the scrubbed PAT is
+  discoverable in the container env, \`~/.azure\`, git remote/config, or on
+  disk.
+- Treat all seeded rows as user-editable examples, not fixtures: users may
+  rename, edit, or delete them freely (seed migrations never overwrite a row a
+  user has customized).
 
 ## Portability
 

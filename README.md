@@ -92,7 +92,10 @@ through `running` → `collecting` to a terminal `done` or `failed`. The
 (concurrency is clamped to 1 for now) that claims the oldest `queued` dispatch,
 runs it, and applies a retry policy (`dispatch_max_attempts`) on retryable
 failures. On boot, `reconcileOrphanedDispatches` fails anything left mid-pipeline
-by an unclean shutdown and releases the leases it still held.
+by an unclean shutdown and releases the leases it still held; a one-shot release
+sweep then runs before any new dispatch, and process-level
+`unhandledRejection`/`uncaughtException` handlers run a last-chance emergency
+sweep (bounded to a few seconds) before exiting.
 
 The **executor** (`src/executor/executor.ts`) is the pipeline state machine:
 
@@ -104,15 +107,25 @@ The **executor** (`src/executor/executor.ts`) is the pipeline state machine:
    to concrete ids here, before leasing.
 2. `createLease` — provisioning runs in the lease `userdata`; the `POST
    /dev/leases` 201 does not return until the lease is ready.
-3. Run each `pre` step as an exec (e.g. `git clone …` using an injected token).
+3. Run each `pre` step as an exec (e.g. `git clone …` using a rendered or
+   injected token).
 4. Run the agent step: a fixed `claude --print --dangerously-skip-permissions
-   --output-format stream-json --verbose` invocation, plus the playbook's
+   --output-format stream-json --verbose` invocation (prefixed `IS_SANDBOX=1`
+   on linux so the CLI accepts the flag under wisp's root execs), plus the playbook's
    optional `--model`/`--allowedTools`, with the composed prompt as the trailing
    argument. Its streamed exit code is the completion signal.
 5. On exit 0, run `collect` steps and persist their captured output plus any
    `<NOTES_TO_SAVE>` findings the agent emitted.
-6. **Always** `DELETE /dev/leases/:id`, on every path including failure and
-   timeout. A per-dispatch hard deadline
+6. **Always** `DELETE /dev/leases/:id` (`/v1/leases/:id` in v1 mode), on every
+   path including failure and timeout. The release is retried inline with
+   bounded backoff (200 ms/500 ms; a wisper `not_found` counts as released);
+   on exhaustion the dispatch is flagged `release_pending` and the **release
+   sweep** — once at boot plus every 60 s while the dispatcher runs — retries
+   it. The sweep touches only TERMINAL (`done`/`failed`) rows: an in-flight
+   dispatch's lease is owned by its own pipeline. Every dispatch records
+   `released_at`/`release_pending`, and a dispatch is never requeued (retry
+   policy or manual `/retry`) while it still holds an unreleased lease. A
+   per-dispatch hard deadline
    (`min(ttl_seconds − margin, dispatch_timeout_seconds)`) tightens the TTL.
 
 The **wisper client** (`src/wisper/client.ts`) wraps the lease endpoints:
@@ -146,7 +159,9 @@ The client speaks one of two surfaces, chosen by `WISPER_MODE` (default `dev`):
   retryable, exactly as in `dev`.
 
 The public client interface is identical in both modes, so the executor is
-mode-agnostic.
+mode-agnostic. Note that in `v1` mode the create body deliberately carries no
+`resources`/`gpus` — sizes are fixed server-side by the selected catalog offer;
+a playbook's `resources` parameterize only the dev-mode body.
 
 ### Snippets (reusable template fragments)
 
@@ -192,7 +207,10 @@ existing machinery — no new tables, no new transport.
   run/token budget gate, or blocked by the chain-depth cap) emit nothing.
 - **`run.completed`** — fires on a terminal `done`.
 - **`run.failed`** — fires on a terminal `failed` (never before a retry — only
-  the final give-up emits).
+  the final give-up emits). One exception to "retries continue": a retryable
+  failure whose lease release keeps failing is converted to terminal `failed`
+  early (the dispatcher refuses to requeue a row still holding an unreleased
+  lease; the release sweep then owns the release) and emits `run.failed` then.
 
 Every callback event carries `source` **`orchestrator`**, copies the originating
 event's `subject_kind`/`subject_ref`, and has a null `dedupe_key`. `run.started`
@@ -289,6 +307,11 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `GET /api/anthropic/models` | Anthropic model list `{models: [{id, display_name}], warning?}` for the playbook Model picker. Always 200 (degrades to an empty list + `warning`). |
 | `GET /api/wisper/hosts` | Rentable host catalog `{hosts: [{id, name, os, online, images: [{id, name, price_cents_per_min}]}], warning?}` for the playbook Host picker. Fetched **server-side** (in `v1` mode via `GET /v1/catalog` with the bearer token) so the API key never reaches the browser; in `dev` mode a single synthetic entry for `WISPER_HOST_ID`. Always 200 (degrades to an empty list + `warning`). |
 | `GET /api/agent-briefing` | The agent briefing `{briefing}` — see **Agent briefing**. |
+| `GET /api/runners` | Registered runner ids `{runners: ["claude-code", …]}` for the playbook Runner picker. |
+| `GET /api/capabilities` | Grantable capabilities `[{id, module_id}]` for the playbook capability picker. |
+| `GET /api/changes` | SSE stream of coalesced resource-change frames `{resource, ts}` driving the SPA's live refetch. |
+| `GET /api/config/export` | Portable config document (playbooks, rules, snippets, module config, whitelisted settings; secrets as NAMES only). `?scrub=environment` strips machine-local values. |
+| `POST /api/config/import` | Import a config document `{document, mode: merge\|overwrite, dry_run}`; dry-run returns the full plan with no writes. |
 
 The secret store is **write-only** across the API: a value is readable only
 inside a lease, via the executor's `env` injection. It never crosses the API
@@ -345,6 +368,9 @@ as TEXT; writes are whitelisted to the keys the core actually reads.
 | `event_dedupe_cooldown_seconds` | `300` | Window in which a repeated `dedupe_key` is suppressed at intake. |
 | `run_retention_max` | `2000` | Cap on kept **terminal** runs (done/failed). The oldest beyond it are pruned — along with their runs, findings, and per-dispatch log files — after each terminal transition and once at boot. Absent/garbage falls back to 2000; **0 or negative disables pruning entirely**. |
 | `identity_me` | `""` | Identity the literal `"@Me"` operand resolves to in rule criteria. |
+| `run_budget_per_hour` | `0` (off) | Run budget gate: max agent runs STARTED per rolling window; the dispatcher claims nothing once the cap is hit. `0`/unset disables the gate. |
+| `run_budget_window_minutes` | `60` | Length of the budget gate's rolling window, in minutes. |
+| `token_budget_per_window` | `0` (off) | Optional trailing-window token circuit breaker: summed run token usage within the window is capped when set. `0`/unset = off. |
 
 ### Secrets
 
@@ -355,7 +381,7 @@ values live only in the encrypted store. The seeded
 | Secret name | Used by | Purpose |
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | agent step | Authenticates the `claude` CLI inside the lease. |
-| `ADO_PAT` | `clone first repo in project` pre-step (**step-only**) | Passed to `az repos list` via `AZURE_DEVOPS_EXT_PAT` and spliced into the clone URL. Delivered as `{name: "ADO_PAT", inject: "step-only"}` so it renders into the pre-step template but never lands in the lease environment — the agent step running inside the lease has no way to read it. The seeded playbook's third pre-step scrubs the credential from the git remote and clears `~/.azure`. |
+| `ADO_PAT` | `clone first repo in project` and credential-leak-hunt pre-steps (**step-only**) | Passed to `az repos list` via `AZURE_DEVOPS_EXT_PAT` and spliced into the clone URL; the leak-hunt step renders it again to grep the disk for its content. Delivered as `{name: "ADO_PAT", inject: "step-only"}` so it renders into pre-step templates but never lands in the lease environment — the agent step running inside the lease has no way to read it. The seeded playbook's third pre-step scrubs the credential from the git remote and clears `~/.azure`; the fourth (fatal) verifies the scrub. |
 
 **Lease-env vs step-only secrets.** Each `env_requirements` entry is either a
 plain string (the legacy shape) or an object `{name, inject: "step-only"}`. Both
@@ -730,6 +756,12 @@ picker alongside the dispatch editor.
 
 ## Web UI
 
+An app-wide system-status banner (fed by `GET /api/settings/system`) warns when
+leasing is silently disabled — the `WISPER_API_KEY` secret missing in `v1` mode,
+or `WISPER_HOST_ID` unset — naming the exact key to set and linking to Settings.
+It is dismissable per session and clears live (no reload) once the missing value
+is stored; the Settings page shows the same read-only host facts inline.
+
 The SPA (`web/`, Fluent UI v9) is a thin editor over the REST API. Its data-entry
 fields are **discovery-backed comboboxes** (`web/src/components/AsyncCombobox.tsx`):
 each takes an injected async `load()`, fetches on mount, shows inline
@@ -744,7 +776,7 @@ data-layer hooks that back them live in `web/src/discovery.ts`.
 |---|---|---|
 | Events **Source** / **Type** filters | Events | `GET /api/events/facets` |
 | Rule **Source** / **Type** | Rules | `GET /api/events/facets` (blank = match any; a trailing `.*` on type matches by prefix) |
-| Playbook **Env requirements** (multi) | Playbooks | `GET /api/secrets` (names only) |
+| Playbook **Env requirements** (multi) | Playbooks | `GET /api/secrets` (names only) — each selected secret has a per-entry "Step-only (do not inject into lease env)" toggle; the API validates the `{name, inject: "step-only"}` shape at save time |
 | Playbook **Image** | Playbooks | `GET /api/settings` `default_lease_image` + the `setting:default_lease_image` sentinel |
 | Playbook **Model** | Playbooks | `GET /api/anthropic/models` |
 | Playbook **Host** | Playbooks | `GET /api/wisper/hosts` (blank = default host; option labels show each host's `os`) |
@@ -832,7 +864,8 @@ configured (Modules page or step 5 of the runbook below):
    from the suggestions (or the `setting:default_lease_image` sentinel), leave
    **Allowed tools** empty for no restriction, choose a **Model** (or leave blank
    for the runner default), and select the secret names the steps need under
-   **Env requirements**.
+   **Env requirements** — each entry has a **Step-only** checkbox to keep that
+   secret out of the lease environment (rendered into step templates only).
 4. **Create a rule** (Rules → *New*). Choose the **Source** and **Type** from the
    facet-backed comboboxes (blank = any; a trailing `.*` on type matches by
    prefix), add any `criteria`, and point its `dispatch` at the playbook you just
@@ -945,8 +978,9 @@ trusted.
 7. **Fire the first-launch smoke test.** The seeded `smoke test:
    ado.workitem.*` rules already dispatch the seeded playbook the instant
    any observed work item carries the `smoke-test-clone-and-claude-linux`
-   tag, and the seeded `Smoke test started` / `Smoke test finished` notify
-   rules push a desktop toast on both edges. So the trigger is:
+   tag, and the seeded `Smoke test started` / `Smoke test finished` /
+   `Smoke test failed` notify rules push a desktop toast on start, success,
+   and failure. So the trigger is:
 
    ```
    Tag any work item the ADO module watches with the string
@@ -957,7 +991,10 @@ trusted.
 
    The playbook installs the Azure CLI, uses `ADO_PAT` to list the project's
    repositories, clones the first one into `./work`, scrubs the credential
-   from the git remote (and clears `~/.azure`), installs the `claude` CLI,
+   from the git remote (and clears `~/.azure`), then runs a **fatal
+   credential-leak hunt** — re-checking the process env, `~/.azure`, the git
+   remote/config, and the disk for any trace of the PAT; any hit fails the
+   dispatch loudly — then installs the `claude` CLI,
    and asks the agent to explore the cloned repository and report findings.
    If it drives all the way to a `done` run with findings you know
    auth / lease / installs / network / claude / notifications all work.
@@ -1046,4 +1083,3 @@ Note: `npm install` requires `--ignore-scripts` in this container (no Python/gcc
 | `npm --prefix web test` (web) | PASS — 1 test file, 1 test |
 
 Note: `npm install` again required `--ignore-scripts` (no Python for the better-sqlite3 native rebuild); the prebuilt binary loads fine and all four verification commands exit 0.
-# orchestrator

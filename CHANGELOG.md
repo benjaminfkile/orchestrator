@@ -45,10 +45,29 @@ owns the lease lifecycle, never the agent inside it.
   done/failed`) with guaranteed lease release.
 - Playbook `pre`/`collect` steps with secret masking.
 - Per-dispatch timeout and startup reconciliation of orphaned dispatches.
+- Lease-release tracking: `released_at`/`release_pending` on every dispatch,
+  bounded in-line release retries in the executor, and a release sweep
+  (one-shot at boot, periodic while the dispatcher runs, plus an emergency
+  sweep on fatal process errors) that reattempts release for dispatches whose
+  lease is still owed; a wisper `not_found` counts as released.
+- The sweep touches TERMINAL (done/failed) dispatches only — an in-flight
+  dispatch's lease is owned by its own pipeline and is never released out from
+  under it.
+- `resetToQueued` and the manual retry endpoint clear release tracking
+  alongside the lease handles, so a stale timestamp from a prior attempt can
+  no longer hide a leaked lease from the sweep; the retry endpoint refuses
+  (409) while a failed dispatch still holds an unreleased lease.
 
 #### Dispatcher & rules engine
 
 - Single-flight FIFO dispatcher loop with a retry policy.
+- `run.started` run-lifecycle event: emitted each time a claimed dispatch is
+  handed to the executor, payload mirroring the terminal events minus
+  terminal-only fields; chain-depth capped like `run.completed`/`run.failed`.
+- A retryable failure holding an unreleased lease is never requeued: the
+  dispatcher attempts one final inline release and otherwise leaves the row
+  terminal `failed` with `release_pending` set for the sweep, so the lease
+  handle is never dropped.
 - Pure, fail-closed rule matcher with a full operator set.
 - Event→dispatch wiring with per-event and per-hour caps.
 - Optional run-budget gate: `run_budget_per_hour` over a
@@ -103,7 +122,22 @@ owns the lease lifecycle, never the agent inside it.
 #### Secrets & playbooks
 
 - Encrypted-at-rest secret store with a keychain-backed key (passphrase fallback).
-- Playbook env resolution and the seeded built-in `researcher` playbook.
+- Playbook env resolution and the seeded first-launch
+  `smoke-test-clone-and-claude-linux` playbook (which replaced the earlier
+  `researcher` seed).
+- Step-only secrets: an `env_requirements` entry may be
+  `{name, inject: "step-only"}` — resolved for server-side template rendering
+  (and log masking) but never injected into the lease environment.
+- The seeded first-launch smoke test: the playbook (ADO clone via step-only
+  `ADO_PAT`, credential scrub, fatal credential-leak hunt, claude run), seven
+  tag-gated `ado.workitem.*` dispatch rules, a `desktop` notifier, and notify
+  rules on its `run.started`/`run.completed`/`run.failed` events; the seed
+  replaces the `researcher` playbook only when it is still pristine and
+  unreferenced.
+- The seeded install-claude step falls back to the CLI's native installer when
+  npm is absent, symlinking the binary onto the default PATH; the linux
+  `claude-code` runner prefixes `IS_SANDBOX=1` so the CLI runs under wisp's
+  root execs.
 
 #### REST API
 
@@ -115,6 +149,11 @@ owns the lease lifecycle, never the agent inside it.
 - React + Vite SPA shell, routing, data layer, and Fluent UI baseline.
 - Queue dashboard, Events, Rules, Playbooks, Runs (with live log), Modules, and
   Settings pages.
+- App-wide system-status banner surfacing the two boot-config dead-ends that
+  silently disable leasing: v1 mode with no `WISPER_API_KEY` secret, and an
+  unset `WISPER_HOST_ID`; session-dismissable, clears live when the missing
+  value is stored.
+- Per-entry "Step-only" toggle on the playbook Env requirements editor.
 - `SubjectCell` renders the triggering subject as a flex stack — a leading,
   colour-tinted type icon (a presentation-layer registry keyed by event-source
   prefix and the opaque `subject_type`; ADO Bug/User Story/Epic/Task/Initiative

@@ -367,7 +367,9 @@ export interface DispatchRecord {
    * Timestamp (ms since epoch) when the lease was successfully released, or
    * `null` when either no lease was ever created OR the release has not yet
    * succeeded. The sweep queries for `lease_id IS NOT NULL AND released_at IS
-   * NULL` so a stuck release keeps retrying past the dispatch's terminal state.
+   * NULL AND status IN ('done','failed')` — the terminal-status filter is
+   * load-bearing (an in-flight row's lease is owned by its own pipeline) — so
+   * a stuck release keeps retrying past the dispatch's terminal state.
    */
   released_at: number | null;
   /**

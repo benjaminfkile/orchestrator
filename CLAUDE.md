@@ -5,8 +5,11 @@
 orchestrator is a single-user desktop app (Express + better-sqlite3/knex backend,
 React + Vite SPA in `web/`) that watches external systems, matches events against
 user-configured rules, and runs data-driven playbooks inside container leases
-rented from a locally running wisper-api (`/dev/leases` endpoints). It binds
-`127.0.0.1` with no auth layer — the OS user is the security boundary.
+rented from a wisper-api — either a locally running dev harness (`/dev/leases`,
+`WISPER_MODE=dev`, the default) or the authenticated `/v1/leases` consumer
+surface (`WISPER_MODE=v1`, bearer `WISPER_API_KEY` secret, https enforced for
+non-loopback hosts). It binds `127.0.0.1` with no auth layer — the OS user is
+the security boundary.
 
 ## ARCHITECTURE PRINCIPLE (load-bearing)
 
@@ -44,9 +47,15 @@ Lease lifecycle is owned by orchestrator code, never by the agent inside the
 lease. Provisioning happens in lease `userdata`; each pipeline step is an exec
 authored by the executor; the agent step's exit code (delivered by the streaming
 exec's terminal `exit` event) is the completion signal; the executor ALWAYS
-releases the lease (`DELETE /dev/leases/:id`) — the lease TTL is only a crash
-failsafe, never the termination mechanism. Never prompt an agent to release,
-extend, or manage its own lease.
+releases the lease (`DELETE /dev/leases/:id`, or `/v1/leases/:id` in v1 mode) —
+the lease TTL is only a crash failsafe, never the termination mechanism. A
+failed release is never abandoned: the executor retries inline, then flags
+`release_pending` for the release sweep (one-shot at boot, periodic while the
+dispatcher runs, emergency pass on fatal process errors), which retries only
+TERMINAL dispatches — an in-flight dispatch's lease is owned by its own
+pipeline. A dispatch is never requeued (dispatcher retry or manual
+`/retry`) while it still holds an unreleased lease. Never prompt an agent to
+release, extend, or manage its own lease.
 
 ## Dev commands (must all pass before any task is done)
 
@@ -70,8 +79,11 @@ prebuilt binary loads fine.
 - Add tests for new logic; place backend tests next to the source as
   `<name>.test.ts`.
 - External-service integrations are READ-ONLY and store output locally in SQLite.
-- Secrets never go in code or logs; they are injected into leases via the dev
-  endpoint's `env` field and referenced by name in playbook config.
+- Secrets never go in code or logs; they are injected into the lease `env`
+  (dev and v1 alike) and referenced by name in playbook `env_requirements`. An
+  entry may be `{name, inject: "step-only"}` to keep the value out of the lease
+  env entirely — rendered into step command templates server-side only, and
+  masked in logs like every resolved secret.
 - If a change alters how the app is OPERATED (endpoints, request/response
   shapes, settings keys, runners, template or rule-matching semantics), update
   the agent briefing in `src/services/agentBriefing.ts` in the same change —

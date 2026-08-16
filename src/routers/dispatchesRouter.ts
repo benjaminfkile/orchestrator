@@ -223,13 +223,29 @@ dispatchesRouter.post(
         `only a failed dispatch can be retried (status is ${dispatch.status})`
       );
     }
+    // A failed dispatch still holding an UNRELEASED lease belongs to the
+    // release sweep: requeueing it would null the lease handle and hide the
+    // lease from the sweep's predicate (the exact leak resetToQueued and the
+    // dispatcher's requeue guard were fixed to prevent). Refuse until the
+    // sweep (or a manual release) resolves it — it runs every minute.
+    if (dispatch.lease_id !== null && dispatch.released_at === null) {
+      throw new HttpError(
+        409,
+        "this dispatch's lease release is still pending; the release sweep " +
+          "must resolve it before a retry (typically within a minute)"
+      );
+    }
     // Return it to the head of its own history: queued, attempt counter reset,
-    // stale lease/contract/error cleared so it runs fresh.
+    // stale lease/contract/error and release tracking cleared so it runs
+    // fresh (a stale released_at from the prior attempt would hide the NEW
+    // attempt's lease from the release sweep).
     const updated = await updateDispatch(id, {
       status: "queued",
       attempts: 0,
       lease_id: null,
       wisp_contract_id: null,
+      released_at: null,
+      release_pending: false,
       error: null,
     });
     // Wake the dispatcher so the requeued work is picked up promptly; it is a
