@@ -44,9 +44,12 @@ owns the lease lifecycle, never the agent inside it.
 
 - `claude` stream-json output parsers.
 - Prompt builder and shared template engine with `{{event.*}}` /
-  `{{payload.*}}` substitution, plus an `{{env.*}}` root for step commands and
-  the script runner's command template (secrets are not exposed to
-  `prompt_template` or `userdata_template`).
+  `{{payload.*}}` substitution, plus an `{{env.*}}` root for step commands,
+  `userdata_template`, `prompt_template`, `prompt`-kind snippet content, and
+  the script runner's command template. `prompt_template`, `userdata_template`,
+  and `prompt`-kind snippet content render against the LEASE-injectable env
+  only, so a `{name, inject: "step-only"}` secret never reaches the lease (via
+  userdata) or the prompt the agent sees.
 - Runner seam (`src/runners/`): a playbook names its `runner` (`claude-code`,
   the default, or `script`, which runs a rendered `runner_config.command_template`
   as the agent step with no LLM) and carries an opaque `runner_config`;

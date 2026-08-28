@@ -210,11 +210,16 @@ export interface GrantedCapability {
  *
  *   - a plain `string` (the legacy shape) — the resolved secret is BOTH injected
  *     into the lease environment AND available to server-side `{{env.NAME}}`
- *     template rendering in step commands, userdata, prompts, and the script
- *     runner's command template. This is what every existing playbook uses.
+ *     template rendering in step commands, `userdata_template`,
+ *     `prompt_template`, prompt-kind snippet content, and the script runner's
+ *     command template. This is what every existing playbook uses.
  *   - an object `{name, inject: "step-only"}` — the resolved secret is available
- *     to server-side `{{env.NAME}}` template rendering but is NEVER placed into
- *     the lease env. Use this for one-shot credentials (e.g. a PAT that a `pre`
+ *     to server-side `{{env.NAME}}` template rendering ONLY in step commands and
+ *     the script runner's command template, and is NEVER placed into the lease
+ *     env; the executor also renders `userdata_template`, `prompt_template`, and
+ *     prompt-kind snippet content against the lease-injectable env only, so a
+ *     step-only value can never reach the lease (via userdata) or the prompt the
+ *     agent sees. Use this for one-shot credentials (e.g. a PAT that a `pre`
  *     step's `git clone` needs once) so the agent step running inside the lease
  *     cannot read the value out of its process environment. The trade-off is
  *     documented at {@link EnvRequirementObject.inject}.
@@ -227,8 +232,10 @@ export type EnvRequirement = string | EnvRequirementObject;
 
 /**
  * Object form of an {@link EnvRequirement}: a required secret that is NOT
- * injected into the lease environment. Only `inject: "step-only"` is defined
- * today; other values are rejected on save (and skipped on tolerant parse).
+ * injected into the lease environment (nor surfaced to `prompt_template`,
+ * `userdata_template`, or prompt-kind snippet content; those render against
+ * the lease-injectable env only). Only `inject: "step-only"` is defined today;
+ * other values are rejected on save (and skipped on tolerant parse).
  *
  * Trade-off: a step-only secret still appears in the RENDERED command string
  * sent to wisper for the one exec that references it — visible in the container

@@ -47,6 +47,14 @@ export interface BuildPromptInput {
    * Absent when the template references no snippets.
    */
   promptSnippets?: Map<string, string>;
+  /**
+   * Resolved LEASE env (a flat name -> value map) used to substitute
+   * `{{env.NAME}}` tokens in `prompt_template`. This is deliberately the
+   * lease-injectable subset (step-only secrets are excluded), so a step-only
+   * value is never surfaced into the prompt handed to the agent. Omit when the
+   * playbook has no `env_requirements`; an `{{env.*}}` token then renders empty.
+   */
+  env?: Record<string, string>;
 }
 
 /** Matches a `{{ dotted.path }}` template token, capturing the trimmed path. */
@@ -104,13 +112,16 @@ function renderValue(value: unknown): string {
 /**
  * Substitute `{{...}}` tokens in `template`. Supported roots are `event`
  * (exposing `type`, `source`, `subject_ref`), `payload` (any dotted path into
- * the event payload), and — when supplied via `extra.env` — `env` (a flat map of
- * resolved secret names to values, for step command templates). Any token that
- * resolves to nothing — an unknown root or a missing path — renders as the empty
- * string and never throws.
+ * the event payload), and (when supplied via `extra.env`) `env` (a flat map of
+ * resolved secret names to values, used for step command templates AND for the
+ * playbook's `prompt_template` / `userdata_template` and prompt-kind snippet
+ * content; the executor hands only the LEASE-injectable env in the latter three
+ * so a step-only secret is never surfaced there). Any token that resolves to
+ * nothing (an unknown root or a missing path) renders as the empty string and
+ * never throws.
  *
  * Exported so the executor can render a playbook's `userdata_template` and its
- * step `command_template`s with the exact same engine used for prompts — the
+ * step `command_template`s with the exact same engine used for prompts; the
  * substitution behavior must not drift between them.
  */
 export function renderTemplate(
@@ -179,6 +190,7 @@ export function buildPrompt(input: BuildPromptInput): string {
     workingEnvironment,
     capabilityContext = [],
     promptSnippets,
+    env,
   } = input;
 
   const eventJson = JSON.stringify(
@@ -205,6 +217,7 @@ export function buildPrompt(input: BuildPromptInput): string {
       "- Save any work product to disk before finishing.",
     ].join("\n"),
     renderTemplate(playbook.prompt_template, event, {
+      env,
       snippets: promptSnippets,
     }),
     ...capabilityContext.map(

@@ -394,18 +394,17 @@ forms are resolved the same way (a missing name fails the dispatch before any
 lease is created), but they differ in **delivery**:
 
 - A **plain string** entry is injected into the lease environment AND is
-  available to server-side `{{env.NAME}}` template rendering. This is what
+  available to server-side `{{env.NAME}}` template rendering in step
+  `command_template`s, `userdata_template`, `prompt_template`, `prompt`-kind
+  snippet content, and the `script` runner's `command_template`. This is what
   every existing playbook uses.
 - A **`{name, inject: "step-only"}`** entry is available to server-side
-  `{{env.NAME}}` template rendering ONLY. Its value is **never** placed into the
-  lease env.
-
-The `env` template root is exposed only where a secret is meant to be spliced
-into a command: step `command_template`s, the `script` runner's
-`command_template`, and the content of `prompt`-kind snippets. `prompt_template`
-and `userdata_template` are rendered WITHOUT an `env` root, so an `{{env.NAME}}`
-token there renders empty (the agent learns a lease-env variable exists only
-because the prompt names it). Use this for one-shot credentials that a `pre` step needs once
+  `{{env.NAME}}` template rendering ONLY in step `command_template`s and the
+  `script` runner's `command_template`. Its value is **never** placed into the
+  lease env; the executor also renders `userdata_template`, `prompt_template`,
+  and `prompt`-kind snippet content against the lease-injectable env only, so a
+  step-only value can never reach the lease (via userdata) or the prompt the
+  agent sees. Use this for one-shot credentials that a `pre` step needs once
   (e.g. an ADO PAT interpolated into a `git clone` URL) so the agent step
   running inside the lease cannot read the value out of its process environment
   — a persistent LLM with shell access would otherwise see every value in the

@@ -1,10 +1,12 @@
 /**
  * The runner registry: the single lookup from a runner id to its {@link Runner}.
  *
- * `claude-code` is currently the sole registered runner and the default. The
- * executor resolves its runner through {@link getDefaultRunner} (hardcoded to the
- * default for now); a later task lets a playbook name its runner, at which point
- * lookups go through {@link getRunner}.
+ * Two runners are registered: `claude-code` (the default; runs the Claude Code
+ * CLI in the lease against the rendered `prompt_template`) and `script` (runs a
+ * rendered `runner_config.command_template` as the agent step with no LLM). The
+ * executor resolves its runner through {@link getRunner} keyed on the
+ * playbook's `runner` field; {@link getDefaultRunner} returns
+ * {@link DEFAULT_RUNNER_ID}'s runner as the fallback when a caller has no id.
  */
 
 import { claudeCodeRunner } from "./claudeCode";
