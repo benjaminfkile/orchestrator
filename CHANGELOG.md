@@ -16,9 +16,13 @@ owns the lease lifecycle, never the agent inside it.
 
 #### Foundation
 
-- knex + better-sqlite3 database bootstrap with a migration runner, and the full
-  schema: `app_settings`, `events`, `rules`, `playbooks`, `dispatches`, `runs`,
-  `findings`, `run_collected`, and `module_config`.
+- knex + better-sqlite3 database bootstrap with a migration runner (migrations
+  are registered explicitly in `src/db/migrations/index.ts`, not discovered from
+  the filesystem), and the full schema: `app_settings`, `events`, `rules`,
+  `playbooks`, `dispatches`, `runs`, `findings`, `module_config`, `notifiers`,
+  `notification_log`, and `snippets` (plus additive columns: `runs.collected`,
+  `playbooks.granted_capabilities`/`runner`/`runner_config`/`host`/`isolation`,
+  `rules.notify`, `dispatches.released_at`/`release_pending`).
 - `events` table + repository with dedupe-cooldown suppression on `dedupe_key`.
 - `rules` and `playbooks` tables + CRUD repositories.
 - `dispatches`, `runs`, and `findings` tables with an atomic FIFO claim.
@@ -39,8 +43,21 @@ owns the lease lifecycle, never the agent inside it.
 #### Executor
 
 - `claude` stream-json output parsers.
-- Prompt builder with `{{event.*}}` / `{{payload.*}}` / `{{env.*}}` template
-  substitution.
+- Prompt builder and shared template engine with `{{event.*}}` /
+  `{{payload.*}}` substitution, plus an `{{env.*}}` root for step commands and
+  the script runner's command template (secrets are not exposed to
+  `prompt_template` or `userdata_template`).
+- Runner seam (`src/runners/`): a playbook names its `runner` (`claude-code`,
+  the default, or `script`, which runs a rendered `runner_config.command_template`
+  as the agent step with no LLM) and carries an opaque `runner_config`;
+  `GET /api/runners` lists the ids. The claude-code runner delivers the prompt
+  as an argv argument on linux and via the `ORCH_AGENT_PROMPT` lease env var on
+  windows leases (prompts over 30000 chars fail a windows dispatch).
+- Snippets: reusable `prompt` / `userdata` / `step` template fragments
+  (`snippets` table, `/api/snippets`) resolved at dispatch time; a missing or
+  kind-mismatched reference fails the dispatch before leasing.
+- Per-playbook `host` selector and `isolation` level (`shared`/`sandboxed`/`vm`);
+  in `v1` mode both are resolved against `GET /v1/catalog` before leasing.
 - Dispatch pipeline state machine (`queued → leasing → running → collecting →
   done/failed`) with guaranteed lease release.
 - Playbook `pre`/`collect` steps with secret masking.
@@ -103,6 +120,47 @@ owns the lease lifecycle, never the agent inside it.
 - `ado.sprint_rollup` capability: a current-sprint summary (counts by state/type
   plus at-risk, unassigned, and in-review lists), built on `ado.query_work_items`.
   Both are read-only and degrade to a note on any ADO error.
+- `ado.get_work_item_links` capability: the subject's ancestors, children,
+  related items, and attachment pointers as a size-capped block (default 8000
+  chars), with an authenticated download hint only when the PAT env var is
+  among the playbook's `env_requirements`.
+- Pull-request producer (`ado.pullrequest`): polls the project's active PRs,
+  optionally filtered by creator, and emits `ado.pullrequest.created` /
+  `.updated` with the repo clone URL and branches.
+- `POST /api/modules/:id/backfill`: replays the currently watched work items
+  through normal intake as `ado.workitem.created` events without touching the
+  poller's snapshot.
+- ADO discovery endpoints (`/api/modules/ado/discovery/*`, `/identity/me`)
+  backing the SPA's cascading pickers; a PAT lacking scope degrades a list to
+  `200 []` with an `X-Ado-Restricted` header.
+
+#### Datadog module
+
+- Read-only Datadog client (log aggregate/search, monitor states) with
+  shape-validated module config.
+- `datadog.logwatch` producer: per-watch grouped counts with threshold, spike,
+  and novel-group detectors emitting one `datadog.logs.alert` per tripped group.
+- `datadog.monitor` producer: emits `datadog.monitor.transition` on a monitor or
+  group state change against a known prior state.
+- `datadog.query_logs` and `datadog.get_monitor` capabilities (read-only,
+  degrade to a note).
+
+#### Notifications
+
+- Notifiers (`notifiers` table, `/api/notifiers`) and rule `notify` targets: a
+  fired notifier always records one `notification_log` row and best-effort
+  raises a native desktop toast (PowerShell WinRT on Windows, `osascript` on
+  macOS, `notify-send` on Linux). There are no delivery kinds.
+- Notification inbox API (`/api/notifications`, unread count, mark read, SSE
+  stream) and the in-app bell.
+
+#### Portability
+
+- `GET /api/config/export` / `POST /api/config/import`: a portable document of
+  playbooks, rules, snippets, module config (exported disabled), and
+  whitelisted settings with secrets as names only; import supports merge /
+  overwrite and dry-run and applies in one transaction. Notifiers and rule
+  `notify` targets are not part of the document.
 - Work-item event payloads carry the human web-UI `url`
   (`_apis/wit/workItems/{id}` → `_workitems/edit/{id}`, host/org/project
   preserved) so a click opens the item rather than raw REST JSON; the original
@@ -141,14 +199,21 @@ owns the lease lifecycle, never the agent inside it.
 
 #### REST API
 
-- Routers for events, rules, playbooks, dispatches, runs, settings, modules, and
-  secrets, plus a health probe and a per-dispatch log-tailing endpoint.
+- Routers for events, rules, playbooks (with `/usage` and a cascading delete),
+  dispatches (manual `POST`, `/retry`), runs, settings (`/system`), modules,
+  secrets, notifiers, notifications, snippets, runners, capabilities, the
+  Anthropic model list, the wisper host catalog, the agent briefing, the
+  `/api/changes/stream` SSE feed, and config export/import, plus a health probe
+  and a per-dispatch log-tailing endpoint. Free-text `?q=` search on events,
+  dispatches, runs, and notifications.
 
 #### Web UI
 
 - React + Vite SPA shell, routing, data layer, and Fluent UI baseline.
-- Queue dashboard, Events, Rules, Playbooks, Runs (with live log), Modules, and
-  Settings pages.
+- Queue dashboard, Events, Rules, Playbooks, Snippets, Runs (with live log),
+  Modules, Notifications, Notifiers, Agent Briefing, and Settings pages; live
+  refetch off the change stream; System / Light / Dark theme; responsive
+  layout with a collapsible nav rail.
 - App-wide system-status banner surfacing the two boot-config dead-ends that
   silently disable leasing: v1 mode with no `WISPER_API_KEY` secret, and an
   unset `WISPER_HOST_ID`; session-dismissable, clears live when the missing

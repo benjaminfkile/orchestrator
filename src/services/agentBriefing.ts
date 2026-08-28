@@ -189,7 +189,11 @@ steps?, granted_capabilities?, output_kind?}\`.
   \`step-only\` names, they are not there).
 - Template substitution (prompt/userdata/step/script templates):
   \`{{event.type}}\`, \`{{event.source}}\`, \`{{event.subject_ref}}\`,
-  \`{{payload.<dotted.path>}}\`, \`{{env.NAME}}\`. Unknown tokens render empty.
+  \`{{payload.<dotted.path>}}\`. \`{{env.NAME}}\` (a resolved secret) is available
+  ONLY in step \`command_template\`s, the \`script\` runner's \`command_template\`,
+  and \`prompt\`-kind snippet content; \`prompt_template\` and \`userdata_template\`
+  have no \`env\` root, so an \`{{env.*}}\` token there renders empty. Unknown
+  tokens render empty.
 - Findings: an agent (or script) persists findings by printing
   \`<NOTES_TO_SAVE>[{"content":"...","visibility":"all","tags":["..."]}]</NOTES_TO_SAVE>\`.
   \`visibility\` is \`self|siblings|descendants|ancestors|all\` (default \`all\`);
@@ -350,8 +354,11 @@ rename therefore breaks every reference by design.
   double-check the body. The ADO integration is READ-ONLY.
 - \`POST /api/modules/ado/backfill\` body \`{producer_id?, limit?, dry_run?}\` ->
   \`{candidates, emitted}\` (400 when the module is disabled or unconfigured).
-- Discovery pickers under \`/api/modules/ado/discovery/*\` (orgs, projects,
-  types, states, people, iterations; \`workitems?q=\` searches work items), plus
+- Discovery pickers under \`/api/modules/ado/discovery/*\` (\`orgs\`,
+  \`projects?org=\`, \`work-item-types?org=&project=\`,
+  \`states?org=&project=&type=\`, \`area-paths?org=&project=\`,
+  \`iterations?org=&project=\`, \`identities?org=&project=&q=\`; \`workitems?q=\`
+  searches the CONFIGURED project's work items and needs the module enabled), plus
   \`GET /api/modules/ado/identity/me\`. On a PAT lacking scopes these DEGRADE to
   200 + an empty list with an \`X-Ado-Restricted\` header, never a hard 401.
 - \`POST /api/modules/ado/workitems/:id/materialize\` -> 201 with a stored
@@ -410,9 +417,12 @@ rename therefore breaks every reference by design.
 ## Portability
 
 - \`GET /api/config/export\` (add \`?scrub=environment\` to strip machine-local
-  values) — one JSON document: playbooks, rules, snippets, module config,
-  whitelisted settings; secrets travel as NAMES only. 409s when a stored secret
-  VALUE is found pasted inside a template (fix the template, then re-export).
+  values): one JSON document: playbooks, rules (with their \`dispatch\` targets),
+  snippets, module config (always exported DISABLED), whitelisted settings
+  (never \`identity_me\`); secrets travel as NAMES only. Notifiers and rule
+  \`notify\` targets are NOT included, so recreate those by hand after an import.
+  409s when a stored secret VALUE is found pasted inside a template (fix the
+  template, then re-export).
 - \`POST /api/config/import\` body \`{document, mode?, dry_run?}\` — \`mode\` is
   \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
   \`dry_run: true\` computes the full plan with NO writes. Returns per-object

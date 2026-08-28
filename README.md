@@ -202,9 +202,10 @@ own intake (`src/services/runEvents.ts`) so rules can react to a dispatch's
 lifecycle and notify or chain further playbooks. This is a callback built from
 existing machinery — no new tables, no new transport.
 
-- **`run.started`** — fires once when the dispatcher hands a **claimed** dispatch
-  to the executor. Dispatches that never start (dropped by a cap, held by the
-  run/token budget gate, or blocked by the chain-depth cap) emit nothing.
+- **`run.started`**: fires each time the dispatcher hands a **claimed** dispatch
+  to the executor, so a dispatch that is retried emits it once per attempt.
+  Dispatches that never start (dropped by a cap, held by the run/token budget
+  gate, or blocked by the chain-depth cap) emit nothing.
 - **`run.completed`** — fires on a terminal `done`.
 - **`run.failed`** — fires on a terminal `failed` (never before a retry — only
   the final give-up emits). One exception to "retries continue": a retryable
@@ -265,21 +266,24 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | Method & path | Purpose |
 |---|---|
 | `GET /api/health` | Liveness probe: `{ status, db, wisper }` (wisper `/healthz` probed with a 2 s timeout, cached 30 s). |
-| `GET /api/events` · `GET /api/events/:id` | List / read stored events. |
+| `GET /api/events` · `GET /api/events/:id` | List / read stored events. The list is newest-first and cursor-paginated: `?limit=` (1..500, default 50), `?before=<id>` pages past an id, and `?q=` substring-searches (case-insensitive, whitespace-separated terms ANDed) across source, type, subject fields, and the raw payload JSON. |
 | `GET /api/events/facets` | Distinct `source` + `type` values (DB distincts merged with the registered modules' advertised event types), for the Events filters and Rule source/type pickers. |
 | `GET /api/rules` · `GET /api/rules/:id` | List / read rules. |
 | `POST /api/rules` · `PATCH /api/rules/:id` · `DELETE /api/rules/:id` | Create / update / delete a rule. |
 | `POST /api/rules/:id/enable` · `POST /api/rules/:id/disable` | Toggle a rule. |
 | `GET /api/playbooks` · `GET /api/playbooks/:id` | List / read playbooks. |
-| `POST /api/playbooks` · `PATCH /api/playbooks/:id` · `DELETE /api/playbooks/:id` | Create / update / delete a playbook. |
-| `GET /api/dispatches` · `GET /api/dispatches/:id` | Read the dispatch queue. |
+| `POST /api/playbooks` · `PATCH /api/playbooks/:id` | Create / update a playbook (unknown body keys and a duplicate `name` are rejected: 400 / 409). |
+| `DELETE /api/playbooks/:id` | Delete a playbook AND cascade its terminal run history (dispatches, runs, findings, per-dispatch log files); 409 `{error: "playbook has N in-flight dispatches"}` while any dispatch is queued/leasing/running/collecting. A rule that still references the playbook is not a barrier; its dangling target simply never dispatches. |
+| `GET /api/playbooks/:id/usage` | `{dispatches, runs, findings, in_flight, referencing_rules: [{id, name}]}`: what a delete would cascade and the enabled rules that reference the playbook. |
+| `GET /api/dispatches` · `GET /api/dispatches/:id` | Read the dispatch queue (newest-first). `?status=` filters to one state, `?active=1` to the non-terminal work (queued/leasing/running/collecting), `?q=` substring-searches status, error, subject fields, event type, and playbook name. `GET /:id` embeds the dispatch's runs, each with its findings. A queued dispatch held by the run/token budget gate is annotated with `waiting_reason: "budget"` plus `window_count`/`budget`/`next_eligible_at`. |
 | `POST /api/dispatches` | Manually queue a playbook against an event: `{event_id, playbook_id}` → 201 with the created `queued` dispatch (`rule_id` null). No rule matching; 404 if either id is unknown. Bypasses the per-event cap. |
-| `GET /api/dispatches/:id/log` | Tail the per-dispatch log (streamed). |
-| `POST /api/dispatches/:id/retry` | Requeue a `failed` dispatch and kick the dispatcher. |
-| `GET /api/runs/:id` | Read a run with its collected output and findings. |
+| `GET /api/dispatches/:id/log` | Tail the per-dispatch log as chunked `text/plain`: current content, then appended bytes, until the dispatch is terminal or the client disconnects; 404 until the log file exists. |
+| `POST /api/dispatches/:id/retry` | Requeue a `failed` dispatch (attempts reset) and kick the dispatcher; 409 unless the status is `failed`, and 409 while the dispatch still holds an unreleased lease (the release sweep must resolve it first). |
+| `GET /api/runs` | Run history, newest-first: one row per dispatch with its latest run's outcome joined in. `?status=` filters to a dispatch status, `?limit=` (1..1000, default 200) caps rows, `?q=` substring-searches playbook name, status, error, subject fields, and each run's result text, collected output, and findings content. |
+| `GET /api/runs/:id` | Read a run with its collected output, findings, and the triggering event's subject fields. |
 | `GET /api/notifiers` · `GET /api/notifiers/:id` | List / read notifiers (outbound sinks). |
 | `POST /api/notifiers` · `PATCH /api/notifiers/:id` · `DELETE /api/notifiers/:id` | Create / update / delete a notifier (`name` required; `config`/templates optional; there is no delivery `kind`). |
-| `GET /api/notifications` | Notification-log inbox, newest-first, cursor-paginated (`limit`≤500, `cursor`); `unread=1` restricts to unread rows. |
+| `GET /api/notifications` | Notification-log inbox, newest-first, cursor-paginated (`limit`≤500, default 50; `cursor`); `unread=1` restricts to unread rows; `?q=` substring-searches title, body, status, and error. |
 | `GET /api/notifications/unread-count` | `{ count }` of rows not yet marked read. |
 | `GET /api/notifications/stream` | Server-Sent Events: one `data:` frame per newly written notification row (heartbeat comment keeps it warm). |
 | `POST /api/notifications/:id/read` · `POST /api/notifications/read-all` | Mark one row / every unread row read (`read-all` → `{ updated }`). |
@@ -309,9 +313,9 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `GET /api/agent-briefing` | The agent briefing `{briefing}` — see **Agent briefing**. |
 | `GET /api/runners` | Registered runner ids `{runners: ["claude-code", …]}` for the playbook Runner picker. |
 | `GET /api/capabilities` | Grantable capabilities `[{id, module_id}]` for the playbook capability picker. |
-| `GET /api/changes` | SSE stream of coalesced resource-change frames `{resource, ts}` driving the SPA's live refetch. |
-| `GET /api/config/export` | Portable config document (playbooks, rules, snippets, module config, whitelisted settings; secrets as NAMES only). `?scrub=environment` strips machine-local values. |
-| `POST /api/config/import` | Import a config document `{document, mode: merge\|overwrite, dry_run}`; dry-run returns the full plan with no writes. |
+| `GET /api/changes/stream` | SSE stream of coalesced resource-change frames `{resource, ts}` driving the SPA's live refetch (a comment ping every 15 s keeps it warm). |
+| `GET /api/config/export` | Portable config document (playbooks, rules with their `dispatch` targets, snippets, module config exported DISABLED, whitelisted settings minus `identity_me`; secrets as NAMES only in `required_secrets`). Notifiers and rule `notify` targets are NOT exported. `?scrub=environment` blanks the module `org`/`project` and `default_lease_image`. 409 when a stored secret VALUE is found pasted inside the document. |
+| `POST /api/config/import` | Import a config document `{document, mode: merge\|overwrite, dry_run}`; `merge` (default) skips name collisions, `overwrite` replaces them; dry-run returns the full plan with no writes. Returns per-object actions, `missing_secrets`, and a post-import checklist; the apply is one transaction (400 on a malformed document, 409 on a rule whose playbook is unresolvable). |
 
 The secret store is **write-only** across the API: a value is readable only
 inside a lease, via the executor's `env` injection. It never crosses the API
@@ -336,8 +340,9 @@ silently fall back to their default so a typo never blocks boot.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `3007` | Loopback API port. Must be an integer 1–65535. |
-| `ORCH_DB_PATH` | OS user-data dir | SQLite database path override (`<user-data>/orchestrator`). |
-| `WISPER_BASE_URL` | `http://localhost:8080` | Base URL of the local wisper-api (must be http(s)). |
+| `ORCH_DB_PATH` | `<user-data>/orchestrator/orchestrator.sqlite` | SQLite database file path override. The user-data base is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and `$XDG_DATA_HOME` (or `~/.local/share`) elsewhere; per-dispatch logs and the secret store live under the same `orchestrator` directory. |
+| `WISPER_BASE_URL` | `http://localhost:8080` | Base URL of the wisper-api (must be http(s)). A plaintext `http://` URL is accepted only for loopback hosts (`localhost`, `127.0.0.1`, `::1`); a non-loopback `http://` URL is refused at boot so the API key and injected secrets never travel unencrypted. |
+| `WISPER_ALLOW_INSECURE_HTTP` | *(unset)* | Set `1` or `true` to downgrade the non-loopback plaintext-http refusal to a loud warning (for operators terminating TLS themselves). |
 | `WISPER_MODE` | `dev` | Which wisper surface the client speaks: `dev` (unauthenticated `/dev/leases` harness) or `v1` (authenticated `/v1/leases` consumer surface). In `v1` mode every request carries `Authorization: Bearer <WISPER_API_KEY>` — set the `WISPER_API_KEY` **secret** (not an env var) first. Any other value fails fast. |
 | `WISPER_HOST_ID` | *(unset)* | The **default host** a playbook uses when it sets no `host`. In `dev` mode it is the hostId targeted on the `/dev/leases` endpoints; in `v1` mode it is the default catalog host **id or name** resolved against `GET /v1/catalog` at dispatch time. **Required to rent leases** — validated lazily, so an unset value does not crash boot but leaves leasing (and the dispatcher) idle. |
 | `WISPER_CREATE_LEASE_TIMEOUT_MS` | `150000` | Client timeout (ms) for the blocking create-lease call. The `POST /dev/leases` 201 is not sent until the lease is fully provisioned (clone/build/host can take minutes for heavy images), so this is the longest per-operation timeout. Raise it when provisioning is slow. Unset or invalid → default. |
@@ -389,13 +394,18 @@ forms are resolved the same way (a missing name fails the dispatch before any
 lease is created), but they differ in **delivery**:
 
 - A **plain string** entry is injected into the lease environment AND is
-  available to server-side `{{env.NAME}}` template rendering (in
-  `userdata_template`, `prompt_template`, step `command_template`s, and the
-  script runner's `command_template`). This is what every existing playbook
-  uses.
+  available to server-side `{{env.NAME}}` template rendering. This is what
+  every existing playbook uses.
 - A **`{name, inject: "step-only"}`** entry is available to server-side
   `{{env.NAME}}` template rendering ONLY. Its value is **never** placed into the
-  lease env. Use this for one-shot credentials that a `pre` step needs once
+  lease env.
+
+The `env` template root is exposed only where a secret is meant to be spliced
+into a command: step `command_template`s, the `script` runner's
+`command_template`, and the content of `prompt`-kind snippets. `prompt_template`
+and `userdata_template` are rendered WITHOUT an `env` root, so an `{{env.NAME}}`
+token there renders empty (the agent learns a lease-env variable exists only
+because the prompt names it). Use this for one-shot credentials that a `pre` step needs once
   (e.g. an ADO PAT interpolated into a `git clone` URL) so the agent step
   running inside the lease cannot read the value out of its process environment
   — a persistent LLM with shell access would otherwise see every value in the
@@ -482,6 +492,23 @@ diffed against a snapshot). It only arms its own interval trigger when `enabled`
 | `enabled` | boolean | Master switch for the PR producer. |
 | `interval_seconds` | number | Poll cadence; falls back to the module default (`60`). |
 | `creators` | string[] | Watched creator identities (`uniqueName` or `displayName`). A PR fires only if its `createdBy` matches one; empty/absent = any creator. |
+
+### ADO capabilities
+
+The module contributes four **READ-ONLY** capabilities a playbook may be
+granted (`GET /api/capabilities`, `module_id` `ado`). Each renders a labelled
+plaintext block into the agent prompt at dispatch time and **degrades, never
+breaks**: any ADO failure contributes a `(capability ... failed: ...)` note
+instead of failing the dispatch. A grant with no `config` inherits the module's
+persisted connection settings (`org`, `project`, `pat_secret_ref`, `base_url`);
+an explicit `config` may restate them plus the fields below.
+
+| Capability | Config | Renders |
+|---|---|---|
+| `ado.get_work_item` | connection fields only | The subject work item (id from the event `subject_ref`): title, type, state, assignee, area, tags, description, and its 20 most recent comments. |
+| `ado.query_work_items` | the `watched`-style filter fields (`assignee_mode`, `people`, `work_item_types`, `states`, `state_mode`, `area_paths`, `iteration`, `tags`) plus `top` | A labelled `id \| type \| title \| state \| assignee \| area \| changed` table from a WIQL query; `top` defaults to 100, hard max 500. |
+| `ado.sprint_rollup` | `area_path?`, `current_for_team?`, `stale_days?` (default 5), `terminal_states?`, `review_states?` | The current sprint's OPEN items: counts by state and type, plus at-risk (unchanged for `stale_days`), unassigned, and in-review lists. Built on the same query pipeline as `ado.query_work_items`. |
+| `ado.get_work_item_links` | `max_chars?` (default 8000, hard cap 20000), `max_ancestor_depth?` (default 10), `max_group_rows?` (default 25), `pat_env_var?` (default `ADO_PAT`) | The subject's ancestors (root first, with descriptions), children and related items (compact rows), and attachment POINTERS (never content). The block is size-capped with visible truncation markers; an authenticated download hint is rendered only when `pat_env_var` is among the playbook's `env_requirements` names. |
 
 > **Wiring status.** The ADO module is **registered at app boot** (`index.ts`
 > constructs it via `createAdoModule`, registers it with the module registry, and
@@ -778,10 +805,13 @@ data-layer hooks that back them live in `web/src/discovery.ts`.
 | Rule **Source** / **Type** | Rules | `GET /api/events/facets` (blank = match any; a trailing `.*` on type matches by prefix) |
 | Playbook **Env requirements** (multi) | Playbooks | `GET /api/secrets` (names only) — each selected secret has a per-entry "Step-only (do not inject into lease env)" toggle; the API validates the `{name, inject: "step-only"}` shape at save time |
 | Playbook **Image** | Playbooks | `GET /api/settings` `default_lease_image` + the `setting:default_lease_image` sentinel |
-| Playbook **Model** | Playbooks | `GET /api/anthropic/models` |
+| Playbook **Runner** | Playbooks | `GET /api/runners` (`claude-code`, `script`) |
+| Playbook **Model** | Playbooks | `GET /api/anthropic/models` (claude-code runner only) |
 | Playbook **Host** | Playbooks | `GET /api/wisper/hosts` (blank = default host; option labels show each host's `os`) |
+| Playbook **Isolation** | Playbooks | static `shared` / `sandboxed` / `vm` (blank = the wisper server default) |
 | Playbook **Network** | Playbooks | static `["open", "none"]` (`web/src/tools.ts`) |
-| Playbook **Allowed tools** (multi) | Playbooks | static `CLAUDE_CODE_TOOLS` list (`web/src/tools.ts`) |
+| Playbook **Allowed tools** (multi) | Playbooks | static `CLAUDE_CODE_TOOLS` list (`web/src/tools.ts`; claude-code runner only) |
+| Playbook **Granted capabilities** (multi) | Playbooks | `GET /api/capabilities` (`[{id, module_id}]`) |
 | ADO module **PAT secret name** | Modules | `GET /api/secrets` (names only) |
 | ADO **Org / Project / Type / State / Area path / Iteration / People** | Modules | cascading `GET /api/modules/ado/discovery/*` |
 | Settings **`identity_me`** | Settings | `GET /api/modules/ado/identity/me` (on demand) |
@@ -840,8 +870,9 @@ The single breakpoint is **768px** (`web/src/useMediaQuery.ts`). Above it, a
 persistent 220px left nav rail sits beside the content. At ≤768px the rail
 collapses into a top app bar with a hamburger that opens an overlay drawer
 holding the same nav links (selecting a route or the close button dismisses it).
-The playbook create/edit drawer is an end-anchored overlay sized
-`min(560px, 100vw)`, so it fills the screen on a phone. Wide tables (Playbooks,
+The playbook create/edit editor is a centered dialog sized `min(900px, 92vw)`
+by `90vh` (its form body scrolls internally); at or below the breakpoint it
+fills the viewport, so it works on a phone. Wide tables (Playbooks,
 Events, Settings/Secrets) and the Events payload blocks wrap in
 horizontally-scrollable containers rather than overflowing a narrow viewport.
 
@@ -858,9 +889,11 @@ configured (Modules page or step 5 of the runbook below):
    picker can list models (otherwise it falls back to `CLAUDE_CODE_OAUTH_TOKEN`).
 2. **Set `default_lease_image`** on the Settings page to your allow-listed runner
    image, and click **Resolve from ADO** on `identity_me` so `@Me` rules resolve.
-3. **Create a playbook** (Playbooks → *New*). The drawer groups the lease shape
-   (Image, Network, TTL, resources), the agent config (Model, Allowed tools),
-   Env requirements, and the ordered `pre`/`collect` steps. Pick the **Image**
+3. **Create a playbook** (Playbooks → *New*). The editor dialog groups the
+   lease shape (Image, Host, Isolation, Network, TTL, resources), the runner
+   config (Runner, then Model and Allowed tools for `claude-code` or a Command
+   template for `script`), Env requirements, Granted capabilities, the ordered
+   `pre`/`collect` steps, and the userdata source. Pick the **Image**
    from the suggestions (or the `setting:default_lease_image` sentinel), leave
    **Allowed tools** empty for no restriction, choose a **Model** (or leave blank
    for the runner default), and select the secret names the steps need under
@@ -903,7 +936,9 @@ trusted.
 1. **Start the lease broker stack.** Run [wisp](https://github.com/benjaminfkile/wisp),
    [wisp-agent](https://github.com/benjaminfkile/wisp-agent), and
    [wisper-api](https://github.com/benjaminfkile/wisper-api) on this machine.
-   wisper-api **must** have the dev endpoints enabled:
+   In the default `WISPER_MODE=dev`, wisper-api **must** have the dev endpoints
+   enabled (in `v1` mode the authenticated `/v1` surface is used instead and
+   only `/healthz` needs to answer):
 
    ```sh
    Tunnel__EnableDevEndpoints=true   # so /dev/leases and /healthz are live
@@ -913,10 +948,12 @@ trusted.
    **hostId** whose wisp-agent tunnel the leases should run through.
 
 2. **Build and allow-list a runner image.** Leases run the `claude` CLI, so the
-   image needs `node`, `git`, and the `claude` CLI on `PATH`. Build an image with
-   those three, then allow-list it in wisper-api (only allow-listed images may be
-   leased). Its reference (e.g. `ghcr.io/acme/agent:latest`) is what you'll store
-   as `default_lease_image` in step 6.
+   image needs `node`, `git`, and the `claude` CLI on `PATH` (the seeded smoke
+   test installs git and the `claude` CLI itself when they are missing, so a
+   bare Debian/Ubuntu image also works for it). Build an image, then allow-list
+   it in the wisp host's image policy (see **Runner image**; only allow-listed
+   images may be leased). Its reference (e.g. `ghcr.io/acme/agent:latest`) is
+   what you'll store as `default_lease_image` in step 6.
 
 3. **Configure and start orchestrator.**
 
@@ -1021,16 +1058,22 @@ trusted.
    ```
 
    The dispatch walks `queued → leasing → running → collecting → done`, and the
-   lease is released regardless of outcome. The web UI at
-   `http://127.0.0.1:3007` (once `web/` is built and served) shows the same via
+   lease is released regardless of outcome. The web UI (`npm --prefix web run
+   dev` serves it at `http://127.0.0.1:4400` and proxies `/api` to the backend
+   on 3007; the backend itself does not serve `web/dist`) shows the same via
    the Queue, Events, and Runs pages.
 
 ## Layout
 
 - `index.ts`, `src/` — Express + better-sqlite3/knex backend (loopback only, no
   auth — the OS user is the security boundary).
-- `web/` — React + Vite SPA (Queue, Events, Rules, Playbooks, Runs, Modules,
-  Settings pages on a Fluent UI baseline).
+- `web/`: React + Vite SPA (Queue, Events, Rules, Playbooks, Snippets, Runs,
+  Modules, Notifications, Notifiers, Agent Briefing, and Settings pages on a
+  Fluent UI baseline).
+- `runner/`: the `orchestrator-runner` lease image definitions (Linux and
+  Windows) plus a reference wisp allow-list snippet.
+- `scripts/local/`: gitignored; a private team-automation install script lives
+  here on a developer machine, never in the repo.
 
 ## Develop
 
@@ -1049,7 +1092,12 @@ Web:
 npm --prefix web install
 npm --prefix web run build
 npm --prefix web test     # vitest run (one-shot, never watch mode)
+npm --prefix web run dev  # Vite on 127.0.0.1:4400, proxying /api to the backend on 3007
 ```
+
+The root `package.json` also offers `npm run start` (build then run),
+`npm run coverage`, and the `install:web` / `build:web` / `dev:web` /
+`test:web` aliases for the commands above.
 
 Configuration: copy `.env.example` to `.env`. Assumes wisper-api is running
 locally with dev endpoints enabled (`Tunnel__EnableDevEndpoints=true`).
