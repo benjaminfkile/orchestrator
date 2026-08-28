@@ -431,10 +431,11 @@ rename therefore breaks every reference by design.
   modules); they are reactive sinks that only fire when a matched rule
   targets them. Rule \`notify\` targets are rewritten to reference notifiers by
   NAME. 409s when a stored secret VALUE is found pasted inside a template OR
-  inside a notifier's free-form \`config\` blob; if a notifier config field must
-  carry a credential, reference it by secret NAME (like a playbook's
-  \`env_requirements\` or a module's \`pat_secret_ref\`) and never by pasted
-  value.
+  inside a notifier's free-form \`config\` blob. Note: NOTHING in the core
+  consumes notifier \`config\` today (delivery never reads it) and the leak
+  scan only catches values that match a currently STORED secret, so an
+  unstored credential pasted into \`config\` would slip through. Never paste
+  credentials into a notifier's \`config\` at all.
 - \`POST /api/config/import\` body \`{document, mode?, dry_run?}\` — \`mode\` is
   \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
   \`dry_run: true\` computes the full plan with NO writes. Notifiers are matched
