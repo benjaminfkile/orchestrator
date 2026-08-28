@@ -175,25 +175,32 @@ steps?, granted_capabilities?, output_kind?}\`.
   saved on the run keyed by label.
 - \`env_requirements\`: required secret NAMES. Each entry is EITHER a plain
   string (the legacy shape — the resolved secret is injected into the lease env
-  AND available to server-side \`{{env.NAME}}\` template rendering) OR an object
-  \`{name, inject: "step-only"}\` (the resolved secret is available to server-side
-  template rendering ONLY — it is NEVER placed in the lease env, so the agent
-  step running inside the lease cannot read it from its process environment). A
-  missing secret fails the dispatch before leasing under both shapes. Reference
-  the secret in templates as \`{{env.NAME}}\`. Use \`inject: "step-only"\` for
-  one-shot credentials (e.g. a PAT that a \`pre\` step's \`git clone\` needs once);
-  the value still appears in that step's rendered command sent to wisper, but
-  does not persist in the lease env for the whole run. IMPORTANT: the agent
-  inside the lease only knows a lease-env variable exists if the prompt says so
-  — state available env var names in \`prompt_template\` (do NOT advertise
-  \`step-only\` names, they are not there).
+  AND available to server-side \`{{env.NAME}}\` template rendering EVERYWHERE:
+  step \`command_template\`s, \`userdata_template\`, \`prompt_template\`,
+  \`prompt\`-kind snippet content, and the \`script\` runner's
+  \`command_template\`) OR an object \`{name, inject: "step-only"}\` (the resolved
+  secret is available to \`{{env.NAME}}\` rendering ONLY in step
+  \`command_template\`s and the \`script\` runner's \`command_template\`; it is
+  NEVER placed in the lease env, and \`prompt_template\` / \`userdata_template\` /
+  \`prompt\`-kind snippet content also do NOT see it, so a step-only value can
+  never reach the lease (via userdata) or the prompt the agent sees). A missing
+  secret fails the dispatch before leasing under both shapes. Use
+  \`inject: "step-only"\` for one-shot credentials (e.g. a PAT that a \`pre\`
+  step's \`git clone\` needs once); the value still appears in that step's
+  rendered command sent to wisper, but does not persist in the lease env for
+  the whole run. IMPORTANT: the agent inside the lease only knows a lease-env
+  variable exists if the prompt says so; state available env var names in
+  \`prompt_template\` (do NOT advertise \`step-only\` names, they are not there).
 - Template substitution (prompt/userdata/step/script templates):
   \`{{event.type}}\`, \`{{event.source}}\`, \`{{event.subject_ref}}\`,
-  \`{{payload.<dotted.path>}}\`. \`{{env.NAME}}\` (a resolved secret) is available
-  ONLY in step \`command_template\`s, the \`script\` runner's \`command_template\`,
-  and \`prompt\`-kind snippet content; \`prompt_template\` and \`userdata_template\`
-  have no \`env\` root, so an \`{{env.*}}\` token there renders empty. Unknown
-  tokens render empty.
+  \`{{payload.<dotted.path>}}\`, and \`{{env.NAME}}\` (a resolved secret). The
+  \`env\` root is available in step \`command_template\`s, the \`script\` runner's
+  \`command_template\`, \`prompt_template\`, \`userdata_template\`, and
+  \`prompt\`-kind snippet content. \`prompt_template\`, \`userdata_template\`, and
+  \`prompt\`-kind snippet content render against the LEASE-injectable env only;
+  a \`{name, inject: "step-only"}\` secret is EXCLUDED there (it renders empty),
+  so a step-only value can never reach the lease (via userdata) or the prompt
+  the agent sees. Unknown tokens render empty.
 - Findings: an agent (or script) persists findings by printing
   \`<NOTES_TO_SAVE>[{"content":"...","visibility":"all","tags":["..."]}]</NOTES_TO_SAVE>\`.
   \`visibility\` is \`self|siblings|descendants|ancestors|all\` (default \`all\`);

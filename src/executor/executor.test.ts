@@ -717,6 +717,131 @@ describe("runDispatch pipeline", () => {
     });
   });
 
+  describe("env root in prompt_template and userdata_template", () => {
+    it("renders {{env.NAME}} from the LEASE env into both prompt_template and userdata_template", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      const dispatchId = await seedDispatch({
+        env_requirements: ["REGION", "HOST"],
+        userdata_template: "#!/bin/sh\necho region={{env.REGION}}",
+        prompt_template: "Deploy in {{env.REGION}} to {{env.HOST}}.",
+      });
+      const secrets: Record<string, string> = {
+        REGION: "westus",
+        HOST: "worker-9",
+      };
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: (name) => secrets[name],
+      });
+
+      expect(result.status).toBe("done");
+      // userdata carried the rendered env value straight through.
+      expect(fake.createBodies[0].userdata).toBe(
+        "#!/bin/sh\necho region=westus"
+      );
+      // The rendered prompt (delivered as an argv on linux) carries the env
+      // values in the agent step command.
+      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
+        .command;
+      expect(agentCmd).toContain("Deploy in westus to worker-9.");
+    });
+
+    it("excludes a step-only secret from BOTH prompt_template and userdata_template while still rendering it into a pre-step command", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+      fake.planSync(() => ({ exitCode: 0 }));
+
+      // A lease-env secret (LEASE_SECRET) plus a step-only one (STEP_SECRET).
+      // The prompt and userdata reference BOTH by name; the step-only one must
+      // render empty in both, but STILL render into the pre step's command.
+      const dispatchId = await seedDispatch({
+        env_requirements: [
+          "LEASE_SECRET",
+          { name: "STEP_SECRET", inject: "step-only" },
+        ],
+        userdata_template:
+          "#!/bin/sh\necho lease=[{{env.LEASE_SECRET}}] step=[{{env.STEP_SECRET}}]",
+        prompt_template:
+          "lease=[{{env.LEASE_SECRET}}] step=[{{env.STEP_SECRET}}]",
+        steps: [
+          {
+            phase: "pre",
+            label: "clone",
+            command_template: "clone --token {{env.STEP_SECRET}}",
+          },
+        ],
+      });
+      const secrets: Record<string, string> = {
+        LEASE_SECRET: "lease-value",
+        STEP_SECRET: "step-value",
+      };
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: (name) => secrets[name],
+      });
+
+      expect(result.status).toBe("done");
+
+      // The step-only value is NOWHERE in userdata: it renders empty and never
+      // reaches the container via this channel.
+      const userdata = fake.createBodies[0].userdata as string;
+      expect(userdata).toBe("#!/bin/sh\necho lease=[lease-value] step=[]");
+      expect(userdata).not.toContain("step-value");
+
+      // The step-only value is NOWHERE in the rendered prompt (delivered as an
+      // argv on linux) either. That is the whole point.
+      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
+        .command;
+      expect(agentCmd).toContain("lease=[lease-value] step=[]");
+      expect(agentCmd).not.toContain("step-value");
+
+      // BUT the pre step's command DID splice the step-only value in: the one
+      // exec that needs it still gets it.
+      const preExec = fake.execs.find((e) => e.command.startsWith("clone "));
+      expect(preExec?.command).toBe("clone --token step-value");
+    });
+
+    it("does not leak a step-only secret into prompt-kind snippet content spliced into the prompt", async () => {
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      // A prompt snippet whose CONTENT references the step-only secret; it must
+      // render empty when spliced into the prompt, since prompt-snippet content
+      // becomes part of the prompt the agent sees.
+      await createSnippet(
+        {
+          kind: "prompt",
+          name: "ctx",
+          content: "step=[{{env.STEP_SECRET}}]",
+        },
+        db
+      );
+      const dispatchId = await seedDispatch({
+        env_requirements: [{ name: "STEP_SECRET", inject: "step-only" }],
+        prompt_template: "[{{snippet.ctx}}]",
+      });
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        resolveEnv: (name) =>
+          name === "STEP_SECRET" ? "step-value" : undefined,
+      });
+
+      expect(result.status).toBe("done");
+      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
+        .command;
+      expect(agentCmd).toContain("[step=[]]");
+      expect(agentCmd).not.toContain("step-value");
+    });
+  });
+
   describe("parseEnvRequirements", () => {
     it("passes plain strings through unchanged", () => {
       expect(parseEnvRequirements(["A", "B_TOKEN"])).toEqual(["A", "B_TOKEN"]);

@@ -238,13 +238,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Parse a playbook's `env_requirements` array into typed {@link EnvRequirement}s,
  * preserving order. Two shapes per entry are accepted:
  *   - a plain string — the legacy shape; the resolved secret is injected into
- *     the lease environment AND available to template rendering.
+ *     the lease environment AND available to server-side `{{env.NAME}}`
+ *     template rendering in step commands, `userdata_template`,
+ *     `prompt_template`, prompt-kind snippet content, and the script runner's
+ *     command template.
  *   - `{name: string, inject: "step-only"}` — the resolved secret is available
- *     to server-side template rendering (`{{env.NAME}}` in step commands,
- *     userdata, prompt, and the script runner's command template) but is NOT
- *     placed into the lease env, so a persistent agent step running inside the
- *     lease cannot read it out of its process environment. See
- *     {@link EnvRequirement}.
+ *     to server-side `{{env.NAME}}` template rendering ONLY in step commands
+ *     and the script runner's command template. It is NOT placed in the lease
+ *     env, and it is NOT surfaced to `prompt_template`, `userdata_template`, or
+ *     prompt-kind snippet content; the executor renders those against the
+ *     lease-injectable env only, so a step-only value can never reach the lease
+ *     (via userdata) or the prompt the agent sees. See {@link EnvRequirement}.
  * Any entry that is neither shape (an object with a missing/bad `name`, an
  * unknown `inject` value, a null, an array, etc.) is SKIPPED rather than fatal
  * — the core stays tolerant of malformed config, like {@link parseSteps} and
@@ -767,7 +771,13 @@ export async function runDispatch(
       "userdata",
       db
     );
-    const userdata = renderTemplate(userdataTemplate, promptEvent);
+    // userdata_template is rendered with the LEASE env root only (the same map
+    // handed to createLease below, with step-only secrets excluded), so a
+    // step-only value can never reach the container via userdata even though
+    // the entry is resolvable elsewhere by name.
+    const userdata = renderTemplate(userdataTemplate, promptEvent, {
+      env: leaseInjectableEnv,
+    });
 
     // Render the prompt BEFORE the lease is created. Its inputs — the event, the
     // playbook templates, and the granted capabilities (which fetch from external
@@ -788,10 +798,14 @@ export async function runDispatch(
     // MAX_SNIPPET_DEPTH fails the dispatch here rather than silently dropping
     // prompt text. A snippet's content may itself reference event/payload/env and
     // further snippets. renderTemplate stays pure; buildPrompt only splices the map.
+    // The env root handed to snippet expansion is the LEASE env only (step-only
+    // secrets excluded), because a prompt snippet's content is spliced into the
+    // prompt the agent sees. A step-only value must not be reachable through
+    // this path any more than through prompt_template itself.
     const promptSnippets = await resolvePromptSnippets(
       playbook.prompt_template,
       promptEvent,
-      env,
+      leaseInjectableEnv,
       db
     );
     const prompt = buildPrompt({
@@ -800,6 +814,12 @@ export async function runDispatch(
       workingEnvironment: deps.workingEnvironment ?? DEFAULT_WORKING_ENVIRONMENT,
       capabilityContext,
       promptSnippets,
+      // prompt_template's `env` root is the LEASE env only (step-only secrets
+      // excluded), so a step-only value never reaches the prompt handed to the
+      // agent. The value is already delivered to the container through
+      // leaseInjectableEnv, so naming it in the prompt only tells the agent it
+      // exists; it does not leak a secret the agent could not otherwise see.
+      env: leaseInjectableEnv,
     });
 
     // A runner may deliver the prompt through the lease environment (the windows

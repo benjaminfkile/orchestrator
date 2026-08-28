@@ -313,6 +313,39 @@ describe("buildPrompt snippet substitution", () => {
   });
 });
 
+describe("buildPrompt env substitution", () => {
+  it("renders {{env.NAME}} from the supplied env map into the rendered prompt_template", () => {
+    const prompt = buildPrompt(
+      makeInput({
+        playbook: {
+          prompt_template: "region={{env.REGION}} host={{env.HOST}}",
+        },
+        env: { REGION: "westus", HOST: "worker-9" },
+      }),
+    );
+    expect(prompt).toContain("region=westus host=worker-9");
+  });
+
+  it("renders an {{env.NAME}} token as empty when env is omitted", () => {
+    const prompt = buildPrompt(
+      makeInput({
+        playbook: { prompt_template: "tok=[{{env.TOK}}]" },
+      }),
+    );
+    expect(prompt).toContain("tok=[]");
+  });
+
+  it("renders an {{env.NAME}} token as empty when the name is absent from env", () => {
+    const prompt = buildPrompt(
+      makeInput({
+        playbook: { prompt_template: "tok=[{{env.MISSING}}]" },
+        env: { OTHER: "x" },
+      }),
+    );
+    expect(prompt).toContain("tok=[]");
+  });
+});
+
 describe("buildPrompt is pure", () => {
   it("does not mutate its inputs", () => {
     const input = makeInput({
