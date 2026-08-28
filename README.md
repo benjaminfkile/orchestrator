@@ -314,7 +314,7 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `GET /api/runners` | Registered runner ids `{runners: ["claude-code", …]}` for the playbook Runner picker. |
 | `GET /api/capabilities` | Grantable capabilities `[{id, module_id}]` for the playbook capability picker. |
 | `GET /api/changes/stream` | SSE stream of coalesced resource-change frames `{resource, ts}` driving the SPA's live refetch (a comment ping every 15 s keeps it warm). |
-| `GET /api/config/export` | Portable config document (`schema_version` 2: playbooks, rules with their `dispatch` AND `notify` targets, notifiers, snippets, module config exported DISABLED, whitelisted settings minus `identity_me`; secrets as NAMES only in `required_secrets`). Notifiers preserve their `enabled` bit (unlike modules); a notifier is a reactive outbound sink that only fires when a matched rule targets it. `?scrub=environment` blanks the module `org`/`project` and `default_lease_image`. 409 when a stored secret VALUE is found pasted inside the document (a notifier's free-form `config` blob is scanned the same way; reference secrets in it by NAME, not by pasting the value). |
+| `GET /api/config/export` | Portable config document (`schema_version` 2: playbooks, rules with their `dispatch` AND `notify` targets, notifiers, snippets, module config exported DISABLED, whitelisted settings minus `identity_me`; secrets as NAMES only in `required_secrets`). Notifiers preserve their `enabled` bit (unlike modules); a notifier is a reactive outbound sink that only fires when a matched rule targets it. `?scrub=environment` blanks the module `org`/`project` and `default_lease_image`. 409 when a stored secret VALUE is found pasted inside the document. Notifier `config` is scanned the same way, but the scan only catches values that match a currently STORED secret, so credentials must NOT be pasted into a notifier's `config` at all (nothing consumes that blob today anyway). |
 | `POST /api/config/import` | Import a config document `{document, mode: merge\|overwrite, dry_run}`; `merge` (default) skips name collisions, `overwrite` replaces them; dry-run returns the full plan with no writes. Notifiers are matched by NAME idempotently and rule `notify` targets rebind to the local notifier ids. Reads schema versions **1 and 2**; a v1 document (which had no notifiers and no rule `notify`) imports cleanly with those fields defaulting to empty. Returns per-object actions, `missing_secrets`, and a post-import checklist; the apply is one transaction (400 on a malformed document, 409 on a rule whose playbook or notifier is unresolvable). |
 
 The secret store is **write-only** across the API: a value is readable only
@@ -736,10 +736,13 @@ integration modules (`src/services/notifications.ts`). A sink only delivers a
 rendered template; it never fetches external data or emits back into the pipeline,
 and its intent lives entirely in its name, `config`, and templates.
 
-A **notifier** is `{name, config, title_template, body_template, enabled}`
-(`config` is kept for future use and no longer read by delivery). **A
-notification is JUST a notification** — there are no delivery kinds. Every fired
-notifier ALWAYS:
+A **notifier** is `{name, config, title_template, body_template, enabled}`.
+**Nothing in the code consumes `config` today**: it is a free-form blob the
+core never branches on and delivery never reads. The exporter's leak scan only
+catches values that match a currently STORED secret, so an unstored credential
+pasted into `config` would slip through: never paste credentials into a
+notifier's `config` at all. **A notification is JUST a notification**: there
+are no delivery kinds. Every fired notifier ALWAYS:
 
 - records **exactly one** row in the in-app notification log — the bell +
   Notifications page keep the full history; and

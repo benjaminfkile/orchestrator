@@ -167,13 +167,13 @@ owns the lease lifecycle, never the agent inside it.
   transaction. Notifiers preserve their `enabled` bit (they are reactive
   outbound sinks that only fire when a matched rule targets them, so they
   cannot poll or dispatch on their own). Notifier `config` is a free-form blob
-  whose contents are unknown to the core; the exporter's leak scan catches a
-  pasted secret VALUE anywhere in it and fails the export loudly, so any
-  secret-bearing field a user places in `config` should reference the secret by
-  NAME (the same pattern as a playbook's `env_requirements` or a module's
-  `pat_secret_ref`). The importer reads both **v2** and **v1** documents; a v1
-  document (which had no notifiers and no rule `notify` field) imports cleanly,
-  with those fields defaulting to empty.
+  and **nothing in the core consumes it today** (delivery never reads it); the
+  exporter's leak scan only catches values that MATCH a currently STORED
+  secret, so an unstored credential pasted into `config` would slip through.
+  Do NOT paste credentials into a notifier's `config` at all. The importer
+  reads both **v2** and **v1** documents; a v1 document (which had no
+  notifiers and no rule `notify` field) imports cleanly, with those fields
+  defaulting to empty.
 - Work-item event payloads carry the human web-UI `url`
   (`_apis/wit/workItems/{id}` → `_workitems/edit/{id}`, host/org/project
   preserved) so a click opens the item rather than raw REST JSON; the original

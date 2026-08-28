@@ -62,6 +62,7 @@ function samplePlan(overrides: Partial<ImportPlan> = {}): ImportPlan {
     applied: false,
     playbooks: [{ key: "researcher", action: "create" }],
     rules: [{ key: "bugs-to-researcher", action: "create" }],
+    notifiers: [{ key: "desktop", action: "create" }],
     snippets: [{ key: "prompt:house-style", action: "create" }],
     modules: [{ key: "ado", action: "create" }],
     settings: [{ key: "default_lease_image", action: "create" }],
@@ -434,6 +435,64 @@ describe("SettingsPage", () => {
       expect(mockImportConfig).toHaveBeenLastCalledWith({}, "merge", false),
     );
     expect(await screen.findByText("Imported")).toBeTruthy();
+  });
+
+  it("renders the Notifiers group in the dry-run plan alongside the other groups", async () => {
+    // Cover every plan group so a missing render surfaces as a diff, not a silent gap.
+    mockImportConfig.mockImplementationOnce((_doc, mode, dryRun) =>
+      Promise.resolve(
+        samplePlan({
+          mode,
+          dry_run: dryRun,
+          applied: !dryRun,
+          notifiers: [
+            { key: "desktop", action: "create" },
+            { key: "email-oncall", action: "overwrite" },
+          ],
+        }),
+      ),
+    );
+
+    render(<SettingsPage />);
+    await screen.findByRole("table", { name: "Secrets" });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Import document" }), {
+      target: { value: "{}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Preview import" }));
+
+    const region = await screen.findByRole("region", { name: "Import plan" });
+    // The Notifiers group title carries a per-plan count like every other group.
+    expect(region.textContent).toContain("Notifiers (2)");
+    expect(region.textContent).toContain("desktop");
+    expect(region.textContent).toContain("email-oncall");
+    // Adjacent groups still render; the notifiers row is additive, not a swap.
+    expect(region.textContent).toContain("Playbooks (1)");
+    expect(region.textContent).toContain("Rules (1)");
+    expect(region.textContent).toContain("Snippets (1)");
+    expect(region.textContent).toContain("Modules (1)");
+    expect(region.textContent).toContain("Settings (1)");
+  });
+
+  it("renders an empty Notifiers group when the plan has none", async () => {
+    // A plan with no notifier changes still shows the group (with a 0 count) so
+    // the dry-run cannot silently hide the section.
+    mockImportConfig.mockImplementationOnce((_doc, mode, dryRun) =>
+      Promise.resolve(
+        samplePlan({ mode, dry_run: dryRun, applied: !dryRun, notifiers: [] }),
+      ),
+    );
+
+    render(<SettingsPage />);
+    await screen.findByRole("table", { name: "Secrets" });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Import document" }), {
+      target: { value: "{}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Preview import" }));
+
+    const region = await screen.findByRole("region", { name: "Import plan" });
+    expect(region.textContent).toContain("Notifiers (0)");
   });
 
   it("passes overwrite mode through and re-requires a preview after a mode change", async () => {

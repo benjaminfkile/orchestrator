@@ -103,6 +103,8 @@ export interface ImportPlan {
   applied: boolean;
   playbooks: ImportPlanItem[];
   rules: ImportPlanItem[];
+  /** Notifier plan items, keyed by name (a notifier's stable identity). */
+  notifiers: ImportPlanItem[];
   /** Snippet plan items, keyed `<kind>:<name>` — a snippet's stable identity. */
   snippets: ImportPlanItem[];
   modules: ImportPlanItem[];

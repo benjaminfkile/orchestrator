@@ -990,6 +990,12 @@ function ImportPlanView({
         listClassName={styles.planList}
       />
       <PlanGroup
+        title="Notifiers"
+        items={plan.notifiers}
+        className={styles.planGroupTitle}
+        listClassName={styles.planList}
+      />
+      <PlanGroup
         title="Snippets"
         items={plan.snippets}
         className={styles.planGroupTitle}
