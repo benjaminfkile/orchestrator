@@ -159,11 +159,21 @@ owns the lease lifecycle, never the agent inside it.
 
 #### Portability
 
-- `GET /api/config/export` / `POST /api/config/import`: a portable document of
-  playbooks, rules, snippets, module config (exported disabled), and
-  whitelisted settings with secrets as names only; import supports merge /
-  overwrite and dry-run and applies in one transaction. Notifiers and rule
-  `notify` targets are not part of the document.
+- `GET /api/config/export` / `POST /api/config/import`: a portable document
+  (`schema_version` 2) of playbooks, rules with their `dispatch` AND `notify`
+  targets, notifiers (referenced by name from `notify` targets), snippets,
+  module config (exported disabled), and whitelisted settings with secrets as
+  names only; import supports merge / overwrite and dry-run and applies in one
+  transaction. Notifiers preserve their `enabled` bit (they are reactive
+  outbound sinks that only fire when a matched rule targets them, so they
+  cannot poll or dispatch on their own). Notifier `config` is a free-form blob
+  whose contents are unknown to the core; the exporter's leak scan catches a
+  pasted secret VALUE anywhere in it and fails the export loudly, so any
+  secret-bearing field a user places in `config` should reference the secret by
+  NAME (the same pattern as a playbook's `env_requirements` or a module's
+  `pat_secret_ref`). The importer reads both **v2** and **v1** documents; a v1
+  document (which had no notifiers and no rule `notify` field) imports cleanly,
+  with those fields defaulting to empty.
 - Work-item event payloads carry the human web-UI `url`
   (`_apis/wit/workItems/{id}` → `_workitems/edit/{id}`, host/org/project
   preserved) so a click opens the item rather than raw REST JSON; the original

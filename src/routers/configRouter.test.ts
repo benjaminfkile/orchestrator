@@ -105,10 +105,11 @@ describe("config router — GET /api/config/export", () => {
     expect(res.status).toBe(200);
     expect(res.headers["content-disposition"]).toMatch(/attachment/);
     expect(res.body.kind).toBe("orchestrator-config-export");
-    expect(res.body.schema_version).toBe(1);
+    expect(res.body.schema_version).toBe(2);
     expect(typeof res.body.exported_at).toBe("string");
     expect(Array.isArray(res.body.playbooks)).toBe(true);
     expect(Array.isArray(res.body.rules)).toBe(true);
+    expect(Array.isArray(res.body.notifiers)).toBe(true);
     expect(Array.isArray(res.body.required_secrets)).toBe(true);
     expect(res.body.modules).toHaveProperty("ado");
     expect(res.body.app_settings).toBeDefined();
@@ -255,9 +256,10 @@ describe("config router — POST /api/config/import", () => {
     db = createDb(file);
     await runMigrations(db);
     setDb(db);
-    // Start from a clean slate: migrations seed some playbooks/rules.
+    // Start from a clean slate: migrations seed some playbooks/rules/notifiers.
     await db("rules").delete();
     await db("playbooks").delete();
+    await db("notifiers").delete();
     await db("module_config").delete();
     await db("app_settings").delete();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orch-config-secrets-"));

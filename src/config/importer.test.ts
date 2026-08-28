@@ -7,12 +7,13 @@ import type { Knex } from "knex";
 import { createDb, setDb } from "../db/db";
 import { runMigrations } from "../db/migrate";
 import { getModuleConfig, setModuleConfig } from "../db/moduleConfig";
+import { createNotifier, listNotifiers } from "../db/notifiers";
 import { createPlaybook, listPlaybooks } from "../db/playbooks";
 import { createRule, listRules } from "../db/rules";
 import { getSetting, setSetting } from "../db/settings";
 import { createSnippet, listSnippets } from "../db/snippets";
 
-import { exportConfig } from "./exporter";
+import { EXPORT_SCHEMA_VERSION, exportConfig } from "./exporter";
 import { importConfig, ImportError } from "./importer";
 
 function tempDbFile(): string {
@@ -20,11 +21,11 @@ function tempDbFile(): string {
   return path.join(dir, "test.sqlite");
 }
 
-/** A minimal, valid export document with one playbook and one rule wired to it. */
+/** A minimal, valid v2 export document with one playbook and one rule wired to it. */
 function sampleDoc(overrides: Record<string, unknown> = {}) {
   return {
     kind: "orchestrator-config-export",
-    schema_version: 1,
+    schema_version: 2,
     exported_at: "2026-07-15T00:00:00.000Z",
     app_settings: {
       dispatch_max_attempts: "7",
@@ -63,8 +64,10 @@ function sampleDoc(overrides: Record<string, unknown> = {}) {
         enabled: true,
         match: { source: "ado", type: "ado.workitem.created" },
         dispatch: [{ playbook: "researcher", bindings: { priority: "high" } }],
+        notify: [],
       },
     ],
+    notifiers: [],
     snippets: [
       {
         kind: "prompt",
@@ -82,6 +85,16 @@ function sampleDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** A v1-shape document (no notifiers, no rule.notify) for back-compat tests. */
+function sampleV1Doc(overrides: Record<string, unknown> = {}) {
+  const doc = sampleDoc(overrides) as Record<string, unknown>;
+  doc.schema_version = 1;
+  delete doc.notifiers;
+  const rules = doc.rules as Array<Record<string, unknown>>;
+  for (const rule of rules) delete rule.notify;
+  return doc;
+}
+
 describe("config importer", () => {
   let file: string;
   let db: Knex;
@@ -91,9 +104,11 @@ describe("config importer", () => {
     db = createDb(file);
     await runMigrations(db);
     setDb(db);
-    // Migrations seed some playbooks/rules; clear them so tests start empty.
+    // Migrations seed some playbooks/rules/notifiers; clear them so tests
+    // start empty.
     await db("rules").delete();
     await db("playbooks").delete();
+    await db("notifiers").delete();
     await db("module_config").delete();
     await db("app_settings").delete();
   });
@@ -152,6 +167,8 @@ describe("config importer", () => {
     expect(plan.rules).toEqual([
       { key: "bugs-to-researcher", action: "create" },
     ]);
+    // The sample doc has no notifiers; the plan is empty, not omitted.
+    expect(plan.notifiers).toEqual([]);
     expect(plan.snippets).toEqual([
       { key: "prompt:house-style", action: "create" },
     ]);
@@ -165,6 +182,7 @@ describe("config importer", () => {
     // No writes happened.
     expect(await listPlaybooks(db)).toHaveLength(0);
     expect(await listRules(db)).toHaveLength(0);
+    expect(await listNotifiers(db)).toHaveLength(0);
     expect(await listSnippets(undefined, db)).toHaveLength(0);
     expect(await getModuleConfig("ado", db)).toBeUndefined();
   });
@@ -514,12 +532,23 @@ describe("config importer", () => {
       },
       db
     );
+    const desktop = await createNotifier(
+      {
+        name: "desktop",
+        title_template: "Run finished",
+        body_template: "{{event.type}}",
+        enabled: true,
+        config: { channel: "primary" },
+      },
+      db
+    );
     await createRule(
       {
         name: "bugs-to-researcher",
         enabled: true,
         match: { source: "ado" },
         dispatch: [{ playbook_id: source.id, bindings: { priority: "high" } }],
+        notify: [{ notifier_id: desktop.id }],
       },
       db
     );
@@ -548,6 +577,7 @@ describe("config importer", () => {
       await runMigrations(target);
       await target("rules").delete();
       await target("playbooks").delete();
+      await target("notifiers").delete();
       await target("module_config").delete();
       await target("app_settings").delete();
 
@@ -563,6 +593,10 @@ describe("config importer", () => {
       // be equivalent.
       expect(second.playbooks).toEqual(first.playbooks);
       expect(second.rules).toEqual(first.rules);
+      // Notifiers and rule notify targets survive the round-trip.
+      expect(second.notifiers).toEqual(first.notifiers);
+      expect(second.notifiers).toHaveLength(1);
+      expect(second.rules[0].notify).toEqual([{ notifier: "desktop" }]);
       expect(second.snippets).toEqual(first.snippets);
       expect(second.snippets).toHaveLength(1);
       expect(second.modules).toEqual(first.modules);
@@ -572,5 +606,188 @@ describe("config importer", () => {
       await target.destroy();
       fs.rmSync(path.dirname(targetFile), { recursive: true, force: true });
     }
+  });
+
+  it("imports notifiers and rebinds rule notify targets to local ids", async () => {
+    const doc = sampleDoc({
+      notifiers: [
+        {
+          name: "desktop",
+          title_template: "Run finished",
+          body_template: "{{event.type}}",
+          enabled: true,
+          config: { channel: "primary" },
+        },
+      ],
+      rules: [
+        {
+          name: "notify-on-done",
+          enabled: true,
+          match: { type: "run.completed" },
+          dispatch: [],
+          notify: [{ notifier: "desktop" }],
+        },
+      ],
+      playbooks: [],
+      required_secrets: [],
+    });
+    const plan = await importConfig({ document: doc, secretNames: [], db });
+    expect(plan.notifiers).toEqual([{ key: "desktop", action: "create" }]);
+    const notifiers = await listNotifiers(db);
+    expect(notifiers).toHaveLength(1);
+    const [rule] = await listRules(db);
+    expect(rule.notify).toEqual([{ notifier_id: notifiers[0].id }]);
+    expect(notifiers[0].config).toEqual({ channel: "primary" });
+    // A notifier's `enabled` bit round-trips through import (unlike a module).
+    expect(notifiers[0].enabled).toBe(true);
+  });
+
+  it("matches a colliding notifier by name (merge skips, overwrite patches)", async () => {
+    const local = await createNotifier(
+      {
+        name: "desktop",
+        title_template: "LOCAL",
+        body_template: "LOCAL body",
+        enabled: false,
+        config: { channel: "local" },
+      },
+      db
+    );
+    const doc = sampleDoc({
+      notifiers: [
+        {
+          name: "desktop",
+          title_template: "DOC",
+          body_template: "DOC body",
+          enabled: true,
+          config: { channel: "doc" },
+        },
+      ],
+      rules: [],
+      playbooks: [],
+      required_secrets: [],
+    });
+
+    // merge: collision skipped, local content preserved. But its id is the same
+    // so a rule that referred to it locally keeps resolving.
+    const mergePlan = await importConfig({
+      document: doc,
+      mode: "merge",
+      secretNames: [],
+      db,
+    });
+    expect(mergePlan.notifiers).toEqual([{ key: "desktop", action: "skip" }]);
+    let [n] = await listNotifiers(db);
+    expect(n.id).toBe(local.id);
+    expect(n.title_template).toBe("LOCAL");
+
+    // overwrite: patch in place, id preserved so existing rule notify targets
+    // keep resolving.
+    const overwritePlan = await importConfig({
+      document: doc,
+      mode: "overwrite",
+      secretNames: [],
+      db,
+    });
+    expect(overwritePlan.notifiers).toEqual([
+      { key: "desktop", action: "overwrite" },
+    ]);
+    [n] = await listNotifiers(db);
+    expect(n.id).toBe(local.id);
+    expect(n.title_template).toBe("DOC");
+    expect(n.body_template).toBe("DOC body");
+    expect(n.enabled).toBe(true);
+    expect(n.config).toEqual({ channel: "doc" });
+  });
+
+  it("rebinds a rule notify target to a pre-existing local notifier not in the document", async () => {
+    const local = await createNotifier({ name: "desktop" }, db);
+    const doc = sampleDoc({
+      notifiers: [],
+      rules: [
+        {
+          name: "notify-only",
+          enabled: true,
+          match: {},
+          dispatch: [],
+          notify: [{ notifier: "desktop" }],
+        },
+      ],
+      playbooks: [],
+      required_secrets: [],
+    });
+    await importConfig({ document: doc, secretNames: [], db });
+    const [rule] = await listRules(db);
+    expect(rule.notify).toEqual([{ notifier_id: local.id }]);
+  });
+
+  it("rolls back the entire import when a rule notifies a dangling notifier", async () => {
+    const doc = sampleDoc({
+      notifiers: [],
+      rules: [
+        {
+          name: "dangling-notify",
+          enabled: true,
+          match: {},
+          dispatch: [],
+          notify: [{ notifier: "no-such-notifier" }],
+        },
+      ],
+      playbooks: [],
+    });
+    await expect(
+      importConfig({ document: doc, secretNames: [], db })
+    ).rejects.toThrow(/no-such-notifier/);
+    // Nothing committed; the sample module config must not have landed.
+    expect(await getModuleConfig("ado", db)).toBeUndefined();
+    expect(await listRules(db)).toHaveLength(0);
+    expect(await listNotifiers(db)).toHaveLength(0);
+  });
+
+  it("rejects a rule notify target with a null notifier at both dry-run and apply", async () => {
+    const doc = sampleDoc({
+      notifiers: [],
+      rules: [
+        {
+          name: "null-notify",
+          enabled: true,
+          match: {},
+          dispatch: [],
+          notify: [{ notifier: null }],
+        },
+      ],
+      playbooks: [],
+    });
+    await expect(
+      importConfig({ document: doc, dryRun: true, secretNames: [], db })
+    ).rejects.toBeInstanceOf(ImportError);
+    await expect(
+      importConfig({ document: doc, secretNames: [], db })
+    ).rejects.toBeInstanceOf(ImportError);
+    expect(await listRules(db)).toHaveLength(0);
+  });
+
+  it("accepts a v1 document, treating notifiers and rule.notify as empty", async () => {
+    // A schema_version=1 document (this build's previous shape) imports cleanly.
+    const plan = await importConfig({
+      document: sampleV1Doc(),
+      secretNames: [],
+      db,
+    });
+    expect(plan.applied).toBe(true);
+    expect(plan.notifiers).toEqual([]);
+    const rules = await listRules(db);
+    expect(rules).toHaveLength(1);
+    expect(rules[0].notify).toEqual([]);
+    // The playbook/rule/module still land as they always did.
+    expect(await listPlaybooks(db)).toHaveLength(1);
+    expect(await getModuleConfig("ado", db)).toBeDefined();
+  });
+
+  it("declares its current schema version and back-compat range through the exported constant", () => {
+    // A regression guard: the build's CURRENT version is 2 (notifiers + rule
+    // notify). Bump both this test and the CHANGELOG portability row when
+    // bumping the schema.
+    expect(EXPORT_SCHEMA_VERSION).toBe(2);
   });
 });

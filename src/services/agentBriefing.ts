@@ -424,17 +424,28 @@ rename therefore breaks every reference by design.
 ## Portability
 
 - \`GET /api/config/export\` (add \`?scrub=environment\` to strip machine-local
-  values): one JSON document: playbooks, rules (with their \`dispatch\` targets),
-  snippets, module config (always exported DISABLED), whitelisted settings
-  (never \`identity_me\`); secrets travel as NAMES only. Notifiers and rule
-  \`notify\` targets are NOT included, so recreate those by hand after an import.
-  409s when a stored secret VALUE is found pasted inside a template (fix the
-  template, then re-export).
+  values): one JSON document (\`schema_version\` 2): playbooks, rules (with
+  their \`dispatch\` AND \`notify\` targets), notifiers, snippets, module config
+  (always exported DISABLED), whitelisted settings (never \`identity_me\`);
+  secrets travel as NAMES only. Notifiers preserve their \`enabled\` bit (unlike
+  modules); they are reactive sinks that only fire when a matched rule
+  targets them. Rule \`notify\` targets are rewritten to reference notifiers by
+  NAME. 409s when a stored secret VALUE is found pasted inside a template OR
+  inside a notifier's free-form \`config\` blob; if a notifier config field must
+  carry a credential, reference it by secret NAME (like a playbook's
+  \`env_requirements\` or a module's \`pat_secret_ref\`) and never by pasted
+  value.
 - \`POST /api/config/import\` body \`{document, mode?, dry_run?}\` — \`mode\` is
   \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
-  \`dry_run: true\` computes the full plan with NO writes. Returns per-object
-  actions plus \`missing_secrets\` and a post-import checklist; the apply is one
-  transaction. ALWAYS dry-run first and show the user the plan.
+  \`dry_run: true\` computes the full plan with NO writes. Notifiers are matched
+  by NAME idempotently (an overwrite patches in place, preserving the local
+  id so existing rule \`notify\` targets keep resolving) and rule \`notify\`
+  targets rebind to the local notifier ids. Reads schema versions \`1\` and
+  \`2\`; a v1 document (which had no notifiers and no rule \`notify\`) imports
+  cleanly with those fields treated as empty. Returns per-object actions plus
+  \`missing_secrets\` and a post-import checklist; the apply is one transaction
+  (409 rolls back everything on a rule whose playbook OR notifier is
+  unresolvable). ALWAYS dry-run first and show the user the plan.
 
 ## Working style
 

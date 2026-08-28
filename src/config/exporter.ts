@@ -2,6 +2,7 @@ import type { Knex } from "knex";
 
 import { getDb } from "../db/db";
 import { listModuleConfigs } from "../db/moduleConfig";
+import { listNotifiers } from "../db/notifiers";
 import { listPlaybooks } from "../db/playbooks";
 import { listRules } from "../db/rules";
 import { getAllSettings } from "../db/settings";
@@ -11,6 +12,7 @@ import { envRequirementName } from "../executor/executor";
 import type {
   EnvRequirement,
   LeaseIsolation,
+  NotifierRecord,
   PlaybookRecord,
   SnippetKind,
   SnippetRecord,
@@ -21,24 +23,41 @@ import { KNOWN_SETTING_KEYS } from "../routers/settingsRouter";
 
 /**
  * config export — a single portable JSON document describing one orchestrator's
- * automation setup (playbooks, rules, snippets, module config, whitelisted
- * settings) so it can be reproduced on another instance.
+ * automation setup (playbooks, rules with their dispatch AND notify targets,
+ * notifiers, snippets, module config, whitelisted settings) so it can be
+ * reproduced on another instance.
  *
  * SECRET HYGIENE (load-bearing). This module NEVER imports or touches the secret
- * store: it reads only playbooks, rules, snippets, module_config, and
- * app_settings. The document references secrets by NAME only. As defense in depth, the caller
- * passes in the currently stored secret {name, value} pairs and {@link
- * exportConfig} scans the serialized document for any of those values, FAILING
- * loudly (a {@link SecretLeakError}) rather than masking — a template holding a
- * pasted secret value is a leak the user must fix, not something to paper over.
+ * store: it reads only playbooks, rules, notifiers, snippets, module_config, and
+ * app_settings. The document references secrets by NAME only. As defense in
+ * depth, the caller passes in the currently stored secret {name, value} pairs
+ * and {@link exportConfig} scans the serialized document for any of those
+ * values, FAILING loudly (a {@link SecretLeakError}) rather than masking: a
+ * template (or a notifier's `config`) holding a pasted secret value is a leak
+ * the user must fix, not something to paper over. Notifier secret-bearing
+ * fields therefore round-trip only when they reference a secret by NAME (like a
+ * playbook's `env_requirements` or a module's `pat_secret_ref`); a pasted VALUE
+ * fails export.
  *
- * Runtime state — events, dispatches, runs, findings, leases — is never
+ * Runtime state (events, dispatches, runs, findings, leases) is never
  * exported. Modules are always exported DISABLED so an imported config can never
- * poll or dispatch until a human re-enables it.
+ * poll or dispatch until a human re-enables it. Notifiers preserve their
+ * `enabled` bit: a notifier is a reactive outbound sink that fires only when a
+ * matched rule targets it, so it cannot poll or dispatch on its own; the sibling
+ * rule's `enabled` bit already gates whether notifications happen at all.
+ *
+ * Schema version history:
+ *  - 1: initial. Playbooks, rules (dispatch only), snippets, modules, settings.
+ *  - 2 (current): adds `notifiers[]` and per-rule `notify[]` targets referencing
+ *    notifiers by NAME. A v1 document imports cleanly (its notifiers/notify
+ *    default to empty); see the importer's back-compat handling.
  */
 
 /** The current export document schema version. Bump on any breaking shape change. */
-export const EXPORT_SCHEMA_VERSION = 1;
+export const EXPORT_SCHEMA_VERSION = 2;
+
+/** Schema versions this build's importer will read. Newest first. */
+export const SUPPORTED_IMPORT_SCHEMA_VERSIONS: readonly number[] = [2, 1];
 
 /** The document `kind` discriminator, so an importer can sanity-check input. */
 export const EXPORT_KIND = "orchestrator-config-export";
@@ -56,12 +75,46 @@ export interface ExportedDispatchTarget {
   bindings?: Record<string, unknown>;
 }
 
-/** A rule as exported: no numeric ids, dispatch keyed by playbook name. */
+/**
+ * A rule's notify target rewritten to reference its notifier by stable key
+ * (name). Null when the numeric notifier id no longer resolves, the same
+ * dangling shape a dispatch target uses.
+ */
+export interface ExportedNotifyTarget {
+  /** The target notifier's stable key (its name), or null when unresolvable. */
+  notifier: string | null;
+}
+
+/**
+ * A rule as exported: no numeric ids, dispatch keyed by playbook name and
+ * notify keyed by notifier name. `notify` is always present (empty array when
+ * the rule has none) so a diff of two exports is stable.
+ */
 export interface ExportedRule {
   name: string;
   enabled: boolean;
   match: unknown;
   dispatch: ExportedDispatchTarget[];
+  notify: ExportedNotifyTarget[];
+}
+
+/**
+ * A notifier as exported: identified by its `name`, with templates, `enabled`
+ * bit, and free-form `config` carried through. Numeric ids and timestamps are
+ * dropped.
+ *
+ * SECRET HYGIENE: `config` is an opaque, user-defined blob (the app never
+ * branches on its content). Any secret-bearing field a user places in it
+ * should reference the secret by NAME, exactly like a playbook's
+ * `env_requirements` or a module's `pat_secret_ref`; a pasted secret VALUE is
+ * caught by the exporter's leak scan and fails the export loudly.
+ */
+export interface ExportedNotifier {
+  name: string;
+  title_template: string;
+  body_template: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
 }
 
 /** A playbook as exported: its full definition keyed by name, no numeric ids. */
@@ -109,6 +162,7 @@ export interface ConfigExportDocument {
   modules: Record<string, unknown>;
   playbooks: ExportedPlaybook[];
   rules: ExportedRule[];
+  notifiers: ExportedNotifier[];
   snippets: ExportedSnippet[];
   required_secrets: RequiredSecret[];
 }
@@ -183,6 +237,25 @@ function exportSnippet(s: SnippetRecord): ExportedSnippet {
     name: s.name,
     description: s.description,
     content: s.content,
+  };
+}
+
+/**
+ * Build the exported form of one notifier: identified by name, with templates,
+ * `enabled` bit, and `config` blob carried through; numeric ids and timestamps
+ * are dropped. The exporter does NOT try to strip "secret-bearing" fields from
+ * `config`: it cannot know which keys are secrets (that would be a domain
+ * branch in the core). Users reference secrets by NAME in `config` for
+ * round-trip safety; a pasted secret VALUE is caught by the leak scan and fails
+ * the export loudly.
+ */
+function exportNotifier(n: NotifierRecord): ExportedNotifier {
+  return {
+    name: n.name,
+    title_template: n.title_template,
+    body_template: n.body_template,
+    enabled: n.enabled,
+    config: n.config,
   };
 }
 
@@ -263,10 +336,11 @@ export async function exportConfig(
   const db = options.db ?? getDb();
   const scrub = options.scrub === "environment";
 
-  const [playbooks, rules, snippets, moduleConfigs, allSettings] =
+  const [playbooks, rules, notifiers, snippets, moduleConfigs, allSettings] =
     await Promise.all([
       listPlaybooks(db),
       listRules(db),
+      listNotifiers(db),
       listSnippets(undefined, db),
       listModuleConfigs(db),
       getAllSettings(db),
@@ -277,7 +351,18 @@ export async function exportConfig(
   const keyById = new Map<number, string>();
   for (const p of playbooks) keyById.set(p.id, p.name);
 
+  // notifier id -> stable key (name), so rule notify targets can be rewritten
+  // to reference notifiers by key instead of the numeric id.
+  const notifierNameById = new Map<number, string>();
+  for (const n of notifiers) notifierNameById.set(n.id, n.name);
+
   const exportedPlaybooks = playbooks.map(exportPlaybook);
+
+  // Notifiers are listed newest-first for the UI; sort by name so exports of
+  // the same setup are diffable.
+  const exportedNotifiers = notifiers
+    .map(exportNotifier)
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   // Snippets are listed newest-first for the UI; sort by (kind, name) — their
   // stable identity — so exports of the same setup are diffable.
@@ -300,6 +385,9 @@ export async function exportConfig(
       if (target.bindings !== undefined) out.bindings = target.bindings;
       return out;
     }),
+    notify: rule.notify.map((target) => ({
+      notifier: notifierNameById.get(target.notifier_id) ?? null,
+    })),
   }));
 
   const modules: Record<string, unknown> = {};
@@ -350,6 +438,7 @@ export async function exportConfig(
     modules,
     playbooks: exportedPlaybooks,
     rules: exportedRules,
+    notifiers: exportedNotifiers,
     snippets: exportedSnippets,
     required_secrets,
   };
@@ -364,6 +453,9 @@ export async function exportConfig(
   }
   for (const rule of doc.rules) {
     scanForSecrets(`rule ${rule.name}`, rule, options.secrets);
+  }
+  for (const n of doc.notifiers) {
+    scanForSecrets(`notifier ${n.name}`, n, options.secrets);
   }
   for (const s of doc.snippets) {
     scanForSecrets(`snippet ${s.kind}:${s.name}`, s, options.secrets);
