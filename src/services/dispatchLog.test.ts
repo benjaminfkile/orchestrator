@@ -69,6 +69,42 @@ describe("dispatchLog", () => {
     expect(() => dl.close()).not.toThrow();
   });
 
+  it("writes an optional header line at open, adding a trailing newline when missing", () => {
+    const dl = openDispatchLog(11, {
+      baseDir,
+      header: "# dispatch 11 playbook 3 exec_timeout_ms=630000 release_timeout_ms=60000",
+    });
+    dl.append("first log line");
+    dl.close();
+
+    const contents = fs.readFileSync(dl.path, "utf8");
+    expect(contents).toBe(
+      "# dispatch 11 playbook 3 exec_timeout_ms=630000 release_timeout_ms=60000\nfirst log line\n"
+    );
+  });
+
+  it("does not write a header when none is supplied", () => {
+    const dl = openDispatchLog(12, { baseDir });
+    dl.append("only line");
+    dl.close();
+
+    expect(fs.readFileSync(dl.path, "utf8")).toBe("only line\n");
+  });
+
+  it("re-opening a dispatch log with a header appends a fresh header (marks a retry attempt)", () => {
+    const first = openDispatchLog(13, { baseDir, header: "# attempt 1" });
+    first.append("a");
+    first.close();
+
+    const second = openDispatchLog(13, { baseDir, header: "# attempt 2" });
+    second.append("b");
+    second.close();
+
+    expect(fs.readFileSync(first.path, "utf8")).toBe(
+      "# attempt 1\na\n# attempt 2\nb\n"
+    );
+  });
+
   describe("default base honors ORCH_DATA_DIR", () => {
     const original = process.env.ORCH_DATA_DIR;
 

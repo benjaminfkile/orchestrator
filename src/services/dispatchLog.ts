@@ -37,6 +37,15 @@ export interface OpenDispatchLogOptions {
    * tests point this at a temp directory.
    */
   baseDir?: string;
+  /**
+   * Optional header line written to the file the moment it is opened, so an
+   * operator reading the log sees the operational bounds (dispatch id,
+   * playbook id, resolved exec/release timeouts) that governed the run
+   * without cross-referencing the structured logger. A trailing newline is
+   * added when missing. On a retry re-open the file already exists and a
+   * fresh header is simply appended, marking the new attempt.
+   */
+  header?: string;
 }
 
 /**
@@ -53,6 +62,10 @@ export function openDispatchLog(
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
   const fd = fs.openSync(filePath, "a");
+  if (options.header !== undefined) {
+    const header = options.header;
+    fs.writeSync(fd, header.endsWith("\n") ? header : header + "\n");
+  }
   let closed = false;
 
   return {
