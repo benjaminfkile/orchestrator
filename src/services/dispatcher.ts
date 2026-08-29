@@ -38,8 +38,8 @@ import {
 import { getSetting } from "../db/settings";
 import {
   attemptLeaseRelease,
+  DEFAULT_RELEASE_TIMEOUT_MS,
   DEFAULT_SWEEP_BACKOFF_MS,
-  EXEC_TIMEOUT_CAP_MS,
   runDispatch,
   sweepPendingReleases,
   type EnvResolver,
@@ -102,6 +102,16 @@ export interface DispatcherDeps {
    */
   execTimeoutMs?: number;
   /**
+   * Explicit operator override for the per-call lease-release timeout in ms,
+   * forwarded to the executor and the release sweep. When UNSET they fall
+   * back to {@link DEFAULT_RELEASE_TIMEOUT_MS} (60 s). Boot threads the
+   * configured `WISPER_RELEASE_TIMEOUT_MS` here. Release is a quick
+   * control-plane call and MUST NOT reuse the multi-hour exec-timeout cap,
+   * so a hung socket cannot stall dispatcher shutdown or a sweep pass for
+   * hours.
+   */
+  releaseTimeoutMs?: number;
+  /**
    * Wall clock used by the run-budget gate and stamped as each run's
    * `started_at`, injectable for deterministic tests; defaults to `Date.now`.
    * Sharing one clock keeps the gate's trailing-window count consistent with the
@@ -152,6 +162,7 @@ export class Dispatcher {
   private readonly logBaseDir?: string;
   private readonly workingEnvironment?: string;
   private readonly execTimeoutMs?: number;
+  private readonly releaseTimeoutMs?: number;
   private readonly now: () => number;
 
   /** Safety-interval handle; undefined while stopped. */
@@ -184,6 +195,7 @@ export class Dispatcher {
     this.logBaseDir = deps.logBaseDir;
     this.workingEnvironment = deps.workingEnvironment;
     this.execTimeoutMs = deps.execTimeoutMs;
+    this.releaseTimeoutMs = deps.releaseTimeoutMs;
     this.now = deps.now ?? Date.now;
   }
 
@@ -247,7 +259,7 @@ export class Dispatcher {
         wisper: this.wisper,
         db: this.db,
         logger: this.logger,
-        execTimeoutMs: this.execTimeoutMs,
+        releaseTimeoutMs: this.releaseTimeoutMs,
         backoffMs: DEFAULT_SWEEP_BACKOFF_MS,
         now: this.now,
       });
@@ -386,6 +398,7 @@ export class Dispatcher {
       logBaseDir: this.logBaseDir,
       workingEnvironment: this.workingEnvironment,
       execTimeoutMs: this.execTimeoutMs,
+      releaseTimeoutMs: this.releaseTimeoutMs,
       now: this.now,
     });
 
@@ -443,7 +456,7 @@ export class Dispatcher {
       const releaseOutcome = await attemptLeaseRelease(
         this.wisper,
         outcome.lease_id,
-        this.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS
+        this.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS
       );
       if (releaseOutcome.ok) {
         // Record the successful late release on the row so the sweep never

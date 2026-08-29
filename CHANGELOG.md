@@ -43,15 +43,24 @@ owns the lease lifecycle, never the agent inside it.
   frame parsing.
 - Shared fetch wrapper with `AbortController` and per-operation timeouts.
 - Env-configurable client timeouts: `WISPER_CREATE_LEASE_TIMEOUT_MS` (default
-  150000) and `WISPER_EXEC_TIMEOUT_MS` (an explicit operator override; UNSET
-  by default). When `WISPER_EXEC_TIMEOUT_MS` is unset the executor derives
-  the per-call exec/release timeout (and the streaming inter-chunk idle
-  window) at dispatch time from the lease's REMAINING TTL plus a small
-  margin, capped at about 6 hours, so a step or agent command that runs the
-  length of a lease is not killed at a fixed 60 seconds. An explicit value
-  wins over the computed default. Unset or invalid values fall back to their
-  respective defaults, so behaviour is unchanged out of the box for normal
-  workloads.
+  150000), `WISPER_EXEC_TIMEOUT_MS` (an explicit operator override; UNSET by
+  default), and `WISPER_RELEASE_TIMEOUT_MS` (default 60000). When
+  `WISPER_EXEC_TIMEOUT_MS` is unset the executor derives the per-call exec
+  timeout (and the streaming inter-chunk idle window) at dispatch time from
+  the lease's REMAINING TTL plus a small margin, capped at about 6 hours, so
+  a step or agent command that runs the length of a lease is not killed at
+  a fixed 60 seconds. An explicit value wins over the computed default. The
+  lease-release path (executor finally block, boot's orphan reconcile, the
+  periodic release sweep, and the dispatcher's late release before a
+  retryable requeue) has its own separate short timeout
+  `WISPER_RELEASE_TIMEOUT_MS` so a hung release socket cannot stall boot or
+  a sweep pass for hours the way the exec-timeout cap would. Unset or
+  invalid values fall back to their respective defaults, so behaviour is
+  unchanged out of the box for normal workloads.
+- Dispatch logs now record the resolved per-call exec timeout on the
+  dispatch header line and on every pre/agent/collect step start line, so
+  an operator can see the ceiling that bounded each exec without
+  cross-referencing config.
 
 #### Executor
 

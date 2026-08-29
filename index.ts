@@ -55,7 +55,7 @@ async function main() {
   const wisper = config.isWisperConfigured() ? wisperClientFromConfig(config) : null;
   await reconcileOrphanedDispatches({
     wisper,
-    execTimeoutMs: config.wisperExecTimeoutMs,
+    releaseTimeoutMs: config.wisperReleaseTimeoutMs,
   });
 
   // Also sweep for any TERMINAL (done/failed) dispatch whose lease was never
@@ -71,7 +71,7 @@ async function main() {
     try {
       await sweepPendingReleases({
         wisper,
-        execTimeoutMs: config.wisperExecTimeoutMs,
+        releaseTimeoutMs: config.wisperReleaseTimeoutMs,
       });
     } catch (err) {
       log.error("boot-time release sweep failed", {
@@ -98,6 +98,7 @@ async function main() {
     wisper,
     resolveEnv: createSecretEnvResolver(),
     execTimeoutMs: config.wisperExecTimeoutMs,
+    releaseTimeoutMs: config.wisperReleaseTimeoutMs,
   });
   await dispatcher.start();
 
@@ -169,7 +170,7 @@ async function main() {
         if (wisper) {
           await sweepPendingReleases({
             wisper,
-            execTimeoutMs: config.wisperExecTimeoutMs,
+            releaseTimeoutMs: config.wisperReleaseTimeoutMs,
           });
         }
       } catch (sweepErr) {

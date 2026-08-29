@@ -22,6 +22,7 @@ import { WisperClient } from "../wisper/client";
 
 import {
   attemptLeaseRelease,
+  DEFAULT_RELEASE_TIMEOUT_MS,
   EXEC_TIMEOUT_CAP_MS,
   EXEC_TIMEOUT_FLOOR_MS,
   EXEC_TIMEOUT_MARGIN_MS,
@@ -1638,7 +1639,7 @@ describe("runDispatch pipeline", () => {
     expect(fake.releasedLeases).toEqual(["lease-1"]);
   });
 
-  it("threads execTimeoutMs to every exec/stream/release call", async () => {
+  it("threads execTimeoutMs to every exec/stream call and releaseTimeoutMs to release", async () => {
     fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
     fake.planSync(() => ({ exitCode: 0 }));
 
@@ -1658,18 +1659,57 @@ describe("runDispatch pipeline", () => {
       ...deps(),
       wisper: c,
       execTimeoutMs: 12345,
+      releaseTimeoutMs: 4321,
     });
     expect(result.status).toBe("done");
 
-    // The pre and collect steps, the streaming agent exec, and the release all
-    // carry the configured per-call timeout — never the client's create-lease
-    // default.
+    // The pre and collect steps and the streaming agent exec carry the
+    // configured exec timeout; the release carries its own separate
+    // releaseTimeoutMs (never inherits the multi-hour exec cap).
     for (const call of execSyncSpy.mock.calls) {
       expect(call[2]).toMatchObject({ timeoutMs: 12345 });
     }
     expect(execSyncSpy).toHaveBeenCalledTimes(2);
     expect(execStreamSpy.mock.calls[0][2]).toMatchObject({ timeoutMs: 12345 });
-    expect(releaseSpy.mock.calls[0][1]).toMatchObject({ timeoutMs: 12345 });
+    expect(releaseSpy.mock.calls[0][1]).toMatchObject({ timeoutMs: 4321 });
+  });
+
+  it("success-path logs carry execTimeoutMs on the dispatch header and every step start line", async () => {
+    fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
+    fake.planSync(() => ({ exitCode: 0 }));
+
+    const dispatchId = await seedDispatch({
+      steps: [
+        { phase: "pre", label: "clone", command_template: "git clone repo" },
+        { phase: "collect", label: "out", command_template: "cat result.txt" },
+      ],
+    });
+
+    const lines: string[] = [];
+    const logger = createLogger({ sink: (l) => lines.push(l), clock: () => 0 });
+
+    const result = await runDispatch(dispatchId, {
+      ...deps(),
+      logger,
+      execTimeoutMs: 12345,
+      releaseTimeoutMs: 4321,
+    });
+    expect(result.status).toBe("done");
+
+    const records = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const header = records.find((r) => r.msg === "dispatch started");
+    expect(header).toBeDefined();
+    expect(header?.configuredExecTimeoutMs).toBe(12345);
+    expect(header?.releaseTimeoutMs).toBe(4321);
+
+    // Every step start line carries the resolved per-call execTimeoutMs so an
+    // operator can see which ceiling bounded each exec without cross-referencing.
+    const preStep = records.find((r) => r.msg === "pre step");
+    const agentStep = records.find((r) => r.msg === "agent step");
+    const collectStep = records.find((r) => r.msg === "collect step");
+    expect(preStep?.execTimeoutMs).toBe(12345);
+    expect(agentStep?.execTimeoutMs).toBe(12345);
+    expect(collectStep?.execTimeoutMs).toBe(12345);
   });
 
   it("a step whose exec takes longer than the OLD 60s default succeeds under the new derived default (mocked wisper)", async () => {
@@ -1705,7 +1745,7 @@ describe("runDispatch pipeline", () => {
     expect(perCallTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
   });
 
-  it("defaults exec/stream/release to (remaining ttl + margin, capped) when execTimeoutMs is unset", async () => {
+  it("defaults exec/stream to (remaining ttl + margin, capped) when execTimeoutMs is unset, but release uses its own short default", async () => {
     fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
 
     // ttl_seconds: 600 → derived default = 600_000 + margin (30_000) = 630_000ms,
@@ -1726,8 +1766,9 @@ describe("runDispatch pipeline", () => {
     // strictly bounded by the cap. Small drift is expected (test clock moves).
     expect(streamTimeout).toBeGreaterThan(600_000);
     expect(streamTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
-    expect(releaseTimeout).toBeGreaterThan(600_000);
-    expect(releaseTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
+    // Release uses its own short DEFAULT_RELEASE_TIMEOUT_MS (60 s): it is
+    // a quick control-plane DELETE and MUST NOT reuse the multi-hour exec cap.
+    expect(releaseTimeout).toBe(DEFAULT_RELEASE_TIMEOUT_MS);
   });
 
   it("pre-step non-zero exit fails the dispatch and skips remaining steps + the agent", async () => {

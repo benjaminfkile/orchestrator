@@ -54,6 +54,15 @@ export interface Config {
    * `remaining_ttl + margin` (capped) default.
    */
   wisperExecTimeoutMs?: number;
+  /**
+   * Per-call timeout in ms for wisper lease-release requests. Release is a
+   * quick control-plane DELETE and MUST NOT share the exec timeout's
+   * multi-hour default: a hung socket would otherwise block boot's orphan
+   * reconcile (which runs sequentially before the dispatcher starts) or the
+   * whole release sweep for hours. Defaults to 60000 (60 s), overridable
+   * via WISPER_RELEASE_TIMEOUT_MS.
+   */
+  wisperReleaseTimeoutMs: number;
   /** True once a wisper host id is configured; false leaves leasing disabled. */
   isWisperConfigured(): boolean;
 }
@@ -64,6 +73,13 @@ export interface Config {
  * literal here to avoid a config↔client import cycle).
  */
 const DEFAULT_CREATE_LEASE_TIMEOUT_MS = 150_000;
+
+/**
+ * Default lease-release timeout in ms when WISPER_RELEASE_TIMEOUT_MS is unset.
+ * Mirrors DEFAULT_RELEASE_TIMEOUT_MS in executor/executor.ts (kept as a
+ * literal here to avoid a config -> executor import cycle).
+ */
+const DEFAULT_RELEASE_TIMEOUT_MS = 60_000;
 
 /** Thrown when an environment value is present but malformed. */
 export class ConfigError extends Error {
@@ -270,6 +286,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     DEFAULT_CREATE_LEASE_TIMEOUT_MS
   );
   const wisperExecTimeoutMs = parseOptionalTimeoutMs(env.WISPER_EXEC_TIMEOUT_MS);
+  const wisperReleaseTimeoutMs = parseTimeoutMs(
+    env.WISPER_RELEASE_TIMEOUT_MS,
+    DEFAULT_RELEASE_TIMEOUT_MS
+  );
 
   return {
     port,
@@ -279,6 +299,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     wisperHostId,
     wisperCreateLeaseTimeoutMs,
     wisperExecTimeoutMs,
+    wisperReleaseTimeoutMs,
     isWisperConfigured() {
       return this.wisperHostId !== undefined;
     },
