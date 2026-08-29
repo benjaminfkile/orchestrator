@@ -22,8 +22,12 @@ import { WisperClient } from "../wisper/client";
 
 import {
   attemptLeaseRelease,
+  EXEC_TIMEOUT_CAP_MS,
+  EXEC_TIMEOUT_FLOOR_MS,
+  EXEC_TIMEOUT_MARGIN_MS,
   parseEnvRequirements,
   reconcileOrphanedDispatches,
+  resolveExecTimeoutMs,
   runDispatch,
   sweepPendingReleases,
 } from "./executor";
@@ -1027,6 +1031,45 @@ describe("runDispatch pipeline", () => {
     expect(command).toMatch(/ '[\s\S]*'$/);
   });
 
+  describe("resolveExecTimeoutMs", () => {
+    it("returns the explicit override verbatim, even ABOVE the cap and below the floor", () => {
+      // Precedence rule: an operator-set value wins over the derived default.
+      expect(resolveExecTimeoutMs(1_234, 600, 0, 0)).toBe(1_234);
+      // ...and it is honored above the cap.
+      expect(resolveExecTimeoutMs(EXEC_TIMEOUT_CAP_MS + 1, 60, 0, 0)).toBe(
+        EXEC_TIMEOUT_CAP_MS + 1
+      );
+      // ...and below the floor.
+      expect(resolveExecTimeoutMs(1, 60, 0, 0)).toBe(1);
+    });
+
+    it("derives (remaining_ttl + margin) when there is no override", () => {
+      // Fresh lease (elapsed 0): remaining = ttl * 1000, plus margin.
+      expect(resolveExecTimeoutMs(undefined, 600, 0, 0)).toBe(
+        600_000 + EXEC_TIMEOUT_MARGIN_MS
+      );
+      // Half the TTL elapsed: remaining shrinks to ttl/2 * 1000, plus margin.
+      expect(resolveExecTimeoutMs(undefined, 600, 0, 300_000)).toBe(
+        300_000 + EXEC_TIMEOUT_MARGIN_MS
+      );
+    });
+
+    it("caps the derived default at EXEC_TIMEOUT_CAP_MS for very long TTLs", () => {
+      // A 24h TTL would derive to ~86_430_000 ms; the cap should hold at 6h.
+      const ttl = 24 * 60 * 60;
+      expect(resolveExecTimeoutMs(undefined, ttl, 0, 0)).toBe(
+        EXEC_TIMEOUT_CAP_MS
+      );
+    });
+
+    it("floors the derived default at EXEC_TIMEOUT_FLOOR_MS when the lease is exhausted", () => {
+      // Elapsed exceeds ttl → remaining would be negative; floor kicks in.
+      expect(resolveExecTimeoutMs(undefined, 60, 0, 120_000)).toBe(
+        EXEC_TIMEOUT_FLOOR_MS
+      );
+    });
+  });
+
   describe("script runner", () => {
     it("runs a script playbook end to end: rendered command, raw output, findings", async () => {
       // A script's output is arbitrary text, NOT stream-json — the raw captured
@@ -1629,10 +1672,46 @@ describe("runDispatch pipeline", () => {
     expect(releaseSpy.mock.calls[0][1]).toMatchObject({ timeoutMs: 12345 });
   });
 
-  it("defaults exec/stream/release to the 60s exec timeout when unset", async () => {
+  it("a step whose exec takes longer than the OLD 60s default succeeds under the new derived default (mocked wisper)", async () => {
+    // Regression guard for task 213: previously, a step whose exec took
+    // longer than the hard-coded 60_000ms client timeout failed with
+    // `upstream_timeout_client`. Under the new derived default (~630_000ms
+    // for a ttl_seconds=600 lease), the executor passes a per-call timeout
+    // that comfortably covers a step of ANY reasonable length under the
+    // lease TTL. The wisper client is mocked so no real time actually
+    // passes; the assertion is on the timeout the executor requested.
     fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
 
-    const dispatchId = await seedDispatch();
+    const dispatchId = await seedDispatch({
+      ttl_seconds: 600,
+      steps: [
+        // Command modelled on the live-found failing playbook: `sleep 60` was
+        // enough to trip the old fixed 60s timeout.
+        { phase: "pre", label: "long", command_template: "sleep 60" },
+      ],
+    });
+
+    const c = client();
+    const execSyncSpy = jest.spyOn(c, "execSync");
+    execSyncSpy.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+
+    const result = await runDispatch(dispatchId, { ...deps(), wisper: c });
+    expect(result.status).toBe("done");
+
+    const perCallTimeout = (
+      execSyncSpy.mock.calls[0][2] as { timeoutMs?: number }
+    )?.timeoutMs;
+    expect(perCallTimeout).toBeGreaterThan(60_000);
+    expect(perCallTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
+  });
+
+  it("defaults exec/stream/release to (remaining ttl + margin, capped) when execTimeoutMs is unset", async () => {
+    fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
+
+    // ttl_seconds: 600 → derived default = 600_000 + margin (30_000) = 630_000ms,
+    // which is well under the 6h cap. A freshly leased dispatch elapses
+    // effectively zero ms, so the resolver returns ~630_000 for every exec.
+    const dispatchId = await seedDispatch({ ttl_seconds: 600 });
 
     const c = client();
     const execStreamSpy = jest.spyOn(c, "execStream");
@@ -1641,8 +1720,14 @@ describe("runDispatch pipeline", () => {
     const result = await runDispatch(dispatchId, { ...deps(), wisper: c });
     expect(result.status).toBe("done");
 
-    expect(execStreamSpy.mock.calls[0][2]).toMatchObject({ timeoutMs: 60000 });
-    expect(releaseSpy.mock.calls[0][1]).toMatchObject({ timeoutMs: 60000 });
+    const streamTimeout = (execStreamSpy.mock.calls[0][2] as { timeoutMs?: number })?.timeoutMs;
+    const releaseTimeout = (releaseSpy.mock.calls[0][1] as { timeoutMs?: number })?.timeoutMs;
+    // The derived default is comfortably above the old 60s fixed value and
+    // strictly bounded by the cap. Small drift is expected (test clock moves).
+    expect(streamTimeout).toBeGreaterThan(600_000);
+    expect(streamTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
+    expect(releaseTimeout).toBeGreaterThan(600_000);
+    expect(releaseTimeout).toBeLessThanOrEqual(EXEC_TIMEOUT_CAP_MS);
   });
 
   it("pre-step non-zero exit fails the dispatch and skips remaining steps + the agent", async () => {
