@@ -1702,6 +1702,13 @@ describe("runDispatch pipeline", () => {
     expect(header?.configuredExecTimeoutMs).toBe(12345);
     expect(header?.releaseTimeoutMs).toBe(4321);
 
+    // The RESOLVED per-call exec timeout and its derivation are logged right
+    // after the lease is created. With WISPER_EXEC_TIMEOUT_MS set, that
+    // override wins verbatim over the ttl-derived default.
+    const resolved = records.find((r) => r.msg === "exec timeout resolved");
+    expect(resolved?.execTimeoutMs).toBe(12345);
+    expect(resolved?.derivation).toBe("override");
+
     // Every step start line carries the resolved per-call execTimeoutMs so an
     // operator can see which ceiling bounded each exec without cross-referencing.
     const preStep = records.find((r) => r.msg === "pre step");
@@ -1710,6 +1717,77 @@ describe("runDispatch pipeline", () => {
     expect(preStep?.execTimeoutMs).toBe(12345);
     expect(agentStep?.execTimeoutMs).toBe(12345);
     expect(collectStep?.execTimeoutMs).toBe(12345);
+
+    // The released log line also carries the release timeout so an operator
+    // can distinguish it from the exec cap at a glance.
+    const released = records.find((r) => r.msg === "lease released");
+    expect(released?.releaseTimeoutMs).toBe(4321);
+  });
+
+  it("with the exec timeout env unset, logs the resolved value + ttl-derived derivation after 'lease created'", async () => {
+    fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
+
+    // ttl_seconds=600 → derived per-call = 600_000 + 30_000 (margin) = 630_000,
+    // which is well under the 6h cap so the derivation is `ttl-derived`.
+    const dispatchId = await seedDispatch({ ttl_seconds: 600 });
+
+    const lines: string[] = [];
+    const logger = createLogger({ sink: (l) => lines.push(l), clock: () => 0 });
+
+    const result = await runDispatch(dispatchId, { ...deps(), logger });
+    expect(result.status).toBe("done");
+
+    const records = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const header = records.find((r) => r.msg === "dispatch started");
+    // With no override the header's raw configuredExecTimeoutMs is unset, so
+    // the resolved-timeout log line is the one operators read.
+    expect(header?.configuredExecTimeoutMs).toBeUndefined();
+    const resolved = records.find((r) => r.msg === "exec timeout resolved");
+    expect(resolved?.execTimeoutMs).toBe(630_000);
+    expect(resolved?.derivation).toBe("ttl-derived");
+  });
+
+  it("with the exec timeout env unset and a very long ttl, the resolved log line's derivation is 'cap'", async () => {
+    fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
+
+    // Ten hours is well past the six-hour cap, so the derived default is
+    // clamped down and the derivation reports `cap`.
+    const dispatchId = await seedDispatch({ ttl_seconds: 10 * 60 * 60 });
+
+    const lines: string[] = [];
+    const logger = createLogger({ sink: (l) => lines.push(l), clock: () => 0 });
+
+    const result = await runDispatch(dispatchId, { ...deps(), logger });
+    expect(result.status).toBe("done");
+
+    const resolved = lines
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r.msg === "exec timeout resolved");
+    expect(resolved?.execTimeoutMs).toBe(EXEC_TIMEOUT_CAP_MS);
+    expect(resolved?.derivation).toBe("cap");
+  });
+
+  it("writes a header line to the per-dispatch log file naming the resolved exec/release timeouts", async () => {
+    fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
+
+    // Two shapes at once: env unset uses the ttl-derived default; the file
+    // header should carry that same resolved value alongside the release
+    // timeout an operator threaded through.
+    const dispatchId = await seedDispatch({ ttl_seconds: 600 });
+
+    const result = await runDispatch(dispatchId, {
+      ...deps(),
+      releaseTimeoutMs: 4321,
+    });
+    expect(result.status).toBe("done");
+
+    const runs = await listRuns(dispatchId, db);
+    const logText = fs.readFileSync(runs[0].log_path as string, "utf8");
+    const [firstLine] = logText.split("\n", 1);
+    expect(firstLine).toBe(
+      `# dispatch ${dispatchId} playbook ${result.playbook_id} ` +
+        `exec_timeout_ms=630000 release_timeout_ms=4321`
+    );
   });
 
   it("a step whose exec takes longer than the OLD 60s default succeeds under the new derived default (mocked wisper)", async () => {

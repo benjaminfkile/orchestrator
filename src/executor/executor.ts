@@ -58,7 +58,7 @@ import type {
 import { log, type Logger } from "../log";
 import type { ModuleRegistry } from "../modules/registry";
 import { getRuntime } from "../runtime";
-import { openDispatchLog } from "../services/dispatchLog";
+import { openDispatchLog, type DispatchLog } from "../services/dispatchLog";
 import { WisperApiError, type WisperClient } from "../wisper/client";
 
 import { getSnippetByName } from "../db/snippets";
@@ -537,6 +537,30 @@ export function resolveExecTimeoutMs(
 }
 
 /**
+ * Classify how the per-call exec/release timeout in
+ * {@link resolveExecTimeoutMs} was arrived at, so a log line can spell the
+ * derivation out for an operator:
+ *   - `override`: an explicit {@link RunDispatchDeps.execTimeoutMs} was set
+ *     (WISPER_EXEC_TIMEOUT_MS), and that value wins verbatim.
+ *   - `cap`: the remaining-TTL derivation exceeded
+ *     {@link EXEC_TIMEOUT_CAP_MS} and was clamped down to it.
+ *   - `ttl-derived`: `remaining_ttl + margin` fell inside the cap and was
+ *     used as-is (this is the common case).
+ */
+export function classifyExecTimeoutDerivation(
+  configured: number | undefined,
+  ttlSeconds: number,
+  leaseStartedAtMs: number,
+  nowMs: number
+): "override" | "ttl-derived" | "cap" {
+  if (configured !== undefined) return "override";
+  const remainingMs = ttlSeconds * 1000 - Math.max(0, nowMs - leaseStartedAtMs);
+  const derived = remainingMs + EXEC_TIMEOUT_MARGIN_MS;
+  if (derived > EXEC_TIMEOUT_CAP_MS) return "cap";
+  return "ttl-derived";
+}
+
+/**
  * Default per-call timeout (ms) for wisper lease-release requests. Release
  * is a quick control-plane call that must not block boot's orphan reconcile
  * or a whole sweep pass while a hung socket sits open. Kept short so a stuck
@@ -619,14 +643,14 @@ export const RELEASE_RETRY_BACKOFFS_MS: readonly number[] = [200, 500];
 export async function attemptLeaseRelease(
   wisper: WisperClient,
   leaseId: string,
-  execTimeoutMs: number,
+  timeoutMs: number,
   backoffsMs: readonly number[] = RELEASE_RETRY_BACKOFFS_MS
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const totalAttempts = backoffsMs.length + 1;
   let lastError = "";
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
     try {
-      await wisper.releaseLease(leaseId, { timeoutMs: execTimeoutMs });
+      await wisper.releaseLease(leaseId, { timeoutMs });
       return { ok: true };
     } catch (err) {
       // A `not_found` reply means wisper has no record of this lease anymore
@@ -741,7 +765,12 @@ export async function runDispatch(
     return value;
   };
 
-  const dispatchLog = openDispatchLog(dispatchId, { baseDir: deps.logBaseDir });
+  // The per-dispatch append-only trace log. Opened INSIDE the try below once
+  // the playbook is known so the file's first line can carry a header with the
+  // resolved exec/release timeouts and the playbook id, the operational bounds
+  // an operator wants when reading the log via GET /api/dispatches/:id/log.
+  // Left null on the pre-open path; the finally block closes it only if opened.
+  let dispatchLog: DispatchLog | null = null;
 
   // Internal controller whose signal drives every wisper call. It is aborted by
   // the per-dispatch timeout timer or, when present, by the caller's signal. The
@@ -794,6 +823,28 @@ export async function runDispatch(
     if (!playbook) {
       throw new Error(`playbook ${dispatch.playbook_id} not found`);
     }
+
+    // Open the per-dispatch trace log with a one-line header naming the
+    // dispatch, its playbook, and the resolved exec/release timeouts. The
+    // resolved exec timeout is computed against the playbook's TTL with a
+    // fresh clock (no lease yet, so remaining_ttl equals the full TTL), which
+    // matches the value the first exec will use once the lease is created.
+    // The precise per-exec resolution (which shrinks as the lease ages) is
+    // still logged on every step start line below.
+    const headerResolvedExecTimeoutMs = resolveExecTimeoutMs(
+      configuredExecTimeoutMs,
+      playbook.ttl_seconds,
+      now(),
+      now()
+    );
+    const openedLog = openDispatchLog(dispatchId, {
+      baseDir: deps.logBaseDir,
+      header:
+        `# dispatch ${dispatchId} playbook ${playbook.id} ` +
+        `exec_timeout_ms=${headerResolvedExecTimeoutMs} ` +
+        `release_timeout_ms=${releaseTimeoutMs}`,
+    });
+    dispatchLog = openedLog;
 
     // Resolve the playbook's runner from the registry BEFORE any lease is
     // created. An unknown runner id is a misconfiguration that must fail the
@@ -1016,6 +1067,32 @@ export async function runDispatch(
       db
     );
     logger.info("lease created", { leaseId: lease.leaseId });
+    // Emit the RESOLVED per-call exec timeout right after the lease exists;
+    // it is the same number the first exec below will use. `derivation` names
+    // WHY that number was chosen (override | ttl-derived | cap) so an operator
+    // reading the log can tell at a glance whether WISPER_EXEC_TIMEOUT_MS was
+    // honored, whether the lease's remaining TTL drove it, or whether the
+    // multi-hour cap clamped a very long TTL. Every step start line below
+    // still carries its own resolved value, which may shrink as the lease ages.
+    // Value AND derivation are computed against the lease-start clock
+    // (`nowMs === leaseStartedAtMs`) so `remaining_ttl` is exactly the full
+    // TTL and the two never disagree due to sub-millisecond drift between
+    // two now() calls; the per-step start lines below re-resolve against
+    // the current clock, which is where any shrinkage shows up.
+    logger.info("exec timeout resolved", {
+      execTimeoutMs: resolveExecTimeoutMs(
+        configuredExecTimeoutMs,
+        leaseTtlSeconds,
+        leaseStartedAtMs,
+        leaseStartedAtMs
+      ),
+      derivation: classifyExecTimeoutDerivation(
+        configuredExecTimeoutMs,
+        leaseTtlSeconds,
+        leaseStartedAtMs,
+        leaseStartedAtMs
+      ),
+    });
 
     // Now the lease's OS is known: a windows lease with an over-limit prompt is
     // failed with a clear error before any exec runs (the finally block still
@@ -1039,7 +1116,7 @@ export async function runDispatch(
         env,
       });
       const masked = maskSecrets(command, env);
-      dispatchLog.append(`$ pre[${step.label}]: ${masked}`);
+      openedLog.append(`$ pre[${step.label}]: ${masked}`);
       const preStepTimeoutMs = perCallTimeout();
       logger.info("pre step", {
         label: step.label,
@@ -1053,10 +1130,10 @@ export async function runDispatch(
       // Persist the step's (masked) output so a failure is diagnosable from the
       // dispatch log rather than reduced to a bare exit code.
       if (stepResult.stdout.trim()) {
-        dispatchLog.append(maskSecrets(stepResult.stdout, env));
+        openedLog.append(maskSecrets(stepResult.stdout, env));
       }
       if (stepResult.stderr.trim()) {
-        dispatchLog.append(maskSecrets(stepResult.stderr, env));
+        openedLog.append(maskSecrets(stepResult.stderr, env));
       }
       if (stepResult.exitCode !== 0) {
         const stderrTail = maskSecrets(stepResult.stderr, env)
@@ -1089,7 +1166,7 @@ export async function runDispatch(
     // must pass through maskSecrets before touching any log, exactly like the
     // pre/collect step commands above.
     const maskedCommand = maskSecrets(command, env);
-    dispatchLog.append(`$ agent: ${maskedCommand}`);
+    openedLog.append(`$ agent: ${maskedCommand}`);
     const agentTimeoutMs = perCallTimeout();
     logger.info("agent step", {
       command: maskedCommand,
@@ -1113,7 +1190,7 @@ export async function runDispatch(
         // result_text below masks the fully-assembled text and is the real
         // guarantee. We deliberately avoid cross-chunk buffering so streaming
         // stays live.
-        dispatchLog.append(maskSecrets(chunk.data, env));
+        openedLog.append(maskSecrets(chunk.data, env));
       },
     });
     logger.info("agent exec complete", { exitCode: result.exitCode });
@@ -1153,7 +1230,7 @@ export async function runDispatch(
         env,
       });
       const masked = maskSecrets(command, env);
-      dispatchLog.append(`$ collect[${step.label}]: ${masked}`);
+      openedLog.append(`$ collect[${step.label}]: ${masked}`);
       const collectStepTimeoutMs = perCallTimeout();
       logger.info("collect step", {
         label: step.label,
@@ -1180,7 +1257,7 @@ export async function runDispatch(
         result_text: maskedResultText,
         usage: parsed.usage,
         collected: Object.keys(collected).length > 0 ? collected : null,
-        log_path: dispatchLog.path,
+        log_path: openedLog.path,
         started_at: runStartedAt,
         ended_at: Date.now(),
       },
@@ -1219,7 +1296,7 @@ export async function runDispatch(
     // outlives the run (and no timer keeps the process alive).
     if (timeoutTimer) clearTimeout(timeoutTimer);
     detachExternalSignal();
-    dispatchLog.close();
+    dispatchLog?.close();
     // HARD RULE: whenever a lease was created it is released on EVERY path.
     // In-line: try the DELETE, retry a couple of times on retryable errors
     // (host_offline/upstream_timeout/client-side timeout), then either mark
@@ -1245,7 +1322,7 @@ export async function runDispatch(
           { released_at: Date.now(), release_pending: false },
           db
         );
-        logger.info("lease released", { leaseId });
+        logger.info("lease released", { leaseId, releaseTimeoutMs });
       } else {
         await updateDispatch(dispatchId, { release_pending: true }, db);
         logger.error("lease release failed; marked release_pending", {
