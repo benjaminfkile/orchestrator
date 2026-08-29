@@ -270,7 +270,8 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `POST /api/events` | Mint a synthetic event through the normal intake so a dispatch can be created on a fresh stack that has no integration modules configured. Body: `{ source? (default "manual"), type (required, e.g. "test.manual"), subject_ref (required), subject_kind? (default "manual"), payload? (JSON object) }`. A deterministic `dedupe_key` of `manual:<source>:<type>:<subject_ref>` is applied so the normal `event_dedupe_cooldown_seconds` cooldown collapses repeats: a first mint returns `201` with the created event; a mint that lands inside the cooldown returns `200` with the existing event. Rules match the minted event exactly as if a producer had emitted it. |
 | `GET /api/events/facets` | Distinct `source` + `type` values (DB distincts merged with the registered modules' advertised event types), for the Events filters and Rule source/type pickers. |
 | `GET /api/rules` · `GET /api/rules/:id` | List / read rules. |
-| `POST /api/rules` · `PATCH /api/rules/:id` · `DELETE /api/rules/:id` | Create / update / delete a rule. |
+| `POST /api/rules` · `PATCH /api/rules/:id` | Create / update a rule. |
+| `DELETE /api/rules/:id` | Delete a rule (204). 409 `{error: "rule has N in-flight dispatches"}` while any dispatch created by this rule is queued/leasing/running/collecting. On success the terminal dispatches that referenced the rule have their `rule_id` set to null so the run history stays readable. |
 | `POST /api/rules/:id/enable` · `POST /api/rules/:id/disable` | Toggle a rule. |
 | `GET /api/playbooks` · `GET /api/playbooks/:id` | List / read playbooks. |
 | `POST /api/playbooks` · `PATCH /api/playbooks/:id` | Create / update a playbook (unknown body keys and a duplicate `name` are rejected: 400 / 409). |
