@@ -59,11 +59,7 @@ import { log, type Logger } from "../log";
 import type { ModuleRegistry } from "../modules/registry";
 import { getRuntime } from "../runtime";
 import { openDispatchLog } from "../services/dispatchLog";
-import {
-  DEFAULT_EXEC_TIMEOUT_MS,
-  WisperApiError,
-  type WisperClient,
-} from "../wisper/client";
+import { WisperApiError, type WisperClient } from "../wisper/client";
 
 import { getSnippetByName } from "../db/snippets";
 import type { SnippetKind } from "../interfaces";
@@ -107,11 +103,14 @@ export interface RunDispatchDeps {
   /** Logger; defaults to the shared process logger. */
   logger?: Logger;
   /**
-   * Per-call timeout in ms for exec and release operations, and the inter-chunk
-   * idle window for the streaming agent exec (NOT a wall-clock cap on total run
-   * time). Defaults to {@link DEFAULT_EXEC_TIMEOUT_MS}; the dispatcher threads
-   * the configured `WISPER_EXEC_TIMEOUT_MS`. The create-lease timeout is carried
-   * by the {@link WisperClient} itself (its construction-time timeout), not here.
+   * Explicit operator override for the per-call exec/release timeout in ms
+   * (and the inter-chunk idle window for the streaming agent exec; NOT a
+   * wall-clock cap on total run time). The dispatcher threads
+   * `WISPER_EXEC_TIMEOUT_MS` here. When UNSET the executor computes a per-call
+   * default from the lease's REMAINING TTL plus
+   * {@link EXEC_TIMEOUT_MARGIN_MS}, capped at {@link EXEC_TIMEOUT_CAP_MS};
+   * see {@link resolveExecTimeoutMs}. The create-lease timeout is carried by
+   * the {@link WisperClient} itself (its construction-time timeout), not here.
    */
   execTimeoutMs?: number;
   /**
@@ -470,6 +469,64 @@ export async function resolvePromptSnippets(
  */
 export const DEADLINE_TTL_MARGIN_SECONDS = 60;
 
+/**
+ * Absolute ceiling (ms) on the per-call exec/release timeout derived from a
+ * lease's remaining TTL. Wisper permits very long-lived leases (the local
+ * launcher sets `Tunnel:RelayRequestTimeoutMs` to 50 minutes and above), so a
+ * naive `remaining_ttl + margin` could grow into a runaway HTTP timeout on a
+ * lease with a many-hour TTL. Bounding the derived default here keeps that
+ * safe. An explicit WISPER_EXEC_TIMEOUT_MS override wins ABOVE this cap: the
+ * operator has stated the value they want, so it is honored verbatim.
+ */
+export const EXEC_TIMEOUT_CAP_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Small buffer added to the lease's remaining TTL when deriving the default
+ * exec timeout, so an exec near the tail of a lease still has a moment to
+ * hear the server's own termination before the client's own timer fires. Kept
+ * short: it is NOT meant to run past the lease TTL, only to avoid racing it
+ * on the exact millisecond.
+ */
+export const EXEC_TIMEOUT_MARGIN_MS = 30_000;
+
+/**
+ * Floor (ms) for the derived default so an exec near the very tail of a lease
+ * still has room to at least attempt the release. If the caller ends up
+ * calling an exec on an already-expired lease, wisper returns quickly anyway;
+ * this just keeps the timer from being tiny or negative.
+ */
+export const EXEC_TIMEOUT_FLOOR_MS = 5_000;
+
+/**
+ * Resolve the per-call exec/release timeout in ms.
+ *
+ * Precedence (most specific wins):
+ *   1. An explicit operator override (`configured`): this is
+ *      WISPER_EXEC_TIMEOUT_MS threaded from config; when set, it is used
+ *      verbatim regardless of the lease's remaining TTL or the cap.
+ *   2. The computed default: `remaining_ttl_ms + {@link EXEC_TIMEOUT_MARGIN_MS}`,
+ *      floored at {@link EXEC_TIMEOUT_FLOOR_MS} and capped at
+ *      {@link EXEC_TIMEOUT_CAP_MS}. `remaining_ttl_ms` is
+ *      `ttlSeconds * 1000 - (nowMs - leaseStartedAtMs)`, so it shrinks as the
+ *      lease ages: a step that starts near the end of the lease gets a
+ *      shorter timeout than one that starts immediately after leasing.
+ *
+ * A `null` `leaseStartedAtMs` (no lease pinned yet; the release-sweep path)
+ * falls back to the cap when `configured` is unset, since there is no
+ * remaining TTL to compute against.
+ */
+export function resolveExecTimeoutMs(
+  configured: number | undefined,
+  ttlSeconds: number,
+  leaseStartedAtMs: number,
+  nowMs: number
+): number {
+  if (configured !== undefined) return configured;
+  const remainingMs = ttlSeconds * 1000 - Math.max(0, nowMs - leaseStartedAtMs);
+  const derived = remainingMs + EXEC_TIMEOUT_MARGIN_MS;
+  return Math.min(EXEC_TIMEOUT_CAP_MS, Math.max(EXEC_TIMEOUT_FLOOR_MS, derived));
+}
+
 /** The `app_settings` key for the optional per-dispatch timeout override. */
 export const DISPATCH_TIMEOUT_SETTING = "dispatch_timeout_seconds";
 
@@ -601,7 +658,7 @@ export async function runDispatch(
 ): Promise<RunDispatchResult> {
   const db = deps.db ?? getDb();
   const now = deps.now ?? Date.now;
-  const execTimeoutMs = deps.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const configuredExecTimeoutMs = deps.execTimeoutMs;
   const logger = (deps.logger ?? log).child({ dispatchId });
 
   const dispatch = await getDispatch(dispatchId, db);
@@ -622,6 +679,34 @@ export async function runDispatch(
   let output = "";
   // Set once a lease is actually created; gates the finally-block release.
   let leaseId: string | null = null;
+  // Wall-clock timestamp at which the createLease succeeded. Used by
+  // {@link resolveExecTimeoutMs} to derive the per-call default timeout as
+  // `remaining_ttl + margin`. Stays 0 until a lease is created; the release
+  // path guards on `leaseId` so the value is never consulted before it is set.
+  let leaseStartedAtMs = 0;
+  // The TTL (seconds) requested when leasing, captured for the same reason.
+  let leaseTtlSeconds = 0;
+  // The per-call exec/release timeout used most recently, exposed to log lines
+  // (in particular the `timeout` failure message asked for by task 213).
+  let lastExecTimeoutMs: number | undefined = configuredExecTimeoutMs;
+
+  const perCallTimeout = (): number => {
+    // Before a lease exists (this call only runs after createLease succeeds in
+    // practice) the derived default has no `remaining_ttl` to lean on, so it
+    // falls back to the cap. In that pre-lease window the executor issues no
+    // execs today; the guard here just keeps the helper safe to call.
+    const value =
+      leaseStartedAtMs === 0 && configuredExecTimeoutMs === undefined
+        ? EXEC_TIMEOUT_CAP_MS
+        : resolveExecTimeoutMs(
+            configuredExecTimeoutMs,
+            leaseTtlSeconds,
+            leaseStartedAtMs,
+            now()
+          );
+    lastExecTimeoutMs = value;
+    return value;
+  };
 
   const dispatchLog = openDispatchLog(dispatchId, { baseDir: deps.logBaseDir });
 
@@ -657,7 +742,17 @@ export async function runDispatch(
       }
       retryable = err instanceof WisperApiError && err.retryable;
     }
-    logger.error("dispatch failed", { error: message, retryable });
+    // A wisper client-side timeout on an exec surfaces the ms value in its own
+    // message, but the request could time out for reasons OTHER than the exec
+    // (per-dispatch deadline, transport drop). Log the resolved per-call
+    // execTimeoutMs alongside the error either way so an operator can tell
+    // whether to raise WISPER_EXEC_TIMEOUT_MS. Task 213: retry semantics are
+    // unchanged; only the log line carries the new detail.
+    logger.error("dispatch failed", {
+      error: message,
+      retryable,
+      execTimeoutMs: lastExecTimeoutMs,
+    });
     await updateDispatch(dispatchId, { status: "failed", error: message }, db);
   };
 
@@ -849,6 +944,12 @@ export async function runDispatch(
       leaseEnv[runner.promptEnvVar] = prompt;
     }
 
+    // Capture the (server-requested) TTL now so the exec-timeout resolver has
+    // a `remaining_ttl` to derive the per-call default from once the lease
+    // exists. Set BEFORE createLease so we do not race with any exec on an
+    // already-known TTL.
+    leaseTtlSeconds = playbook.ttl_seconds;
+
     const lease = await deps.wisper.createLease({
       image,
       // The playbook's optional host selector, threaded verbatim. `null` (the
@@ -870,6 +971,12 @@ export async function runDispatch(
       signal: controller.signal,
     });
     leaseId = lease.leaseId;
+    // Stamp the lease-start clock right after the server acknowledges the
+    // lease. From here on every per-call exec timeout is computed against
+    // this moment via {@link resolveExecTimeoutMs}, so a step that starts near
+    // the tail of a long-lived lease gets a shorter budget than one that
+    // starts immediately after.
+    leaseStartedAtMs = now();
     await updateDispatch(
       dispatchId,
       { lease_id: lease.leaseId, wisp_contract_id: lease.wispContractId },
@@ -902,7 +1009,7 @@ export async function runDispatch(
       dispatchLog.append(`$ pre[${step.label}]: ${masked}`);
       logger.info("pre step", { label: step.label, command: masked });
       const stepResult = await deps.wisper.execSync(lease.leaseId, command, {
-        timeoutMs: execTimeoutMs,
+        timeoutMs: perCallTimeout(),
         signal: controller.signal,
       });
       // Persist the step's (masked) output so a failure is diagnosable from the
@@ -950,8 +1057,11 @@ export async function runDispatch(
     const runStartedAt = now();
     const result = await deps.wisper.execStream(lease.leaseId, command, {
       // Inter-chunk idle timeout for the stream (not a wall-clock cap): the
-      // per-dispatch deadline armed above bounds total run time.
-      timeoutMs: execTimeoutMs,
+      // per-dispatch deadline armed above bounds total run time. Derived
+      // per-call from the lease's remaining TTL so a long-running agent that
+      // pauses between chunks is not killed by a fixed 60s idle window; see
+      // resolveExecTimeoutMs.
+      timeoutMs: perCallTimeout(),
       signal: controller.signal,
       onChunk: (chunk) => {
         output += chunk.data;
@@ -1004,7 +1114,7 @@ export async function runDispatch(
       dispatchLog.append(`$ collect[${step.label}]: ${masked}`);
       logger.info("collect step", { label: step.label, command: masked });
       const stepResult = await deps.wisper.execSync(lease.leaseId, command, {
-        timeoutMs: execTimeoutMs,
+        timeoutMs: perCallTimeout(),
         signal: controller.signal,
       });
       collected[step.label] = stepResult.stdout;
@@ -1078,7 +1188,7 @@ export async function runDispatch(
       const outcome = await attemptLeaseRelease(
         deps.wisper,
         leaseId,
-        execTimeoutMs
+        perCallTimeout()
       );
       if (outcome.ok) {
         await updateDispatch(
@@ -1130,9 +1240,11 @@ export interface ReconcileDeps {
   /** Logger; defaults to the shared process logger. */
   logger?: Logger;
   /**
-   * Per-call timeout in ms for the orphaned-lease releases. Defaults to
-   * {@link DEFAULT_EXEC_TIMEOUT_MS}; boot threads the configured
-   * `WISPER_EXEC_TIMEOUT_MS` so release matches the running pipeline.
+   * Per-call timeout in ms for the orphaned-lease releases. When unset falls
+   * back to {@link EXEC_TIMEOUT_CAP_MS}: reconciliation has no live lease
+   * context (the process just booted), so the remaining-TTL derivation used
+   * by {@link runDispatch} does not apply; the cap is used as a safe ceiling
+   * and boot's configured `WISPER_EXEC_TIMEOUT_MS` overrides it verbatim.
    */
   execTimeoutMs?: number;
 }
@@ -1158,7 +1270,7 @@ export async function reconcileOrphanedDispatches(
 ): Promise<number> {
   const db = deps.db ?? getDb();
   const logger = deps.logger ?? log;
-  const execTimeoutMs = deps.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const execTimeoutMs = deps.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS;
 
   const orphans: DispatchRecord[] = [];
   for (const status of ORPHANED_ON_RESTART) {
@@ -1234,7 +1346,8 @@ export interface SweepDeps {
   logger?: Logger;
   /**
    * Per-call timeout in ms for the release attempts. Defaults to
-   * {@link DEFAULT_EXEC_TIMEOUT_MS}.
+   * {@link EXEC_TIMEOUT_CAP_MS} when unset; boot threads the configured
+   * `WISPER_EXEC_TIMEOUT_MS` so a release matches the running pipeline.
    */
   execTimeoutMs?: number;
   /**
@@ -1281,7 +1394,7 @@ export async function sweepPendingReleases(
 ): Promise<number> {
   const db = deps.db ?? getDb();
   const logger = deps.logger ?? log;
-  const execTimeoutMs = deps.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const execTimeoutMs = deps.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS;
   const now = deps.now ?? Date.now;
   const backoffMs = deps.backoffMs ?? DEFAULT_SWEEP_BACKOFF_MS;
 

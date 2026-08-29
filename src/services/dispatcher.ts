@@ -39,13 +39,14 @@ import { getSetting } from "../db/settings";
 import {
   attemptLeaseRelease,
   DEFAULT_SWEEP_BACKOFF_MS,
+  EXEC_TIMEOUT_CAP_MS,
   runDispatch,
   sweepPendingReleases,
   type EnvResolver,
 } from "../executor/executor";
 import type { DispatchRecord } from "../interfaces";
 import { log, type Logger } from "../log";
-import { DEFAULT_EXEC_TIMEOUT_MS, type WisperClient } from "../wisper/client";
+import type { WisperClient } from "../wisper/client";
 
 import { evaluateRunBudget } from "./runBudget";
 import { emitRunEvent, emitRunStartedEvent } from "./runEvents";
@@ -92,9 +93,12 @@ export interface DispatcherDeps {
   /** Body of the prompt's "## Working environment" section; forwarded on. */
   workingEnvironment?: string;
   /**
-   * Per-call exec/release timeout in ms (and the streaming idle window),
-   * forwarded to the executor. Defaults there to {@link DEFAULT_EXEC_TIMEOUT_MS}
-   * when unset; boot threads the configured `WISPER_EXEC_TIMEOUT_MS`.
+   * Explicit operator override for the per-call exec/release timeout in ms
+   * (and the inter-chunk idle window for the streaming agent exec), forwarded
+   * to the executor. When UNSET the executor derives the per-call default
+   * from the lease's remaining TTL; see
+   * {@link import("../executor/executor").resolveExecTimeoutMs}. Boot threads
+   * the configured `WISPER_EXEC_TIMEOUT_MS` here.
    */
   execTimeoutMs?: number;
   /**
@@ -439,7 +443,7 @@ export class Dispatcher {
       const releaseOutcome = await attemptLeaseRelease(
         this.wisper,
         outcome.lease_id,
-        this.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS
+        this.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS
       );
       if (releaseOutcome.ok) {
         // Record the successful late release on the row so the sweep never

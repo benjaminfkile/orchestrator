@@ -10,7 +10,7 @@ describe("loadConfig", () => {
     expect(cfg.dbPath).toBeUndefined();
     expect(cfg.wisperHostId).toBeUndefined();
     expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
-    expect(cfg.wisperExecTimeoutMs).toBe(60000);
+    expect(cfg.wisperExecTimeoutMs).toBeUndefined();
     expect(cfg.wisperMode).toBe("dev");
     expect(cfg.isWisperConfigured()).toBe(false);
   });
@@ -46,7 +46,7 @@ describe("loadConfig", () => {
     expect(cfg.dbPath).toBeUndefined();
     expect(cfg.wisperBaseUrl).toBe("http://localhost:8080");
     expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
-    expect(cfg.wisperExecTimeoutMs).toBe(60000);
+    expect(cfg.wisperExecTimeoutMs).toBeUndefined();
     expect(cfg.isWisperConfigured()).toBe(false);
   });
 
@@ -73,7 +73,9 @@ describe("loadConfig", () => {
         WISPER_EXEC_TIMEOUT_MS: "abc",
       });
       expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
-      expect(cfg.wisperExecTimeoutMs).toBe(60000);
+      // WISPER_EXEC_TIMEOUT_MS is now an OPTIONAL override; a malformed value
+      // becomes undefined so the executor's remaining-TTL default applies.
+      expect(cfg.wisperExecTimeoutMs).toBeUndefined();
     });
 
     it("falls back to the default for a non-positive value", () => {
@@ -82,7 +84,7 @@ describe("loadConfig", () => {
         WISPER_EXEC_TIMEOUT_MS: "-5",
       });
       expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
-      expect(cfg.wisperExecTimeoutMs).toBe(60000);
+      expect(cfg.wisperExecTimeoutMs).toBeUndefined();
     });
   });
 

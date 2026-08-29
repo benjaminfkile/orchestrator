@@ -369,6 +369,15 @@ rename therefore breaks every reference by design.
   file. When neither is set the base defaults to \`<OS user-data
   dir>/orchestrator\`. The resolved paths are logged once at startup as
   \`{dbPath, logsDir, secretsDir}\`.
+- Per-call exec/release timeout (boot env \`WISPER_EXEC_TIMEOUT_MS\`, optional
+  operator override): governs the per-call timeout for the pipeline's step
+  execs and the streaming agent exec (inter-chunk IDLE window there, not a
+  wall-clock cap). When UNSET the executor derives the value per call from
+  the lease's REMAINING TTL plus a small margin, capped at about 6 hours, so
+  a step or agent command that runs the length of a long lease is not killed
+  by a fixed 60 seconds. An explicit env value wins over that computed
+  default. Total run time is bounded separately by the per-dispatch deadline
+  (\`min(ttl_seconds - 60, dispatch_timeout_seconds)\`), not by this timeout.
 
 ## Modules (integration producers)
 

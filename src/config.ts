@@ -39,11 +39,21 @@ export interface Config {
    */
   wisperCreateLeaseTimeoutMs: number;
   /**
-   * Timeout in ms for exec and release calls, and the inter-chunk idle window for
-   * streaming execs (NOT a wall-clock cap on total run time). Defaults to 60000;
-   * overridable via WISPER_EXEC_TIMEOUT_MS.
+   * Explicit operator override for the exec/release timeout (ms) and the
+   * inter-chunk idle window for streaming execs (NOT a wall-clock cap on total
+   * run time). When UNSET the executor derives a per-call default at dispatch
+   * time from the lease's REMAINING TTL plus a small margin, capped at the
+   * cap constant in the executor (about 6 hours), so a long-running step or
+   * agent command is not killed by a fixed client timeout. Set
+   * WISPER_EXEC_TIMEOUT_MS to override that computed default with a fixed
+   * value across every exec.
+   *
+   * Precedence (widest wins first is the ONLY exception, otherwise most-
+   * specific wins): a per-call `timeoutMs` on the wisper client > this
+   * WISPER_EXEC_TIMEOUT_MS operator override > the executor's computed
+   * `remaining_ttl + margin` (capped) default.
    */
-  wisperExecTimeoutMs: number;
+  wisperExecTimeoutMs?: number;
   /** True once a wisper host id is configured; false leaves leasing disabled. */
   isWisperConfigured(): boolean;
 }
@@ -54,11 +64,6 @@ export interface Config {
  * literal here to avoid a config↔client import cycle).
  */
 const DEFAULT_CREATE_LEASE_TIMEOUT_MS = 150_000;
-/**
- * Default exec/release timeout in ms when WISPER_EXEC_TIMEOUT_MS is unset.
- * Mirrors DEFAULT_EXEC_TIMEOUT_MS in wisper/client.ts.
- */
-const DEFAULT_EXEC_TIMEOUT_MS = 60_000;
 
 /** Thrown when an environment value is present but malformed. */
 export class ConfigError extends Error {
@@ -141,6 +146,24 @@ function parseTimeoutMs(raw: string | undefined, fallback: number): number {
   }
   const ms = Number(value);
   return ms > 0 ? ms : fallback;
+}
+
+/**
+ * Parse an OPTIONAL positive-integer millisecond timeout: an unset OR malformed
+ * value returns `undefined`, and callers treat that as "no explicit override"
+ * (the executor then derives its own default from the lease's remaining TTL).
+ * A typo must never block boot, so validation is lenient like {@link parseTimeoutMs}.
+ */
+function parseOptionalTimeoutMs(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === "") {
+    return undefined;
+  }
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) {
+    return undefined;
+  }
+  const ms = Number(value);
+  return ms > 0 ? ms : undefined;
 }
 
 /**
@@ -246,10 +269,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     env.WISPER_CREATE_LEASE_TIMEOUT_MS,
     DEFAULT_CREATE_LEASE_TIMEOUT_MS
   );
-  const wisperExecTimeoutMs = parseTimeoutMs(
-    env.WISPER_EXEC_TIMEOUT_MS,
-    DEFAULT_EXEC_TIMEOUT_MS
-  );
+  const wisperExecTimeoutMs = parseOptionalTimeoutMs(env.WISPER_EXEC_TIMEOUT_MS);
 
   return {
     port,
