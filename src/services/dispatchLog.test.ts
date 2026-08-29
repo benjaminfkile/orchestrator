@@ -3,6 +3,7 @@ import os from "os";
 import path from "path";
 
 import {
+  dispatchLogDir,
   dispatchLogPath,
   openDispatchLog,
 } from "./dispatchLog";
@@ -66,5 +67,22 @@ describe("dispatchLog", () => {
     const dl = openDispatchLog(4, { baseDir });
     dl.close();
     expect(() => dl.close()).not.toThrow();
+  });
+
+  describe("default base honors ORCH_DATA_DIR", () => {
+    const original = process.env.ORCH_DATA_DIR;
+
+    afterEach(() => {
+      if (original === undefined) delete process.env.ORCH_DATA_DIR;
+      else process.env.ORCH_DATA_DIR = original;
+    });
+
+    it("puts logs under <ORCH_DATA_DIR>/logs when the base is omitted", () => {
+      process.env.ORCH_DATA_DIR = baseDir;
+      expect(dispatchLogDir()).toBe(path.join(baseDir, "logs"));
+      expect(dispatchLogPath(7)).toBe(
+        path.join(baseDir, "logs", "dispatch-7.log")
+      );
+    });
   });
 });

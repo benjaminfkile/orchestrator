@@ -340,8 +340,9 @@ silently fall back to their default so a typo never blocks boot.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PORT` | `3007` | Loopback API port. Must be an integer 1–65535. |
-| `ORCH_DB_PATH` | `<user-data>/orchestrator/orchestrator.sqlite` | SQLite database file path override. The user-data base is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and `$XDG_DATA_HOME` (or `~/.local/share`) elsewhere; per-dispatch logs and the secret store live under the same `orchestrator` directory. |
+| `PORT` | `3007` | Loopback API port. Must be an integer 1-65535. |
+| `ORCH_DATA_DIR` | *(unset)* | Base directory for ALL of orchestrator's on-disk state: the SQLite DB file (default `<ORCH_DATA_DIR>/orchestrator.sqlite`), the per-dispatch log directory (`<ORCH_DATA_DIR>/logs/dispatch-<id>.log`), and the encrypted secret store (`<ORCH_DATA_DIR>/secrets.enc` + `secrets.salt`). Used verbatim (no `orchestrator` subdirectory is appended). When unset, the OS user-data base is used with an `orchestrator` subdirectory (`%APPDATA%\orchestrator` on Windows, `~/Library/Application Support/orchestrator` on macOS, `$XDG_DATA_HOME` or `~/.local/share`, plus `/orchestrator`, elsewhere). Set this so a launcher can keep every piece of state in one folder. |
+| `ORCH_DB_PATH` | `<data-dir>/orchestrator.sqlite` | SQLite database file path override. Set it to redirect ONLY the DB file (per-dispatch logs and the secret store still resolve against `ORCH_DATA_DIR` or the OS user-data default). |
 | `WISPER_BASE_URL` | `http://localhost:8080` | Base URL of the wisper-api (must be http(s)). A plaintext `http://` URL is accepted only for loopback hosts (`localhost`, `127.0.0.1`, `::1`); a non-loopback `http://` URL is refused at boot so the API key and injected secrets never travel unencrypted. |
 | `WISPER_ALLOW_INSECURE_HTTP` | *(unset)* | Set `1` or `true` to downgrade the non-loopback plaintext-http refusal to a loud warning (for operators terminating TLS themselves). |
 | `WISPER_MODE` | `dev` | Which wisper surface the client speaks: `dev` (unauthenticated `/dev/leases` harness) or `v1` (authenticated `/v1/leases` consumer surface). In `v1` mode every request carries `Authorization: Bearer <WISPER_API_KEY>` — set the `WISPER_API_KEY` **secret** (not an env var) first. Any other value fails fast. |

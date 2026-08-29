@@ -189,3 +189,25 @@ describe("SecretStore passphrase fallback", () => {
     expect(salt1).toHaveLength(16);
   });
 });
+
+describe("SecretStore default dir honors ORCH_DATA_DIR", () => {
+  const original = process.env.ORCH_DATA_DIR;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = tempDir();
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (original === undefined) delete process.env.ORCH_DATA_DIR;
+    else process.env.ORCH_DATA_DIR = original;
+  });
+
+  it("writes secrets.enc under ORCH_DATA_DIR when the store has no explicit dir", () => {
+    process.env.ORCH_DATA_DIR = dir;
+    const store = new SecretStore({ keychain: fakeKeychain(), env: {} });
+    store.set("K", "v");
+    expect(fs.existsSync(path.join(dir, "secrets.enc"))).toBe(true);
+  });
+});

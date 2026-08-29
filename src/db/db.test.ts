@@ -13,22 +13,41 @@ function tempDbFile(): string {
 }
 
 describe("resolveDbPath", () => {
-  const original = process.env.ORCH_DB_PATH;
+  const originalDb = process.env.ORCH_DB_PATH;
+  const originalData = process.env.ORCH_DATA_DIR;
 
   afterEach(() => {
-    if (original === undefined) delete process.env.ORCH_DB_PATH;
-    else process.env.ORCH_DB_PATH = original;
+    if (originalDb === undefined) delete process.env.ORCH_DB_PATH;
+    else process.env.ORCH_DB_PATH = originalDb;
+    if (originalData === undefined) delete process.env.ORCH_DATA_DIR;
+    else process.env.ORCH_DATA_DIR = originalData;
   });
 
   it("uses ORCH_DB_PATH when set", () => {
+    delete process.env.ORCH_DATA_DIR;
     process.env.ORCH_DB_PATH = "/tmp/custom/orch.sqlite";
     expect(resolveDbPath()).toBe("/tmp/custom/orch.sqlite");
   });
 
-  it("falls back to a user-data path under an orchestrator dir when unset", () => {
+  it("falls back to a user-data path under an orchestrator dir when neither is set", () => {
     delete process.env.ORCH_DB_PATH;
+    delete process.env.ORCH_DATA_DIR;
     const resolved = resolveDbPath();
     expect(resolved).toContain(path.join("orchestrator", "orchestrator.sqlite"));
+  });
+
+  it("places the DB under ORCH_DATA_DIR when only ORCH_DATA_DIR is set", () => {
+    delete process.env.ORCH_DB_PATH;
+    process.env.ORCH_DATA_DIR = path.join("/tmp", "orch-state");
+    expect(resolveDbPath()).toBe(
+      path.join("/tmp", "orch-state", "orchestrator.sqlite")
+    );
+  });
+
+  it("ORCH_DB_PATH wins over ORCH_DATA_DIR when both are set", () => {
+    process.env.ORCH_DATA_DIR = path.join("/tmp", "orch-state");
+    process.env.ORCH_DB_PATH = "/var/lib/other/orch.sqlite";
+    expect(resolveDbPath()).toBe("/var/lib/other/orch.sqlite");
   });
 });
 
