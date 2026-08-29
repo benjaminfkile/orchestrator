@@ -11,6 +11,7 @@ describe("loadConfig", () => {
     expect(cfg.wisperHostId).toBeUndefined();
     expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
     expect(cfg.wisperExecTimeoutMs).toBeUndefined();
+    expect(cfg.wisperReleaseTimeoutMs).toBe(60000);
     expect(cfg.wisperMode).toBe("dev");
     expect(cfg.isWisperConfigured()).toBe(false);
   });
@@ -23,6 +24,7 @@ describe("loadConfig", () => {
       WISPER_HOST_ID: "host-1",
       WISPER_CREATE_LEASE_TIMEOUT_MS: "300000",
       WISPER_EXEC_TIMEOUT_MS: "90000",
+      WISPER_RELEASE_TIMEOUT_MS: "15000",
     });
     expect(cfg.port).toBe(4000);
     expect(cfg.dbPath).toBe("/tmp/orch.sqlite");
@@ -30,6 +32,7 @@ describe("loadConfig", () => {
     expect(cfg.wisperHostId).toBe("host-1");
     expect(cfg.wisperCreateLeaseTimeoutMs).toBe(300000);
     expect(cfg.wisperExecTimeoutMs).toBe(90000);
+    expect(cfg.wisperReleaseTimeoutMs).toBe(15000);
     expect(cfg.isWisperConfigured()).toBe(true);
   });
 
@@ -41,12 +44,14 @@ describe("loadConfig", () => {
       WISPER_HOST_ID: "  ",
       WISPER_CREATE_LEASE_TIMEOUT_MS: "   ",
       WISPER_EXEC_TIMEOUT_MS: "",
+      WISPER_RELEASE_TIMEOUT_MS: "  ",
     });
     expect(cfg.port).toBe(3007);
     expect(cfg.dbPath).toBeUndefined();
     expect(cfg.wisperBaseUrl).toBe("http://localhost:8080");
     expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
     expect(cfg.wisperExecTimeoutMs).toBeUndefined();
+    expect(cfg.wisperReleaseTimeoutMs).toBe(60000);
     expect(cfg.isWisperConfigured()).toBe(false);
   });
 
@@ -71,20 +76,26 @@ describe("loadConfig", () => {
       const cfg = loadConfig({
         WISPER_CREATE_LEASE_TIMEOUT_MS: "60s",
         WISPER_EXEC_TIMEOUT_MS: "abc",
+        WISPER_RELEASE_TIMEOUT_MS: "soon",
       });
       expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
       // WISPER_EXEC_TIMEOUT_MS is now an OPTIONAL override; a malformed value
       // becomes undefined so the executor's remaining-TTL default applies.
       expect(cfg.wisperExecTimeoutMs).toBeUndefined();
+      // WISPER_RELEASE_TIMEOUT_MS has a compiled-in default (60 s), so a typo
+      // falls back to that rather than becoming undefined.
+      expect(cfg.wisperReleaseTimeoutMs).toBe(60000);
     });
 
     it("falls back to the default for a non-positive value", () => {
       const cfg = loadConfig({
         WISPER_CREATE_LEASE_TIMEOUT_MS: "0",
         WISPER_EXEC_TIMEOUT_MS: "-5",
+        WISPER_RELEASE_TIMEOUT_MS: "0",
       });
       expect(cfg.wisperCreateLeaseTimeoutMs).toBe(150000);
       expect(cfg.wisperExecTimeoutMs).toBeUndefined();
+      expect(cfg.wisperReleaseTimeoutMs).toBe(60000);
     });
   });
 

@@ -114,6 +114,15 @@ export interface RunDispatchDeps {
    */
   execTimeoutMs?: number;
   /**
+   * Explicit operator override for the per-call lease-release timeout in ms.
+   * The dispatcher threads `WISPER_RELEASE_TIMEOUT_MS` here. When UNSET the
+   * executor's finally block uses {@link DEFAULT_RELEASE_TIMEOUT_MS}. Release
+   * is a quick control-plane DELETE and MUST NOT share the exec timeout's
+   * multi-hour default, so a hung socket cannot block dispatcher shutdown or
+   * the release sweep for hours.
+   */
+  releaseTimeoutMs?: number;
+  /**
    * Base directory for the per-dispatch log file. Defaults to the OS user-data
    * dir; tests point this at a temp directory.
    */
@@ -527,6 +536,16 @@ export function resolveExecTimeoutMs(
   return Math.min(EXEC_TIMEOUT_CAP_MS, Math.max(EXEC_TIMEOUT_FLOOR_MS, derived));
 }
 
+/**
+ * Default per-call timeout (ms) for wisper lease-release requests. Release
+ * is a quick control-plane call that must not block boot's orphan reconcile
+ * or a whole sweep pass while a hung socket sits open. Kept short so a stuck
+ * DELETE fails fast and the sweep retries again on its next tick.
+ * Overridable via WISPER_RELEASE_TIMEOUT_MS; see
+ * {@link import("../config").Config.wisperReleaseTimeoutMs}.
+ */
+export const DEFAULT_RELEASE_TIMEOUT_MS = 60_000;
+
 /** The `app_settings` key for the optional per-dispatch timeout override. */
 export const DISPATCH_TIMEOUT_SETTING = "dispatch_timeout_seconds";
 
@@ -659,12 +678,26 @@ export async function runDispatch(
   const db = deps.db ?? getDb();
   const now = deps.now ?? Date.now;
   const configuredExecTimeoutMs = deps.execTimeoutMs;
+  const releaseTimeoutMs =
+    deps.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS;
   const logger = (deps.logger ?? log).child({ dispatchId });
 
   const dispatch = await getDispatch(dispatchId, db);
   if (!dispatch) {
     throw new Error(`runDispatch: dispatch ${dispatchId} not found`);
   }
+
+  // One-shot header line for the dispatch. Includes the configured exec
+  // timeout so an operator can see the ceiling that bounds every exec at a
+  // glance; when UNSET the value is derived per call from the lease's
+  // remaining TTL (see resolveExecTimeoutMs) and each step start line below
+  // still logs the resolved value it actually used.
+  logger.info("dispatch started", {
+    playbookId: dispatch.playbook_id,
+    eventId: dispatch.event_id,
+    configuredExecTimeoutMs,
+    releaseTimeoutMs,
+  });
 
   // The engine behind the agent step: it owns building the agent command and
   // parsing its output. Resolved from the registry against the playbook's chosen
@@ -1007,9 +1040,14 @@ export async function runDispatch(
       });
       const masked = maskSecrets(command, env);
       dispatchLog.append(`$ pre[${step.label}]: ${masked}`);
-      logger.info("pre step", { label: step.label, command: masked });
+      const preStepTimeoutMs = perCallTimeout();
+      logger.info("pre step", {
+        label: step.label,
+        command: masked,
+        execTimeoutMs: preStepTimeoutMs,
+      });
       const stepResult = await deps.wisper.execSync(lease.leaseId, command, {
-        timeoutMs: perCallTimeout(),
+        timeoutMs: preStepTimeoutMs,
         signal: controller.signal,
       });
       // Persist the step's (masked) output so a failure is diagnosable from the
@@ -1052,7 +1090,11 @@ export async function runDispatch(
     // pre/collect step commands above.
     const maskedCommand = maskSecrets(command, env);
     dispatchLog.append(`$ agent: ${maskedCommand}`);
-    logger.info("agent step", { command: maskedCommand });
+    const agentTimeoutMs = perCallTimeout();
+    logger.info("agent step", {
+      command: maskedCommand,
+      execTimeoutMs: agentTimeoutMs,
+    });
 
     const runStartedAt = now();
     const result = await deps.wisper.execStream(lease.leaseId, command, {
@@ -1061,7 +1103,7 @@ export async function runDispatch(
       // per-call from the lease's remaining TTL so a long-running agent that
       // pauses between chunks is not killed by a fixed 60s idle window; see
       // resolveExecTimeoutMs.
-      timeoutMs: perCallTimeout(),
+      timeoutMs: agentTimeoutMs,
       signal: controller.signal,
       onChunk: (chunk) => {
         output += chunk.data;
@@ -1112,9 +1154,14 @@ export async function runDispatch(
       });
       const masked = maskSecrets(command, env);
       dispatchLog.append(`$ collect[${step.label}]: ${masked}`);
-      logger.info("collect step", { label: step.label, command: masked });
+      const collectStepTimeoutMs = perCallTimeout();
+      logger.info("collect step", {
+        label: step.label,
+        command: masked,
+        execTimeoutMs: collectStepTimeoutMs,
+      });
       const stepResult = await deps.wisper.execSync(lease.leaseId, command, {
-        timeoutMs: perCallTimeout(),
+        timeoutMs: collectStepTimeoutMs,
         signal: controller.signal,
       });
       collected[step.label] = stepResult.stdout;
@@ -1181,14 +1228,16 @@ export async function runDispatch(
     // is gone by the desired definition). Never rethrows — the release path
     // is intentionally decoupled from the run's success/failure outcome, and
     // does NOT carry the caller's signal so an aborted run still frees its
-    // lease. Release shares the exec-timeout window (see WisperClient
-    // defaults); it is passed explicitly because the client's
-    // construction-time timeout is the longer create-lease ceiling.
+    // lease. Release uses its OWN short per-call timeout
+    // (WISPER_RELEASE_TIMEOUT_MS, default DEFAULT_RELEASE_TIMEOUT_MS), NOT the
+    // exec-timeout window: release is a quick control-plane DELETE and a hung
+    // socket must not block dispatcher shutdown or the sweep for hours the
+    // way the exec-timeout cap would.
     if (leaseId !== null) {
       const outcome = await attemptLeaseRelease(
         deps.wisper,
         leaseId,
-        perCallTimeout()
+        releaseTimeoutMs
       );
       if (outcome.ok) {
         await updateDispatch(
@@ -1241,12 +1290,13 @@ export interface ReconcileDeps {
   logger?: Logger;
   /**
    * Per-call timeout in ms for the orphaned-lease releases. When unset falls
-   * back to {@link EXEC_TIMEOUT_CAP_MS}: reconciliation has no live lease
-   * context (the process just booted), so the remaining-TTL derivation used
-   * by {@link runDispatch} does not apply; the cap is used as a safe ceiling
-   * and boot's configured `WISPER_EXEC_TIMEOUT_MS` overrides it verbatim.
+   * back to {@link DEFAULT_RELEASE_TIMEOUT_MS}. Release is a quick
+   * control-plane DELETE, so this MUST NOT reuse the multi-hour exec-timeout
+   * cap: boot awaits this reconcile sequentially before the dispatcher
+   * starts, and a hung socket per orphan would otherwise stall startup by
+   * hours per row. Boot threads the configured `WISPER_RELEASE_TIMEOUT_MS`.
    */
-  execTimeoutMs?: number;
+  releaseTimeoutMs?: number;
 }
 
 /**
@@ -1270,7 +1320,8 @@ export async function reconcileOrphanedDispatches(
 ): Promise<number> {
   const db = deps.db ?? getDb();
   const logger = deps.logger ?? log;
-  const execTimeoutMs = deps.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS;
+  const releaseTimeoutMs =
+    deps.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS;
 
   const orphans: DispatchRecord[] = [];
   for (const status of ORPHANED_ON_RESTART) {
@@ -1310,7 +1361,7 @@ export async function reconcileOrphanedDispatches(
     const outcome = await attemptLeaseRelease(
       deps.wisper,
       dispatch.lease_id,
-      execTimeoutMs
+      releaseTimeoutMs
     );
     if (outcome.ok) {
       await updateDispatch(
@@ -1346,10 +1397,13 @@ export interface SweepDeps {
   logger?: Logger;
   /**
    * Per-call timeout in ms for the release attempts. Defaults to
-   * {@link EXEC_TIMEOUT_CAP_MS} when unset; boot threads the configured
-   * `WISPER_EXEC_TIMEOUT_MS` so a release matches the running pipeline.
+   * {@link DEFAULT_RELEASE_TIMEOUT_MS} when unset; boot threads the
+   * configured `WISPER_RELEASE_TIMEOUT_MS`. Release is a quick control-plane
+   * DELETE, so this MUST NOT reuse the multi-hour exec-timeout cap: a hung
+   * socket per stranded lease would otherwise stall a whole sweep pass for
+   * hours per row.
    */
-  execTimeoutMs?: number;
+  releaseTimeoutMs?: number;
   /**
    * Wall clock, injectable for deterministic tests; defaults to `Date.now`.
    * Used to compute the per-lease backoff window against
@@ -1394,7 +1448,8 @@ export async function sweepPendingReleases(
 ): Promise<number> {
   const db = deps.db ?? getDb();
   const logger = deps.logger ?? log;
-  const execTimeoutMs = deps.execTimeoutMs ?? EXEC_TIMEOUT_CAP_MS;
+  const releaseTimeoutMs =
+    deps.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS;
   const now = deps.now ?? Date.now;
   const backoffMs = deps.backoffMs ?? DEFAULT_SWEEP_BACKOFF_MS;
 
@@ -1412,7 +1467,7 @@ export async function sweepPendingReleases(
     const outcome = await attemptLeaseRelease(
       deps.wisper,
       dispatch.lease_id,
-      execTimeoutMs
+      releaseTimeoutMs
     );
     if (outcome.ok) {
       await updateDispatch(
