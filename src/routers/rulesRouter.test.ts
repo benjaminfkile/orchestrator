@@ -7,9 +7,12 @@ import request from "supertest";
 
 import app from "../app";
 import { createDb, setDb } from "../db/db";
+import { createDispatch } from "../db/dispatches";
+import { insertEvent } from "../db/events";
 import { runMigrations } from "../db/migrate";
 import { createPlaybook } from "../db/playbooks";
 import { createRule, getRule } from "../db/rules";
+import type { DispatchStatus } from "../interfaces";
 
 function tempDbFile(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orch-rules-router-"));
@@ -221,8 +224,39 @@ describe("rules router", () => {
     });
   });
 
+  /**
+   * Seed a dispatch that references `ruleId` (and the shared `playbookId`) with
+   * the given lifecycle `status`, mimicking the shape the rule engine records
+   * when a match fires. Returns the created dispatch id.
+   */
+  async function seedDispatchForRule(
+    ruleId: number,
+    status: DispatchStatus
+  ): Promise<number> {
+    const event = await insertEvent(
+      {
+        source: "s",
+        type: "t",
+        subject_kind: "k",
+        subject_ref: "r",
+        payload: {},
+      },
+      db
+    );
+    const dispatch = await createDispatch(
+      {
+        event_id: event.id,
+        rule_id: ruleId,
+        playbook_id: playbookId,
+        status,
+      },
+      db
+    );
+    return dispatch.id;
+  }
+
   describe("DELETE /api/rules/:id", () => {
-    it("deletes a rule", async () => {
+    it("deletes an unreferenced rule", async () => {
       const created = await createRule({ name: "doomed" }, db);
       const res = await request(app).delete(`/api/rules/${created.id}`);
       expect(res.status).toBe(204);
@@ -232,6 +266,41 @@ describe("rules router", () => {
     it("404s for a missing rule", async () => {
       const res = await request(app).delete("/api/rules/9999");
       expect(res.status).toBe(404);
+    });
+
+    it("deletes the rule and nulls rule_id on terminal dispatches (204)", async () => {
+      const created = await createRule({ name: "with-history" }, db);
+      const d1 = await seedDispatchForRule(created.id, "done");
+      const d2 = await seedDispatchForRule(created.id, "failed");
+
+      const res = await request(app).delete(`/api/rules/${created.id}`);
+      expect(res.status).toBe(204);
+
+      // The rule row is gone; the dispatch history stays but its rule_id was
+      // nulled so a reader can still see it.
+      expect(await getRule(created.id, db)).toBeUndefined();
+      for (const id of [d1, d2]) {
+        const row = await db("dispatches").where({ id }).first();
+        expect(row).toBeDefined();
+        expect(row?.rule_id).toBeNull();
+      }
+    });
+
+    it("409s with an in-flight count when a non-terminal dispatch references the rule", async () => {
+      const created = await createRule({ name: "busy" }, db);
+      await seedDispatchForRule(created.id, "done");
+      await seedDispatchForRule(created.id, "running");
+
+      const res = await request(app).delete(`/api/rules/${created.id}`);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("rule has 1 in-flight dispatches");
+      // Nothing was deleted: the rule stays and both dispatches still reference it.
+      expect(await getRule(created.id, db)).toBeDefined();
+      const stillReferencing = await db("dispatches")
+        .where({ rule_id: created.id })
+        .count<{ n: number | string }>({ n: "*" })
+        .first();
+      expect(Number(stillReferencing?.n ?? 0)).toBe(2);
     });
   });
 

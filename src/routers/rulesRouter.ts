@@ -3,7 +3,6 @@ import express from "express";
 import { getPlaybook } from "../db/playbooks";
 import {
   createRule,
-  deleteRule,
   getRule,
   listRules,
   updateRule,
@@ -13,6 +12,7 @@ import type {
   RuleMatch,
   RuleNotifyTarget,
 } from "../interfaces";
+import { deleteRuleWithHistory } from "../services/ruleDeletion";
 
 import {
   handler,
@@ -33,7 +33,10 @@ import {
  *   GET /:id              one rule, 404 when absent
  *   POST /                create (validates match/dispatch; playbook_ids must exist)
  *   PATCH /:id            partial update (same validation), 404 when absent
- *   DELETE /:id           remove, 404 when absent
+ *   DELETE /:id           remove; 404 when absent, 409 while an in-flight
+ *                         dispatch references the rule. On success the terminal
+ *                         dispatches that referenced it have their `rule_id`
+ *                         nulled so history stays readable.
  *   POST /:id/enable      set enabled=true, 404 when absent
  *   POST /:id/disable     set enabled=false, 404 when absent
  */
@@ -219,8 +222,15 @@ rulesRouter.delete(
   "/:id",
   handler(async (req, res) => {
     const id = parseIdParam(req.params.id);
-    if (!(await deleteRule(id))) {
+    const result = await deleteRuleWithHistory(id);
+    if (result.outcome === "not_found") {
       res.status(404).json({ error: "rule not found" });
+      return;
+    }
+    if (result.outcome === "in_flight") {
+      res.status(409).json({
+        error: `rule has ${result.inFlight} in-flight dispatches`,
+      });
       return;
     }
     res.status(204).end();

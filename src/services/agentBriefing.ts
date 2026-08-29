@@ -131,6 +131,11 @@ Body: \`{name, enabled?, match?, dispatch?, notify?}\`.
   \`bindings\` is validated and stored but NOT currently read by the executor or
   exposed to templates — do not rely on it to parameterize a run.
 - \`notify\`: \`[{notifier_id}]\` — notifiers to fire on match (not rate-capped).
+- \`DELETE /api/rules/:id\` -> 204. 409 \`{error: "rule has N in-flight dispatches"}\`
+  while any dispatch created by this rule is queued/leasing/running/collecting;
+  wait for those to finish first. On success the terminal dispatches that
+  referenced the rule have their \`rule_id\` set to null so the run history stays
+  readable.
 
 ## Playbooks — \`GET/POST /api/playbooks\`, \`GET/PATCH/DELETE /api/playbooks/:id\`
 
