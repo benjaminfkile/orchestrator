@@ -1,14 +1,14 @@
 /**
  * The agent briefing served by `GET /api/agent-briefing` and shown on the
  * "Agent Briefing" page. A user pastes it into any AI coding agent running on
- * this machine (Claude Code, Codex, Cursor — anything that can make HTTP
- * requests) so the agent can drive this orchestrator's loopback API — creating
- * rules, playbooks, notifiers, dispatching runs — on their behalf.
+ * this machine (Claude Code, Codex, Cursor, or anything that can make HTTP
+ * requests) so the agent can drive this orchestrator's loopback API (creating
+ * rules, playbooks, notifiers, dispatching runs) on their behalf.
  *
  * MAINTENANCE (load-bearing): this text is the ONLY thing a pasted-in agent
- * knows about the app. Whenever the operational surface changes — an endpoint
+ * knows about the app. Whenever the operational surface changes (an endpoint
  * is added/renamed, a request/response shape changes, a setting key or runner
- * appears, template/matching semantics move — update this briefing in the same
+ * appears, template/matching semantics move), update this briefing in the same
  * change. The README ("Agent briefing" section) and CLAUDE.md both point here.
  *
  * Rendered per request with the port this server actually booted on (`PORT`,
@@ -27,11 +27,11 @@ help the user configure and operate it over plain HTTP+JSON.
 Base URL: \`${baseUrl}\` (loopback only, NO auth). Verify with
 \`GET /api/health\` -> \`{status:"ok", db:true, wisper:true}\` ("wisper" false means
 the lease backend is down; config edits still work, runs will not). This text is
-served at \`GET /api/agent-briefing\` -> \`{briefing}\` — re-fetch it any time to
+served at \`GET /api/agent-briefing\` -> \`{briefing}\`; re-fetch it any time to
 refresh these instructions.
 
 \`GET /api/changes/stream\` is a Server-Sent Events feed of \`{resource, ts}\`
-frames — one per data change (e.g. \`{"resource":"playbooks"}\`) — that the web UI
+frames (one per data change, e.g. \`{"resource":"playbooks"}\`) that the web UI
 subscribes to so open pages refresh live. You do NOT need to do anything special
 for the UI to update: every write you make is picked up automatically.
 
@@ -44,19 +44,19 @@ run-lifecycle event -> **notifiers** fire notifications.
 
 Key invariants you must respect:
 - The core is domain-neutral: all intent lives in DATA you write (rule
-  criteria, prompts, templates, event-type strings) — never ask to change code.
+  criteria, prompts, templates, event-type strings); never ask to change code.
 - Send ONLY documented keys. The rules/playbooks/snippets/notifiers/dispatches
   write endpoints (and the datadog config PUT) reject unknown body keys with a
   400 naming the offender; secrets and the ADO config do not, so a typo there
-  can persist silently — double-check those bodies yourself. Settings
+  can persist silently; double-check those bodies yourself. Settings
   whitelists the \`key\` (unknown keys 400) but ignores extra body properties.
 - Secrets are write-only: you can set and reference them by NAME, never read a
   value back. Never echo a secret value the user gives you into any other field.
 
 ## Events
 
-- \`GET /api/events?limit=N&before=<id>\` — newest first; \`before\` pages past
-  the given event id. \`GET /api/events/:id\`.
+- \`GET /api/events?limit=N&before=<id>\`: newest first (\`limit\` default 50, max
+  500); \`before\` pages past the given event id. \`GET /api/events/:id\`.
   Add \`?q=<text>\` to substring-search (case-insensitive) across source, type,
   subject_kind, subject_ref, and the raw payload JSON; whitespace-separated terms
   are ANDed and it composes with \`before\`.
@@ -69,7 +69,7 @@ Key invariants you must respect:
   collapses repeats: a first mint returns \`201\` with the created event; a mint
   that lands inside the cooldown returns \`200\` with the existing event. Rules
   match the minted event exactly as if a producer had emitted it.
-- \`GET /api/events/facets\` -> \`{sources, types}\` — every recorded source/type
+- \`GET /api/events/facets\` -> \`{sources, types}\`: every recorded source/type
   merged with what the registered modules can emit (works on an empty DB). Use
   it to discover valid \`match.type\` strings before writing a rule.
 - Shape: \`{id, source, type, subject_kind, subject_ref, payload, dedupe_key,
@@ -78,9 +78,9 @@ Key invariants you must respect:
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
   .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
   .updated\` (source \`ado\`).
-- Datadog producer events (source \`datadog\`, aggregate-driven — never one per
+- Datadog producer events (source \`datadog\`, aggregate-driven: never one per
   log line):
-  - \`datadog.logs.alert\` — a watched log query's grouped count tripped a
+  - \`datadog.logs.alert\`: a watched log query's grouped count tripped a
     statistical detector. ONE event per (watch, group) tick; rules discriminate
     on the payload, not distinct types. Payload: \`{watch, query, group_by, group,
     detectors, count, baseline, window_start, window_end, samples[], explorer_url}\`.
@@ -89,32 +89,32 @@ Key invariants you must respect:
     first sighting of the group). Match e.g. \`payload.count gte 100\`,
     \`payload.detectors contains "spike"\`. \`subject_kind\` \`log_group\`,
     \`subject_ref\` \`<watch>/<group>\`, \`dedupe_key\` \`datadog:<watch>:<group>\`.
-  - \`datadog.monitor.transition\` — a monitor (or monitor group) changed state.
+  - \`datadog.monitor.transition\`: a monitor (or monitor group) changed state.
     Payload: \`{monitor_id, name, query, group, from_state, to_state, url}\` (group
     \`*\` for an ungrouped monitor). Match e.g. \`payload.to_state eq "Alert"\`.
     \`subject_kind\` \`monitor\`, \`subject_ref\` \`<id>\`, \`dedupe_key\`
     \`datadog:monitor:<id>:<group>\`. The \`event_dedupe_cooldown_seconds\` setting
     then suppresses re-storms of the same subject.
 - Run-lifecycle events (source \`orchestrator\`): \`run.started\` fires each time
-  the dispatcher hands a claimed dispatch to the executor — a retried dispatch
+  the dispatcher hands a claimed dispatch to the executor; a retried dispatch
   emits it once per attempt (never for dispatches that stay queued or are
   dropped by a cap/gate); \`run.completed\` / \`run.failed\`
   fire on terminal dispatch outcomes. \`run.started\` payload: \`{dispatch_id,
-  playbook_id, playbook_name, rule_id, origin, chain_depth}\` — the start-time
+  playbook_id, playbook_name, rule_id, origin, chain_depth}\`: the start-time
   subset, with no terminal fields. Terminal payload: \`{dispatch_id, run_id,
   playbook_id, playbook_name, rule_id, status, exit_code, error, findings,
   findings_count, collected, duration_ms, total_tokens, origin, chain_depth}\`.
-  \`origin\` is an OBJECT describing the triggering event — \`{event_id, source,
-  type, subject_kind, subject_ref}\` — so a chaining rule matches e.g.
+  \`origin\` is an OBJECT describing the triggering event (\`{event_id, source,
+  type, subject_kind, subject_ref}\`), so a chaining rule matches e.g.
   \`payload.origin.subject_ref\`; \`findings\` is \`[{content, tags}]\`.
   Rules can match these to notify or CHAIN playbooks; the
   \`dispatch_max_chain_depth\` setting (default 3) caps runaway chains for every
   run-lifecycle event (\`run.started\` included).
 
-## Rules — \`GET/POST /api/rules\`, \`GET/PATCH/DELETE /api/rules/:id\`, \`POST /api/rules/:id/enable|disable\`
+## Rules: \`GET/POST /api/rules\`, \`GET/PATCH/DELETE /api/rules/:id\`, \`POST /api/rules/:id/enable|disable\`
 
 Body: \`{name, enabled?, match?, dispatch?, notify?}\`.
-- \`match\`: \`{source?, type?, criteria?}\` — absent field = wildcard.
+- \`match\`: \`{source?, type?, criteria?}\`: absent field = wildcard.
   - \`type\` supports \`*\` and \`prefix.*\` wildcards (\`prefix.*\` also matches the
     bare \`prefix\`).
   - \`criteria\` keys are dotted paths into the event payload (\`fields.state\`),
@@ -124,26 +124,27 @@ Body: \`{name, enabled?, match?, dispatch?, notify?}\`.
     (aliases also accepted: \`=\`, \`==\`, \`!=\`, \`<>\`, \`not_in\`, \`has\`, \`regex\`,
     \`matches\`, \`not_matches\`, \`>\`, \`>=\`, \`<\`, \`<=\`).
     The literal string \`"@Me"\` resolves to the \`identity_me\` setting in
-    scalar/array specs and eq/ne/in/nin/contains/ordering operands — NOT inside
+    scalar/array specs and eq/ne/in/nin/contains/ordering operands, but NOT inside
     regex patterns; when \`identity_me\` is unset it compares literally.
     Malformed criteria fail closed (rule silently does not fire).
-- \`dispatch\`: \`[{playbook_id, bindings?}]\` — playbooks to run on match.
+- \`dispatch\`: \`[{playbook_id, bindings?}]\`: playbooks to run on match.
   \`bindings\` is validated and stored but NOT currently read by the executor or
-  exposed to templates — do not rely on it to parameterize a run.
-- \`notify\`: \`[{notifier_id}]\` — notifiers to fire on match (not rate-capped).
+  exposed to templates; do not rely on it to parameterize a run.
+- \`notify\`: \`[{notifier_id}]\`: notifiers to fire on match (not rate-capped).
 - \`DELETE /api/rules/:id\` -> 204. 409 \`{error: "rule has N in-flight dispatches"}\`
   while any dispatch created by this rule is queued/leasing/running/collecting;
   wait for those to finish first. On success the terminal dispatches that
   referenced the rule have their \`rule_id\` set to null so the run history stays
   readable.
 
-## Playbooks — \`GET/POST /api/playbooks\`, \`GET/PATCH/DELETE /api/playbooks/:id\`
+## Playbooks: \`GET/POST /api/playbooks\`, \`GET/PATCH/DELETE /api/playbooks/:id\`
 
 Body (required: name, image, ttl_seconds): \`{name, image, host?, isolation?,
 ttl_seconds, resources?{cpus,memory_mb,pids}, network? ("open"|"none"),
 userdata_template?, prompt_template?, runner?, runner_config?,
 env_requirements? (array of \`"NAME"\` or \`{name, inject: "step-only"}\`),
-steps?, granted_capabilities?, output_kind?}\`.
+steps?, granted_capabilities?, output_kind?}\`. \`output_kind\` is a stored
+string (default \`findings\`) that the core never interprets.
 - \`image\`: literal image ref, or \`setting:<key>\` resolved from app settings at
   dispatch time (convention: \`setting:default_lease_image\`).
 - \`host\` (optional string, or \`null\` to clear to the default): which host runs
@@ -158,12 +159,12 @@ steps?, granted_capabilities?, output_kind?}\`.
   server default): the lease isolation level, ordered weakest -> strongest. An
   infrastructure knob, never domain intent. \`null\`/omitted lets the wisper
   server apply its default (\`shared\`). In \`v1\` mode a non-null value is checked
-  against the selected host's advertised \`isolation_levels\` at dispatch time — a
-  host that cannot provide it fails the dispatch BEFORE leasing (like an
-  unoffered image) — and is sent on \`POST /v1/leases\`; \`dev\` mode ignores it. A
+  against the selected host's advertised \`isolation_levels\` at dispatch time (a
+  host that cannot provide it fails the dispatch BEFORE leasing, like an
+  unoffered image) and is sent on \`POST /v1/leases\`; \`dev\` mode ignores it. A
   value outside the allowed set is a \`400\` at save time. Note
   \`GET /api/wisper/hosts\` does NOT expose isolation levels, so you cannot
-  pre-check support — a mismatch surfaces as the dispatch failure.
+  pre-check support; a mismatch surfaces as the dispatch failure.
 - \`resources\` (optional \`{cpus?, memory_mb?, pids?}\`): only forwarded in
   \`dev\` mode. In \`v1\` mode resources are fixed by the selected offer server-side,
   so the field is IGNORED at lease creation and \`POST /v1/leases\` NEVER carries
@@ -177,18 +178,18 @@ steps?, granted_capabilities?, output_kind?}\`.
     prefixed \`IS_SANDBOX=1\` so the claude CLI accepts
     \`--dangerously-skip-permissions\` under root (wisp execs run as root); an
     image only needs \`claude\` reachable on the default PATH.
-  - \`script\`: no LLM — \`runner_config.command_template\` (required; a missing/
+  - \`script\`: no LLM; \`runner_config.command_template\` (required; a missing/
     empty one fails the dispatch BEFORE leasing) is rendered
     and run as the agent step; its stdout is the run's result text. Exit 0 =
     success. CAUTION: leases may be Windows containers (check the
     \`default_lease_image\` setting); commands then run under \`cmd /c\` and
-    double quotes arrive backslash-escaped — avoid quotes/angle brackets in
+    double quotes arrive backslash-escaped; avoid quotes/angle brackets in
     commands, or build strings in PowerShell via \`[char]34\`/\`[char]60\`.
-- \`steps\`: \`[{phase: "pre"|"collect", command_template, label}]\` — \`pre\` runs
+- \`steps\`: \`[{phase: "pre"|"collect", command_template, label}]\`: \`pre\` runs
   before the agent (e.g. git clone), \`collect\` after success; collect stdout is
   saved on the run keyed by label.
 - \`env_requirements\`: required secret NAMES. Each entry is EITHER a plain
-  string (the legacy shape — the resolved secret is injected into the lease env
+  string (the legacy shape: the resolved secret is injected into the lease env
   AND available to server-side \`{{env.NAME}}\` template rendering EVERYWHERE:
   step \`command_template\`s, \`userdata_template\`, \`prompt_template\`,
   \`prompt\`-kind snippet content, and the \`script\` runner's
@@ -220,18 +221,18 @@ steps?, granted_capabilities?, output_kind?}\`.
   \`visibility\` is \`self|siblings|descendants|ancestors|all\` (default \`all\`);
   \`content\` must be a non-empty string. Invalid entries are SILENTLY skipped
   (never fatal); multiple blocks in one output accumulate.
-- \`DELETE /api/playbooks/:id\` CASCADES the playbook's run history — its terminal
-  dispatches, their runs, those runs' findings, and each dispatch's log file —
-  then the playbook row (204). A playbook with any IN-FLIGHT (queued/leasing/
+- \`DELETE /api/playbooks/:id\` CASCADES the playbook's run history (its terminal
+  dispatches, their runs, those runs' findings, and each dispatch's log file)
+  and then the playbook row (204). A playbook with any IN-FLIGHT (queued/leasing/
   running/collecting) dispatch is refused with 409 \`{error: "playbook has N
   in-flight dispatches"}\`; wait for those to finish first. A referencing rule is
-  NOT a barrier — after the delete its dispatch target is dangling but fail-closes
+  NOT a barrier: after the delete its dispatch target is dangling but fail-closes
   (the event just does not dispatch that target).
 - \`GET /api/playbooks/:id/usage\` -> \`{dispatches, runs, findings, in_flight,
-  referencing_rules: [{id, name}]}\` — the counts a delete would cascade, whether
+  referencing_rules: [{id, name}]}\`: the counts a delete would cascade, whether
   any dispatch is in flight, and the enabled rules that reference the playbook.
 
-## Snippets — \`GET/POST /api/snippets\`, \`GET/PATCH/DELETE /api/snippets/:id\`
+## Snippets: \`GET/POST /api/snippets\`, \`GET/PATCH/DELETE /api/snippets/:id\`
 
 Reusable, user-authored template fragments resolved at DISPATCH TIME, so editing
 one propagates to every playbook that references it. Body: \`{kind, name,
@@ -245,22 +246,23 @@ References are BY NAME and differ by kind ON PURPOSE:
   itself rendered with the full context (event/payload/env AND further
   \`{{snippet.*}}\` tokens), so snippets nest; nesting is bounded (depth 5) and
   cycle-guarded.
-- \`userdata\`: a SINGLE whole-value reference — set \`userdata_template\` to
+- \`userdata\`: a SINGLE whole-value reference: set \`userdata_template\` to
   exactly \`snippet:<name>\` (no inline mixing, no nesting).
-- \`step\`: a whole saved command — set a step's \`command_template\` (or the
+- \`step\`: a whole saved command: set a step's \`command_template\` (or the
   \`script\` runner's \`runner_config.command_template\`) to \`snippet:<name>\`.
   Ordering the steps chains them.
 
 A missing, renamed, or kind-mismatched reference FAILS the dispatch BEFORE any
-lease is created (loudly, like a missing secret) — never silently dropped. A
+lease is created (loudly, like a missing secret), never silently dropped. A
 rename therefore breaks every reference by design.
 
-## Dispatches (the queue) — \`GET /api/dispatches\`, \`GET /api/dispatches/:id\`
+## Dispatches (the queue): \`GET /api/dispatches\`, \`GET /api/dispatches/:id\`
 
-- \`GET /api/dispatches\` lists newest-first; \`?status=\` filters to one state,
-  \`?active=1\` filters to the non-terminal (queued/leasing/running/collecting)
-  work. The Queue page is a QUEUE: it fetches \`?active=1\` and shows only
-  waiting/in-flight dispatches. Terminal history (done/failed) lives on the
+- \`GET /api/dispatches/:id\` embeds every run of the dispatch (retries add
+  rows), each with its findings. \`GET /api/dispatches\` lists newest-first;
+  \`?status=\` filters to one state, \`?active=1\` filters to the non-terminal
+  (queued/leasing/running/collecting) work. The Queue page is a QUEUE: it
+  fetches \`?active=1\` and shows only waiting/in-flight dispatches. Terminal history (done/failed) lives on the
   Runs page (\`GET /api/runs\`), which links back per dispatch and offers retry.
 - Add \`?q=<text>\` to \`GET /api/dispatches\` to substring-search (case-insensitive,
   whitespace-separated terms ANDed) across status, error, subject fields, event
@@ -271,30 +273,30 @@ rename therefore breaks every reference by design.
   (404 for an unknown event or playbook). Deliberately bypasses
   \`dispatch_max_per_event\`, but still counts against the per-hour cap and the
   run/token budget gate.
-- \`POST /api/dispatches/:id/retry\` — 409 unless the status is exactly \`failed\`.
-- \`GET /api/dispatches/:id/log\` — a \`text/plain\` stream that TAILS the log
+- \`POST /api/dispatches/:id/retry\`: 409 unless the status is exactly \`failed\`.
+- \`GET /api/dispatches/:id/log\`: a \`text/plain\` stream that TAILS the log
   until the dispatch is terminal (it deliberately stays open while the dispatch
-  runs — do not curl it and wait); 404 until the log file exists.
+  runs; do not curl it and wait); 404 until the log file exists.
 - There is NO cancel endpoint: an in-flight dispatch runs to completion (which
   is also why deleting its playbook is refused until it finishes).
 - Status flow: queued -> leasing -> running -> collecting -> done | failed.
   A dispatch held by the run/token budget gate stays \`queued\` annotated with
-  \`{waiting_reason: "budget", window_count, budget, next_eligible_at, ...}\` —
+  \`{waiting_reason: "budget", window_count, budget, next_eligible_at, ...}\`;
   check those fields when a dispatch seems stuck.
 - Lease release bookkeeping: \`released_at\` (ms since epoch or null) is the
   timestamp of a successful lease release; \`release_pending: true\` marks a row
   whose lease release is stuck retrying. A release sweep runs once at boot and
   periodically while the dispatcher is up; it reattempts release for any
   TERMINAL (\`done\`/\`failed\`) dispatch with a non-null \`lease_id\` and a null
-  \`released_at\` — in-flight dispatches are never touched (their lease is owned
+  \`released_at\`; in-flight dispatches are never touched (their lease is owned
   by the running pipeline, which releases it itself). A wisper "not_found"
   response is treated as a successful release. \`POST /api/dispatches/:id/retry\`
-  refuses (409) while a failed dispatch still holds an unreleased lease — wait
+  refuses (409) while a failed dispatch still holds an unreleased lease; wait
   for the sweep (typically under a minute), then retry.
 - A retryable dispatch failure is NEVER requeued while it still holds an
   unreleased lease: the dispatcher tries one more inline release first, and if
   that also fails it leaves the row \`failed\` with \`release_pending\` set (the
-  sweep then chases the release) instead of requeueing — a stuck release is
+  sweep then chases the release) instead of requeueing; a stuck release is
   strong evidence the host/wisper path is unhealthy, and requeueing would drop
   the lease handle so the lease would run to wisper's TTL failsafe, billed.
 - Runs: \`GET /api/runs/:id\` -> run + collected output + findings. \`GET
@@ -315,7 +317,8 @@ rename therefore breaks every reference by design.
 ## Settings & secrets
 
 - \`GET /api/settings\`, \`PUT /api/settings\` body \`{key, value}\` (whitelisted
-  keys): \`default_lease_image\`, \`dispatch_concurrency\`,
+  keys): \`default_lease_image\`, \`dispatch_concurrency\` (any value above 1 is
+  clamped to 1: dispatches run one at a time),
   \`dispatcher_interval_seconds\`,
   \`dispatch_max_attempts\`, \`dispatch_timeout_seconds\`, \`dispatch_max_per_event\`,
   \`dispatch_max_per_hour\`, \`dispatch_max_chain_depth\`,
@@ -325,7 +328,7 @@ rename therefore breaks every reference by design.
   \`run_budget_per_hour\`, \`run_budget_window_minutes\` (default 60), and
   \`token_budget_per_window\`. The run/token budgets are a GATE, not a rejection:
   when the window's run count or token spend is exhausted, further dispatches
-  are HELD in \`queued\` (annotated with \`waiting_reason: "budget"\` — see
+  are HELD in \`queued\` (annotated with \`waiting_reason: "budget"\`, see
   Dispatches) until the window frees up.
 - Secrets: \`GET /api/secrets\` (names only), \`PUT /api/secrets\` body
   \`{key, value}\`, \`DELETE /api/secrets/:key\`. Typical names:
@@ -333,18 +336,18 @@ rename therefore breaks every reference by design.
   \`DD_APP_KEY\`, \`WISPER_API_KEY\`.
 - \`GET /api/settings/system\` -> read-only boot facts the UI shows next to the
   editable settings: \`{wisperBaseUrl, wisperHostId (null when unset), wisperMode
-  ("dev"|"v1"), wisperApiKeyPresent (boolean — WHETHER the \`WISPER_API_KEY\`
+  ("dev"|"v1"), wisperApiKeyPresent (boolean: WHETHER the \`WISPER_API_KEY\`
   secret is set, never its value)}\`.
 - \`GET /api/wisper/hosts\` -> the rentable host catalog for the playbook Host
   picker, fetched SERVER-SIDE so the API key never reaches the client:
   \`{hosts: [{id, name, os, online, images: [{id, name, price_cents_per_min}]}], warning?}\`.
   In \`v1\` mode it reads \`GET /v1/catalog\` with the bearer token; in \`dev\` mode it
   returns a single synthetic entry for \`WISPER_HOST_ID\`. DEGRADES like
-  \`GET /api/anthropic/models\` — always 200, empty list + \`warning\` on any failure.
+  \`GET /api/anthropic/models\`: always 200, empty list + \`warning\` on any failure.
 - Lease backend mode (boot env \`WISPER_MODE\`, default \`dev\`): \`dev\` speaks the
   unauthenticated local \`/dev/leases\` harness. \`v1\` speaks the authenticated
   \`/v1/leases\` consumer surface, sending \`Authorization: Bearer <WISPER_API_KEY>\`
-  (resolved from the secret store at call time — set the \`WISPER_API_KEY\` secret
+  (resolved from the secret store at call time; set the \`WISPER_API_KEY\` secret
   before switching). In v1 a missing key, or a \`401\`/\`403\`, fails the dispatch
   terminally (never retried) naming \`WISPER_API_KEY\`; a \`402\` fails terminally as
   insufficient funds. In v1 the client also resolves a playbook's \`host\` selector
@@ -369,6 +372,9 @@ rename therefore breaks every reference by design.
   file. When neither is set the base defaults to \`<OS user-data
   dir>/orchestrator\`. The resolved paths are logged once at startup as
   \`{dbPath, logsDir, secretsDir}\`.
+- Create-lease timeout (boot env \`WISPER_CREATE_LEASE_TIMEOUT_MS\`, default
+  150000 ms): the blocking create-lease call waits this long for wisper to
+  provision the lease (clone/build can take minutes for heavy images).
 - Per-call exec timeout (boot env \`WISPER_EXEC_TIMEOUT_MS\`, optional
   operator override): governs the per-call timeout for the pipeline's step
   execs and the streaming agent exec (inter-chunk IDLE window there, not a
@@ -389,12 +395,12 @@ rename therefore breaks every reference by design.
 ## Modules (integration producers)
 
 - \`GET /api/modules\` -> \`[{id, producers: [{producerId, trigger, lastTickAt,
-  lastError, nextFireAt}]}]\` — whether each poller is armed and its last error.
+  lastError, nextFireAt}]}]\`: whether each poller is armed and its last error.
 - \`GET /api/modules/:id/config\` -> \`{module_id, config}\`; \`PUT\` takes the
   BARE config object (do not round-trip the GET wrapper back).
 - ADO config keys (\`/api/modules/ado/config\`): org, project, base_url,
   pat_secret_ref, enabled, interval_seconds, watched, pull_requests. NOT
-  shape-validated on PUT (unlike datadog) — a typoed key persists silently, so
+  shape-validated on PUT (unlike datadog); a typoed key persists silently, so
   double-check the body. The ADO integration is READ-ONLY.
 - \`POST /api/modules/ado/backfill\` body \`{producer_id?, limit?, dry_run?}\` ->
   \`{candidates, emitted}\` (400 when the module is disabled or unconfigured).
@@ -407,14 +413,14 @@ rename therefore breaks every reference by design.
   200 + an empty list with an \`X-Ado-Restricted\` header, never a hard 401.
 - \`POST /api/modules/ado/workitems/:id/materialize\` -> 201 with a stored
   \`ado.workitem.manual\` event (source \`ado\`; rule matching and dedupe are
-  skipped) — the way to mint a real test event on demand.
+  skipped): the way to mint a real test event on demand.
 - Grantable capabilities (\`GET /api/capabilities\` -> \`[{id, module_id}]\`) are
   READ-ONLY prompt enrichers granted per playbook; for ANY capability, a grant
   with no \`config\` inherits the owning module's stored connection config. ADO
   contributes \`ado.get_work_item\`, \`ado.query_work_items\`, \`ado.sprint_rollup\`,
   and \`ado.get_work_item_links\`.
-- \`GET/PUT /api/modules/datadog/config\` (enabled, site — a bare domain like
-  \`us5.datadoghq.com\`, default \`datadoghq.com\`; api_key_secret_ref,
+- \`GET/PUT /api/modules/datadog/config\` (enabled, site (a bare domain like
+  \`us5.datadoghq.com\`, default \`datadoghq.com\`), api_key_secret_ref,
   app_key_secret_ref, interval_seconds, monitors, watches). Config is
   shape-validated on PUT (unknown keys rejected -> 400). The two keys are read
   from the secret store by name and sent as \`DD-API-KEY\`/\`DD-APPLICATION-KEY\`.
@@ -427,14 +433,14 @@ rename therefore breaks every reference by design.
   detect:{min_count?, spike_multiplier?, baseline_windows?, novel_groups?}}\`;
   \`monitors\` is \`{enabled?, monitor_tags?}\`. It also contributes two READ-ONLY
   grantable capabilities (\`GET /api/capabilities\`, module_id \`datadog\`) that
-  enrich a dispatch prompt with fresh context — a grant with no config inherits the
+  enrich a dispatch prompt with fresh context; a grant with no config inherits the
   module's connection settings:
-  - \`datadog.query_logs\` — a compact page of recent matching log lines. Config
+  - \`datadog.query_logs\`: a compact page of recent matching log lines. Config
     \`{query?, window_seconds?, limit?}\` (limit default 20, hard-max 50). On a
     \`datadog.logs.alert\` event the query (scoped to the tripped group) and window
     default off the payload so a bare grant Just Works; a configured \`query\` may
     use the \`{{...}}\` engine against the event.
-  - \`datadog.get_monitor\` — one monitor's definition + current group states.
+  - \`datadog.get_monitor\`: one monitor's definition + current group states.
     Config \`{monitor_id?}\`; defaults to the event subject (a monitor id) when
     unset. Renders name, query, thresholds, options, states, url.
 
@@ -451,7 +457,7 @@ rename therefore breaks every reference by design.
 - Tagging any watched work item \`smoke-test-clone-and-claude-linux\` therefore
   fires an end-to-end pipeline test (event -> rule -> lease -> agent ->
   findings -> release) with toasts on start, success, and failure. The leak
-  hunt exits non-zero — failing the dispatch loudly — if the scrubbed PAT is
+  hunt exits non-zero (failing the dispatch loudly) if the scrubbed PAT is
   discoverable in the container env, \`~/.azure\`, git remote/config, or on
   disk.
 - Treat all seeded rows as user-editable examples, not fixtures: users may
@@ -473,7 +479,7 @@ rename therefore breaks every reference by design.
   scan only catches values that match a currently STORED secret, so an
   unstored credential pasted into \`config\` would slip through. Never paste
   credentials into a notifier's \`config\` at all.
-- \`POST /api/config/import\` body \`{document, mode?, dry_run?}\` — \`mode\` is
+- \`POST /api/config/import\` body \`{document, mode?, dry_run?}\`: \`mode\` is
   \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
   \`dry_run: true\` computes the full plan with NO writes. Notifiers are matched
   by NAME idempotently (an overwrite patches in place, preserving the local
