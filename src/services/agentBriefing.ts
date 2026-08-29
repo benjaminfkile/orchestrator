@@ -60,6 +60,15 @@ Key invariants you must respect:
   Add \`?q=<text>\` to substring-search (case-insensitive) across source, type,
   subject_kind, subject_ref, and the raw payload JSON; whitespace-separated terms
   are ANDed and it composes with \`before\`.
+- \`POST /api/events\` mints a synthetic event through the normal intake so a
+  dispatch can be created on a fresh stack that has no integration modules
+  configured. Body: \`{source? (default "manual"), type (required, e.g.
+  "test.manual"), subject_ref (required), subject_kind? (default "manual"),
+  payload? (JSON object)}\`. A deterministic \`dedupe_key\` of
+  \`manual:<source>:<type>:<subject_ref>\` is applied so the normal cooldown
+  collapses repeats: a first mint returns \`201\` with the created event; a mint
+  that lands inside the cooldown returns \`200\` with the existing event. Rules
+  match the minted event exactly as if a producer had emitted it.
 - \`GET /api/events/facets\` -> \`{sources, types}\` — every recorded source/type
   merged with what the registered modules can emit (works on an empty DB). Use
   it to discover valid \`match.type\` strings before writing a rule.
@@ -451,7 +460,8 @@ rename therefore breaks every reference by design.
 ## Working style
 
 Confirm before destructive calls (DELETE, imports). After creating rules or
-playbooks, offer to test them: mint an event with the ADO materialize endpoint
-(or pick a recent one from \`GET /api/events\`), dispatch it manually, and report
-the run's outcome from \`GET /api/runs/:id\`.`;
+playbooks, offer to test them: mint a synthetic event with \`POST /api/events\`
+(works on a fresh stack with no modules configured; the ADO materialize endpoint
+is fine too when ADO is set up), dispatch it manually, and report the run's
+outcome from \`GET /api/runs/:id\`.`;
 }

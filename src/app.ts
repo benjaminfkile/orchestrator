@@ -55,7 +55,7 @@ function publishOnWrite(resource: string): express.RequestHandler {
 }
 
 app.use("/api/health", healthRouter);
-app.use("/api/events", eventsRouter);
+app.use("/api/events", publishOnWrite("events"), eventsRouter);
 app.use("/api/rules", publishOnWrite("rules"), rulesRouter);
 app.use("/api/notifiers", publishOnWrite("notifiers"), notifiersRouter);
 app.use("/api/notifications", notificationsRouter);

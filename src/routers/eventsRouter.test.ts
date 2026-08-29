@@ -7,9 +7,12 @@ import request from "supertest";
 
 import app from "../app";
 import { createDb, setDb } from "../db/db";
-import { insertEvent } from "../db/events";
+import { insertEvent, listEvents } from "../db/events";
 import { runMigrations } from "../db/migrate";
 import { ModuleRegistry } from "../modules/registry";
+import { createPlaybook } from "../db/playbooks";
+import { createRule } from "../db/rules";
+import { listDispatches } from "../db/dispatches";
 import { resetRuntime, setRuntime } from "../runtime";
 
 function tempDbFile(): string {
@@ -213,6 +216,177 @@ describe("events router", () => {
     it("400s for a non-numeric id", async () => {
       const res = await request(app).get("/api/events/abc");
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe("POST /api/events", () => {
+    it("mints an event with defaults, returns 201, and matches rules", async () => {
+      const playbook = await createPlaybook(
+        { name: "pb-manual", image: "img", ttl_seconds: 60 },
+        db
+      );
+      await createRule(
+        {
+          name: "catch-manual",
+          match: { source: "manual", type: "test.manual" },
+          dispatch: [{ playbook_id: playbook.id }],
+        },
+        db
+      );
+      let kicked = 0;
+      setRuntime({ dispatcher: { kick: () => (kicked += 1) } });
+
+      const res = await request(app).post("/api/events").send({
+        type: "test.manual",
+        subject_ref: "smoke-1",
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        source: "manual",
+        type: "test.manual",
+        subject_kind: "manual",
+        subject_ref: "smoke-1",
+        payload: {},
+        dedupe_key: "manual:manual:test.manual:smoke-1",
+      });
+      expect(typeof res.body.id).toBe("number");
+      expect(typeof res.body.ts).toBe("number");
+
+      // Full shape matches what GET /api/events returns for the same row.
+      const listed = await request(app).get("/api/events");
+      expect(listed.status).toBe(200);
+      expect(listed.body[0]).toEqual(res.body);
+
+      // Rule matched -> a queued dispatch is created and the dispatcher kicked.
+      const dispatches = await listDispatches(undefined, db);
+      expect(dispatches).toHaveLength(1);
+      expect(dispatches[0].event_id).toBe(res.body.id);
+      expect(dispatches[0].playbook_id).toBe(playbook.id);
+      expect(kicked).toBe(1);
+    });
+
+    it("honors an explicit source, subject_kind, and payload", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({
+          source: "cli",
+          type: "chaos.injected",
+          subject_kind: "region",
+          subject_ref: "us-fake-1",
+          payload: { note: "smoke" },
+        });
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        source: "cli",
+        type: "chaos.injected",
+        subject_kind: "region",
+        subject_ref: "us-fake-1",
+        payload: { note: "smoke" },
+        dedupe_key: "manual:cli:chaos.injected:us-fake-1",
+      });
+    });
+
+    it("dedupes a second mint on the same (source,type,subject_ref) triple", async () => {
+      const first = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual", subject_ref: "smoke-1" });
+      expect(first.status).toBe(201);
+
+      const second = await request(app)
+        .post("/api/events")
+        .send({
+          type: "test.manual",
+          subject_ref: "smoke-1",
+          payload: { ignored: true },
+        });
+      expect(second.status).toBe(200);
+      expect(second.body.id).toBe(first.body.id);
+      // Body reflects the ORIGINAL event: the duplicate payload was not inserted.
+      expect(second.body.payload).toEqual({});
+
+      // Exactly one row landed in the events table.
+      const rows = await listEvents({}, db);
+      expect(rows).toHaveLength(1);
+    });
+
+    it("mints separate events for different subject_refs (no cross-dedupe)", async () => {
+      const a = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual", subject_ref: "one" });
+      const b = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual", subject_ref: "two" });
+      expect(a.status).toBe(201);
+      expect(b.status).toBe(201);
+      expect(a.body.id).not.toBe(b.body.id);
+    });
+
+    it("400s when type is missing", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({ subject_ref: "smoke-1" });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: expect.any(String) });
+    });
+
+    it("400s when subject_ref is missing", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual" });
+      expect(res.status).toBe(400);
+    });
+
+    it("400s when type is an empty string", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({ type: "", subject_ref: "smoke-1" });
+      expect(res.status).toBe(400);
+    });
+
+    it("400s when subject_ref is not a string", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual", subject_ref: 42 });
+      expect(res.status).toBe(400);
+    });
+
+    it("400s when payload is not an object", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({
+          type: "test.manual",
+          subject_ref: "smoke-1",
+          payload: "not an object",
+        });
+      expect(res.status).toBe(400);
+    });
+
+    it("400s on an unknown body key", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .send({
+          type: "test.manual",
+          subject_ref: "smoke-1",
+          dedupe_key: "attacker:supplied",
+        });
+      expect(res.status).toBe(400);
+    });
+
+    it("400s on a non-object body", async () => {
+      const res = await request(app)
+        .post("/api/events")
+        .set("Content-Type", "application/json")
+        .send('"nope"');
+      expect(res.status).toBe(400);
+    });
+
+    it("succeeds even when no dispatcher is wired (kick is a no-op)", async () => {
+      // resetRuntime already ran in beforeEach: no dispatcher present.
+      const res = await request(app)
+        .post("/api/events")
+        .send({ type: "test.manual", subject_ref: "smoke-1" });
+      expect(res.status).toBe(201);
     });
   });
 });
