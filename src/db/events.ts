@@ -143,6 +143,25 @@ export async function getEventById(
   return row ? fromRow(row) : undefined;
 }
 
+/**
+ * Return the most recent un-cleared event sharing `dedupe_key`, or `undefined`
+ * if none exists. Used by the manual-mint endpoint to surface the existing row
+ * a cooldown suppression collapsed into (the same row {@link emitEvent}'s
+ * dedupe lookup consulted).
+ */
+export async function getLatestUnclearedEventByDedupeKey(
+  dedupe_key: string,
+  db: Knex = getDb()
+): Promise<EventRecord | undefined> {
+  const row = await db<EventRow>("events")
+    .where({ dedupe_key })
+    .whereNull("cleared_at")
+    .orderBy("ts", "desc")
+    .orderBy("id", "desc")
+    .first();
+  return row ? fromRow(row) : undefined;
+}
+
 /** The distinct facet values currently present in the events table. */
 export interface EventFacets {
   /** Every distinct `source`, ascending. */
