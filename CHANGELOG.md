@@ -28,6 +28,13 @@ owns the lease lifecycle, never the agent inside it.
 - `dispatches`, `runs`, and `findings` tables with an atomic FIFO claim.
 - Config loader (validated environment), structured logger, and per-dispatch log
   files under the OS user-data directory.
+- Single `ORCH_DATA_DIR` base for all on-disk state: the SQLite DB file, the
+  per-dispatch log directory, and the encrypted secret store all resolve
+  against it, so a launcher that sets `ORCH_DATA_DIR` keeps every piece of
+  state in one folder. Used verbatim (no `orchestrator` subdirectory is
+  appended); unset falls back to the OS user-data dir with an `orchestrator`
+  subdirectory. `ORCH_DB_PATH` still overrides ONLY the DB file. The resolved
+  paths are logged once at boot as `{dbPath, logsDir, secretsDir}`.
 
 #### Wisper client
 

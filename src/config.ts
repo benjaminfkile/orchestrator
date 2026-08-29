@@ -69,11 +69,23 @@ export class ConfigError extends Error {
 }
 
 /**
- * The OS user-data directory for orchestrator's private files
- * (<user-data base>/orchestrator). Kept here so both the DB path and the
- * per-dispatch log directory resolve against the same base.
+ * The single directory orchestrator keeps its private state under: the SQLite
+ * database file, the per-dispatch log directory, and the encrypted secret
+ * store all resolve against it, so a launcher that sets ORCH_DATA_DIR keeps
+ * every piece of state in one folder.
+ *
+ * Precedence: an explicit ORCH_DATA_DIR wins verbatim (used as-is, no
+ * "orchestrator" suffix is appended); otherwise the OS user-data base is used
+ * with an "orchestrator" subdirectory (%APPDATA%\orchestrator on Windows,
+ * ~/Library/Application Support/orchestrator on macOS, $XDG_DATA_HOME (or
+ * ~/.local/share)/orchestrator elsewhere). ORCH_DB_PATH still overrides just
+ * the DB file path.
  */
 export function userDataDir(): string {
+  const override = process.env.ORCH_DATA_DIR?.trim();
+  if (override) {
+    return override;
+  }
   const home = os.homedir();
   let base: string;
   switch (process.platform) {

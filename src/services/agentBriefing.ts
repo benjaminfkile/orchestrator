@@ -357,6 +357,13 @@ rename therefore breaks every reference by design.
   or a loopback host (\`localhost\`/\`127.0.0.1\`/\`::1\`) for local dev. Set
   \`WISPER_ALLOW_INSECURE_HTTP=1\` (or \`true\`) to downgrade the refusal to a loud
   warning when terminating TLS yourself.
+- On-disk state layout (boot env \`ORCH_DATA_DIR\` / \`ORCH_DB_PATH\`): the SQLite
+  DB, per-dispatch log files, and the encrypted secret store all live under a
+  single base directory. \`ORCH_DATA_DIR\` (verbatim, no \`orchestrator\` suffix
+  appended) redirects all three; \`ORCH_DB_PATH\` still overrides ONLY the DB
+  file. When neither is set the base defaults to \`<OS user-data
+  dir>/orchestrator\`. The resolved paths are logged once at startup as
+  \`{dbPath, logsDir, secretsDir}\`.
 
 ## Modules (integration producers)
 

@@ -1,4 +1,6 @@
-import { ConfigError, loadConfig } from "./config";
+import path from "path";
+
+import { ConfigError, loadConfig, userDataDir } from "./config";
 
 describe("loadConfig", () => {
   it("applies defaults when the environment is empty", () => {
@@ -165,5 +167,30 @@ describe("loadConfig", () => {
           .wisperBaseUrl
       ).toBe("https://wisper.example:9000");
     });
+  });
+});
+
+describe("userDataDir", () => {
+  const original = process.env.ORCH_DATA_DIR;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.ORCH_DATA_DIR;
+    else process.env.ORCH_DATA_DIR = original;
+  });
+
+  it("returns ORCH_DATA_DIR verbatim when set (no orchestrator suffix)", () => {
+    process.env.ORCH_DATA_DIR = path.join("/tmp", "orch-state");
+    expect(userDataDir()).toBe(path.join("/tmp", "orch-state"));
+  });
+
+  it("treats a blank ORCH_DATA_DIR as unset", () => {
+    process.env.ORCH_DATA_DIR = "   ";
+    expect(userDataDir().endsWith(path.sep + "orchestrator")).toBe(true);
+  });
+
+  it("falls back to an OS user-data path with an orchestrator subdir when unset", () => {
+    delete process.env.ORCH_DATA_DIR;
+    const resolved = userDataDir();
+    expect(resolved.endsWith(path.sep + "orchestrator")).toBe(true);
   });
 });

@@ -2,7 +2,8 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import app from "./src/app";
-import { getConfig } from "./src/config";
+import { getConfig, userDataDir } from "./src/config";
+import { resolveDbPath } from "./src/db/db";
 import { getModuleConfig } from "./src/db/moduleConfig";
 import { runMigrations } from "./src/db/migrate";
 import { createSecretEnvResolver } from "./src/executor/envResolver";
@@ -20,6 +21,7 @@ import { ModuleRegistry } from "./src/modules/registry";
 import { setRuntime } from "./src/runtime";
 import { getSecret, initSecrets } from "./src/secrets";
 import { Dispatcher } from "./src/services/dispatcher";
+import { dispatchLogDir } from "./src/services/dispatchLog";
 import { pruneRunRetention } from "./src/services/runRetention";
 import { TriggerScheduler } from "./src/services/triggerScheduler";
 import { wisperClientFromConfig } from "./src/wisper/client";
@@ -28,6 +30,15 @@ async function main() {
   // Parse and validate configuration first; a malformed value fails fast here
   // with a clear message rather than surfacing as a confusing runtime error.
   const config = getConfig();
+
+  // Log the resolved on-disk paths up front so an operator can see where the
+  // DB file, per-dispatch logs, and secret store landed (an ORCH_DATA_DIR
+  // override moves all three; ORCH_DB_PATH only moves the DB file).
+  log.info("orchestrator data paths", {
+    dbPath: resolveDbPath(),
+    logsDir: dispatchLogDir(),
+    secretsDir: userDataDir(),
+  });
 
   // Resolve the master key and load the encrypted secret store. Doing this at
   // boot surfaces a misconfigured key source (no keychain and no

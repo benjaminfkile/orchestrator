@@ -1,36 +1,28 @@
 import fs from "fs";
-import os from "os";
 import path from "path";
 
 import knex, { Knex } from "knex";
 
+import { userDataDir } from "../config";
 import { migrationSource } from "./migrations";
 
 /**
- * Default on-disk location for the SQLite database when ORCH_DB_PATH is unset:
- * <OS user-data dir>/orchestrator/orchestrator.sqlite.
+ * Resolve the database file path.
+ *
+ * Precedence:
+ * 1. ORCH_DB_PATH (verbatim) when set, so a launcher can still redirect just
+ *    the DB file.
+ * 2. Otherwise `<userDataDir()>/orchestrator.sqlite`. The base is ORCH_DATA_DIR
+ *    when set, else the OS user-data dir with an "orchestrator" subdirectory
+ *    (see {@link userDataDir}), so a launcher setting ORCH_DATA_DIR keeps the
+ *    DB, per-dispatch logs, and the secret store all under one folder.
  */
-function defaultDbPath(): string {
-  const home = os.homedir();
-  let base: string;
-  switch (process.platform) {
-    case "win32":
-      base = process.env.APPDATA ?? path.join(home, "AppData", "Roaming");
-      break;
-    case "darwin":
-      base = path.join(home, "Library", "Application Support");
-      break;
-    default:
-      base = process.env.XDG_DATA_HOME ?? path.join(home, ".local", "share");
-      break;
-  }
-  return path.join(base, "orchestrator", "orchestrator.sqlite");
-}
-
-/** Resolve the database file path: ORCH_DB_PATH when set, else the default. */
 export function resolveDbPath(): string {
   const fromEnv = process.env.ORCH_DB_PATH?.trim();
-  return fromEnv ? fromEnv : defaultDbPath();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  return path.join(userDataDir(), "orchestrator.sqlite");
 }
 
 /** Build a knex instance bound to `filename`, creating parent dirs as needed. */
