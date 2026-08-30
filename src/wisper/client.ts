@@ -34,6 +34,47 @@ export interface WisperResources {
   pids?: number;
 }
 
+/**
+ * A file staged into a lease at create time. `path` is an absolute unix-style
+ * path (starts with `/`, no `..` segment, no backslash, at most 256 chars,
+ * unique per request), and `content_base64` is the file's raw bytes, base64
+ * encoded. Files are written into the container AFTER start and BEFORE
+ * `userdata` runs, so userdata (and every exec after it) can read them.
+ *
+ * Per the wisper contract, a create request may carry AT MOST
+ * {@link MAX_FILES_PER_LEASE} files whose DECODED sizes sum to at most
+ * {@link MAX_FILES_TOTAL_BYTES}. On a windows lease the same unix-style paths
+ * are mapped onto the container filesystem the same way exec working
+ * directories already resolve. The `files` map is NEVER logged: file contents
+ * may be sensitive (e.g. the fully rendered prompt).
+ */
+export interface LeaseFileSpec {
+  path: string;
+  content_base64: string;
+}
+
+/**
+ * Maximum number of {@link LeaseFileSpec} entries a single create request may
+ * carry. The wisper server enforces the same cap; this client-side constant
+ * fails a request over the cap BEFORE it is sent, with a typed
+ * {@link WisperApiError} whose code is `validation_error`.
+ */
+export const MAX_FILES_PER_LEASE = 16;
+
+/**
+ * Maximum SUMMED DECODED size (bytes) of every {@link LeaseFileSpec} on a
+ * single create request. The wisper server enforces the same cap; this
+ * client-side constant fails a request over the cap BEFORE it is sent, with a
+ * typed {@link WisperApiError} whose code is `validation_error`.
+ */
+export const MAX_FILES_TOTAL_BYTES = 1024 * 1024;
+
+/**
+ * Maximum length of a single {@link LeaseFileSpec} `path` field. Matches the
+ * wisper server-side cap; a longer path fails locally as `validation_error`.
+ */
+export const MAX_FILE_PATH_CHARS = 256;
+
 /** Arguments for {@link WisperClient.createLease}. */
 export interface CreateLeaseParams {
   image: string;
@@ -69,6 +110,15 @@ export interface CreateLeaseParams {
    * echoed into an error message by this client.
    */
   env?: Record<string, string>;
+  /**
+   * Optional files staged into the container AFTER start and BEFORE `userdata`
+   * runs (so userdata and every exec after it can read them). See
+   * {@link LeaseFileSpec} for shape and caps; the client validates the caps
+   * and path shapes BEFORE sending; an oversize/malformed entry throws a
+   * terminal {@link WisperApiError} with code `validation_error` instead of
+   * being sent to the server. The list and its contents are NEVER logged.
+   */
+  files?: LeaseFileSpec[];
   /**
    * Timeout in ms for this call. Defaults to
    * {@link DEFAULT_CREATE_LEASE_TIMEOUT_MS} — the longest per-operation default,
@@ -338,6 +388,101 @@ export interface WisperClientOptions {
 interface RawResponse {
   status: number;
   body: string;
+}
+
+/**
+ * Build a terminal, non-retryable {@link WisperApiError} for a client-side
+ * `validation_error`: a request the client refuses to send because it would
+ * be rejected by the server anyway (an oversize/malformed
+ * {@link LeaseFileSpec} entry). The message describes the offense; the file
+ * path is included when relevant but a file's CONTENT is never surfaced.
+ */
+function localValidationError(message: string): WisperApiError {
+  return new WisperApiError({
+    code: "validation_error",
+    httpStatus: 0,
+    message,
+    requestId: "",
+    retryable: false,
+  });
+}
+
+/**
+ * Validate a {@link CreateLeaseParams.files} array against the wisper contract
+ * BEFORE any request is sent. Throws a terminal {@link WisperApiError} with
+ * code `validation_error` on the first offense. Checks:
+ *   - at most {@link MAX_FILES_PER_LEASE} entries;
+ *   - each `path` is an absolute unix-style path (starts with `/`), has no
+ *     `..` segment, no backslash, and at most {@link MAX_FILE_PATH_CHARS}
+ *     chars;
+ *   - `path` values are unique across the array;
+ *   - `content_base64` is valid, canonical base64;
+ *   - decoded sizes sum to at most {@link MAX_FILES_TOTAL_BYTES}.
+ * File contents are never surfaced in the error message.
+ */
+export function validateLeaseFiles(files: readonly LeaseFileSpec[]): void {
+  if (files.length > MAX_FILES_PER_LEASE) {
+    throw localValidationError(
+      `lease files: ${files.length} entries exceed the ${MAX_FILES_PER_LEASE}-file cap`
+    );
+  }
+  const seen = new Set<string>();
+  let totalDecodedBytes = 0;
+  for (const file of files) {
+    const path = file.path;
+    if (typeof path !== "string" || path.length === 0) {
+      throw localValidationError(
+        "lease files: entry has a missing or empty path"
+      );
+    }
+    if (path.length > MAX_FILE_PATH_CHARS) {
+      throw localValidationError(
+        `lease files: path exceeds ${MAX_FILE_PATH_CHARS} chars: ${path.slice(0, 32)}...`
+      );
+    }
+    if (!path.startsWith("/")) {
+      throw localValidationError(
+        `lease files: path is not absolute unix-style (must start with "/"): ${path}`
+      );
+    }
+    if (path.includes("\\")) {
+      throw localValidationError(
+        `lease files: path contains a backslash (unix-style paths only): ${path}`
+      );
+    }
+    if (path.split("/").some((segment) => segment === "..")) {
+      throw localValidationError(
+        `lease files: path contains a ".." segment: ${path}`
+      );
+    }
+    if (seen.has(path)) {
+      throw localValidationError(
+        `lease files: duplicate path in the same request: ${path}`
+      );
+    }
+    seen.add(path);
+    const b64 = file.content_base64;
+    if (typeof b64 !== "string") {
+      throw localValidationError(
+        `lease files: content_base64 is not a string for path ${path}`
+      );
+    }
+    // Node's Buffer.from(_, "base64") is permissive (it silently drops invalid
+    // characters), so round-trip and compare canonical forms: a discrepancy
+    // means the input was not valid, canonical base64.
+    const decoded = Buffer.from(b64, "base64");
+    if (decoded.toString("base64") !== b64) {
+      throw localValidationError(
+        `lease files: invalid base64 for path ${path}`
+      );
+    }
+    totalDecodedBytes += decoded.length;
+    if (totalDecodedBytes > MAX_FILES_TOTAL_BYTES) {
+      throw localValidationError(
+        `lease files: total decoded bytes ${totalDecodedBytes} exceed the ${MAX_FILES_TOTAL_BYTES}-byte cap`
+      );
+    }
+  }
 }
 
 /**
@@ -1067,11 +1212,30 @@ export class WisperClient {
    *   an abort via `params.signal`.
    */
   async createLease(params: CreateLeaseParams): Promise<Lease> {
-    const { image, network, resources, ttl_seconds, userdata, env, isolation, signal } =
-      params;
+    const {
+      image,
+      network,
+      resources,
+      ttl_seconds,
+      userdata,
+      env,
+      files,
+      isolation,
+      signal,
+    } = params;
     const v1 = this.mode === "v1";
 
-    // Deliberately omit `env` — its keys and values are secret.
+    // Validate the `files` array against the wisper contract BEFORE any
+    // request is sent. A local violation throws a terminal validation error
+    // (never retried) so an oversize or malformed entry fails the dispatch
+    // just like a missing secret: the same loud, pre-lease semantics.
+    if (files !== undefined) {
+      validateLeaseFiles(files);
+    }
+
+    // Deliberately omit `env` and `files`: env values are secret, and file
+    // contents may be sensitive (e.g. the fully rendered prompt). Only the
+    // presence of each is logged, plus the file COUNT.
     this.logger.debug("wisper: creating lease", {
       mode: this.mode,
       image,
@@ -1079,6 +1243,7 @@ export class WisperClient {
       ttl_seconds,
       isolation: isolation ?? null,
       hasEnv: env !== undefined && Object.keys(env).length > 0,
+      fileCount: files?.length ?? 0,
     });
 
     // The effective host selector: an explicit per-playbook `host`, else the
@@ -1113,6 +1278,9 @@ export class WisperClient {
         env,
         // Omit when unset so the server applies its own default ("shared").
         ...(isolation !== undefined ? { isolation } : {}),
+        // Omit when unset so the request stays byte-for-byte identical for
+        // callers that do not stage any files.
+        ...(files !== undefined ? { files } : {}),
       };
     } else {
       body = {
@@ -1129,6 +1297,9 @@ export class WisperClient {
         env,
         // Omit when unset so the server applies its own default ("shared").
         ...(isolation !== undefined ? { isolation } : {}),
+        // Omit when unset so the dev-mode body stays byte-for-byte identical
+        // for callers that do not stage any files.
+        ...(files !== undefined ? { files } : {}),
       };
     }
 
@@ -1193,6 +1364,87 @@ export class WisperClient {
       throw this.mapError(res.status, res.body);
     }
     this.logger.debug("wisper: lease released", { leaseId });
+  }
+
+  /**
+   * Download the raw bytes of a single file from a live lease:
+   * `GET {base}/dev/leases/{leaseId}/files?path={path}` in dev mode, or
+   * `GET {base}/v1/leases/{leaseId}/files?path={path}` in v1 mode. Success is
+   * HTTP 200 with an `application/octet-stream` body; the returned {@link Buffer}
+   * holds the file's bytes.
+   *
+   * The `path` MUST be an absolute unix-style path (starts with `/`, no `..`
+   * segment, no backslash). A malformed shape is refused BEFORE any request is
+   * sent, with a typed {@link WisperApiError} whose code is `validation_error`
+   * (the same shape a server-side rejection would surface). Errors from the
+   * server are surfaced as {@link WisperApiError}s: `not_found` (no such file,
+   * or the path is a directory/symlink), `lease_not_ready` (409, the lease is
+   * not active), `file_too_large` (413, the file exceeds the download cap),
+   * `validation_error` (400), and the usual retryable
+   * `host_offline`/`upstream_timeout` codes.
+   *
+   * @throws {@link WisperApiError} on any non-2xx response, a client timeout, or
+   *   an abort via `opts.signal`.
+   */
+  async downloadLeaseFile(
+    leaseId: string,
+    path: string,
+    opts: { timeoutMs?: number; signal?: AbortSignal } = {}
+  ): Promise<Buffer> {
+    if (typeof path !== "string" || path.length === 0) {
+      throw localValidationError(
+        "downloadLeaseFile: path is missing or empty"
+      );
+    }
+    if (!path.startsWith("/")) {
+      throw localValidationError(
+        `downloadLeaseFile: path is not absolute unix-style (must start with "/"): ${path}`
+      );
+    }
+    if (path.includes("\\")) {
+      throw localValidationError(
+        `downloadLeaseFile: path contains a backslash (unix-style paths only): ${path}`
+      );
+    }
+    if (path.split("/").some((segment) => segment === "..")) {
+      throw localValidationError(
+        `downloadLeaseFile: path contains a ".." segment: ${path}`
+      );
+    }
+
+    this.logger.debug("wisper: downloading lease file", { leaseId, path });
+
+    const v1 = this.mode === "v1";
+    const basePath = v1
+      ? `/v1/leases/${encodeURIComponent(leaseId)}/files`
+      : `/dev/leases/${encodeURIComponent(leaseId)}/files`;
+    const url = `${basePath}?path=${encodeURIComponent(path)}`;
+    const timeoutMs = this.resolveTimeout(opts.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS);
+
+    return sendRequest<Buffer>(
+      {
+        fullUrl: joinUrl(this.baseUrl, url),
+        method: "GET",
+        accept: "application/octet-stream",
+        authorization: this.authorization(),
+        timeoutMs,
+        signal: opts.signal,
+      },
+      (res, settle) => {
+        const status = res.statusCode ?? 0;
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const body = Buffer.concat(chunks);
+          if (status !== 200) {
+            settle.reject(this.mapError(status, body.toString("utf8")));
+            return;
+          }
+          settle.resolve(body);
+        });
+        res.on("error", (err) => settle.reject(err));
+      }
+    );
   }
 
   /**

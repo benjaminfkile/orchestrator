@@ -54,7 +54,17 @@ owns the lease lifecycle, never the agent inside it.
 
 #### Wisper client
 
-- `createLease` + `releaseLease` with typed errors.
+- `createLease` + `releaseLease` with typed errors. `createLease` accepts an
+  optional `files` array (a list of `{path, content_base64}` staged into the
+  container after start and before `userdata` runs) validated locally against
+  the wisper contract's caps (at most 16 files, 1 MiB total decoded bytes,
+  absolute unix-style path, no `..` segment, no backslash, at most 256 chars,
+  unique per request, valid base64) before any request is sent; a cap
+  violation is a terminal `validation_error` and never reaches the network.
+  A companion `downloadLeaseFile(leaseId, path)` helper fetches a single
+  staged file's raw bytes back from a live lease over the same auth path
+  (`GET /dev/leases/:id/files?path=...` in dev, `GET /v1/leases/:id/files`
+  with the bearer token in v1).
 - Synchronous exec (`execSync`) and streaming exec (`execStream`, SSE) with robust
   frame parsing.
 - Shared fetch wrapper with `AbortController` and per-operation timeouts.
@@ -91,9 +101,14 @@ owns the lease lifecycle, never the agent inside it.
 - Runner seam (`src/runners/`): a playbook names its `runner` (`claude-code`,
   the default, or `script`, which runs a rendered `runner_config.command_template`
   as the agent step with no LLM) and carries an opaque `runner_config`;
-  `GET /api/runners` lists the ids. The claude-code runner delivers the prompt
-  as an argv argument on linux and via the `ORCH_AGENT_PROMPT` lease env var on
-  windows leases (prompts over 30000 chars fail a windows dispatch).
+  `GET /api/runners` lists the ids. The claude-code runner stages the fully
+  rendered prompt into the lease as a file at `/work/prompt.txt` on
+  createLease (via the wisper contract's `files` array) and reads it into
+  `claude` on STDIN (`sh -c 'claude -p ... < /work/prompt.txt'` on linux and
+  `cmd /c type C:\work\prompt.txt | claude -p ...` on windows), so no
+  rendered prompt content ever appears in any exec command. A rendered prompt
+  over the wisper file budget (1 MiB total) fails the dispatch with a clear
+  validation error before any lease is created.
 - Snippets: reusable `prompt` / `userdata` / `step` template fragments
   (`snippets` table, `/api/snippets`) resolved at dispatch time; a missing or
   kind-mismatched reference fails the dispatch before leasing.

@@ -3,9 +3,14 @@ import type { AddressInfo } from "net";
 
 import { createLogger, type Logger } from "../log";
 import {
+  MAX_FILES_PER_LEASE,
+  MAX_FILES_TOTAL_BYTES,
+  MAX_FILE_PATH_CHARS,
   WisperApiError,
   WisperClient,
+  validateLeaseFiles,
   wisperClientFromConfig,
+  type LeaseFileSpec,
   type StreamChunk,
 } from "./client";
 import { ConfigError, loadConfig } from "../config";
@@ -1346,6 +1351,281 @@ describe("WisperClient", () => {
       } finally {
         await stream.stop();
       }
+    });
+  });
+
+  describe("createLease files", () => {
+    it("dev mode forwards the files array verbatim in the request body", async () => {
+      mock.respondWith({
+        status: 201,
+        body: { leaseId: "lease-f", wispContractId: "wisp-f", status: "ready" },
+      });
+
+      const files: LeaseFileSpec[] = [
+        { path: "/work/prompt.txt", content_base64: Buffer.from("hi").toString("base64") },
+        { path: "/work/data.bin", content_base64: Buffer.from([0, 1, 2, 3]).toString("base64") },
+      ];
+      await client().createLease({ ...createParams(), files });
+
+      const sent = JSON.parse(mock.requests[0].body);
+      expect(sent.files).toEqual(files);
+    });
+
+    it("v1 mode forwards the files array verbatim alongside the resolved catalog ids", async () => {
+      mock.respondWith({
+        status: 201,
+        body: { id: "lease-v1", wisp_contract_id: "wisp-v1", status: "ready" },
+      });
+      const API_KEY = "wck_live_secretkey123";
+      const echo = {
+        resolve: async (h: string, i: string) => ({ host_id: h, host_image_id: i }),
+      };
+      const c = new WisperClient({
+        baseUrl: mock.baseUrl,
+        hostId: "host-1",
+        mode: "v1",
+        resolveApiKey: () => API_KEY,
+        catalog: echo,
+        timeoutMs: 2000,
+      });
+      const files: LeaseFileSpec[] = [
+        { path: "/work/prompt.txt", content_base64: Buffer.from("hello").toString("base64") },
+      ];
+
+      await c.createLease({ ...createParams(), files });
+
+      const sent = JSON.parse(mock.requests[0].body);
+      expect(sent.files).toEqual(files);
+    });
+
+    it("omits files from the body entirely when the caller does not supply it", async () => {
+      mock.respondWith({
+        status: 201,
+        body: { leaseId: "lease-1", wispContractId: "wisp-1", status: "ready" },
+      });
+      await client().createLease(createParams());
+      expect(JSON.parse(mock.requests[0].body)).not.toHaveProperty("files");
+    });
+
+    it("NEVER logs file content or paths, only the file count", async () => {
+      mock.respondWith({
+        status: 201,
+        body: { leaseId: "lease-f", wispContractId: "wisp-f", status: "ready" },
+      });
+      const { logger, lines } = capturingLogger();
+      const secret = "topsecret-file-content-abc";
+      const files: LeaseFileSpec[] = [
+        { path: "/work/prompt.txt", content_base64: Buffer.from(secret).toString("base64") },
+      ];
+
+      await client(logger).createLease({ ...createParams(), files });
+
+      const joined = lines.join("\n");
+      expect(joined).not.toContain(secret);
+      expect(joined).not.toContain(Buffer.from(secret).toString("base64"));
+      expect(joined).not.toContain("/work/prompt.txt");
+      // The count IS observable so an operator can see files were staged.
+      expect(joined).toMatch(/fileCount"?\s*:\s*1/);
+    });
+
+    it("rejects with a terminal validation_error BEFORE sending when a file cap is exceeded", async () => {
+      // Overshoots MAX_FILES_TOTAL_BYTES by one byte.
+      const oversize = "x".repeat(MAX_FILES_TOTAL_BYTES + 1);
+      const files: LeaseFileSpec[] = [
+        { path: "/work/prompt.txt", content_base64: Buffer.from(oversize).toString("base64") },
+      ];
+
+      const err = await client().createLease({ ...createParams(), files }).catch((e) => e);
+
+      expect(err).toBeInstanceOf(WisperApiError);
+      expect(err.code).toBe("validation_error");
+      expect(err.retryable).toBe(false);
+      // No request was sent; the client refused it locally.
+      expect(mock.requests).toHaveLength(0);
+    });
+
+    it.each([
+      [
+        "count",
+        Array.from({ length: MAX_FILES_PER_LEASE + 1 }, (_, i) => ({
+          path: `/work/f${i}`,
+          content_base64: "",
+        })),
+      ],
+      [
+        "not absolute",
+        [{ path: "work/prompt.txt", content_base64: "" }],
+      ],
+      [
+        "backslash",
+        [{ path: "/work\\prompt.txt", content_base64: "" }],
+      ],
+      [
+        "dotdot segment",
+        [{ path: "/work/../etc/passwd", content_base64: "" }],
+      ],
+      [
+        "path too long",
+        [{ path: `/${"a".repeat(MAX_FILE_PATH_CHARS)}`, content_base64: "" }],
+      ],
+      [
+        "duplicate path",
+        [
+          { path: "/work/prompt.txt", content_base64: "" },
+          { path: "/work/prompt.txt", content_base64: "" },
+        ],
+      ],
+      [
+        "invalid base64",
+        [{ path: "/work/prompt.txt", content_base64: "not@@base64!!" }],
+      ],
+    ] as const)("validateLeaseFiles rejects: %s", (_label, files) => {
+      expect(() => validateLeaseFiles(files as LeaseFileSpec[])).toThrow(
+        WisperApiError
+      );
+      try {
+        validateLeaseFiles(files as LeaseFileSpec[]);
+        fail("expected throw");
+      } catch (err) {
+        expect((err as WisperApiError).code).toBe("validation_error");
+        expect((err as WisperApiError).retryable).toBe(false);
+      }
+    });
+
+    it("validateLeaseFiles accepts an empty array and a single small valid entry", () => {
+      expect(() => validateLeaseFiles([])).not.toThrow();
+      expect(() =>
+        validateLeaseFiles([
+          { path: "/work/prompt.txt", content_base64: Buffer.from("hi").toString("base64") },
+        ])
+      ).not.toThrow();
+    });
+
+    it("validateLeaseFiles accepts a payload right AT the 1 MiB cap", () => {
+      const atCap = "x".repeat(MAX_FILES_TOTAL_BYTES);
+      expect(() =>
+        validateLeaseFiles([
+          { path: "/work/prompt.txt", content_base64: Buffer.from(atCap).toString("base64") },
+        ])
+      ).not.toThrow();
+    });
+  });
+
+  describe("downloadLeaseFile", () => {
+    it("dev mode issues GET /dev/leases/:id/files?path=... and returns the raw bytes on 200", async () => {
+      const payload = Buffer.from("hello world");
+      mock.respondWith({ status: 200, body: payload.toString("utf8") });
+
+      const bytes = await client().downloadLeaseFile("lease-42", "/work/prompt.txt");
+
+      expect(bytes.toString("utf8")).toBe("hello world");
+      expect(mock.requests[0].method).toBe("GET");
+      expect(mock.requests[0].url).toBe(
+        "/dev/leases/lease-42/files?path=%2Fwork%2Fprompt.txt"
+      );
+      expect(mock.requests[0].headers.accept).toBe("application/octet-stream");
+    });
+
+    it("v1 mode issues GET /v1/leases/:id/files with the bearer token", async () => {
+      const API_KEY = "wck_live_secretkey123";
+      mock.respondWith({ status: 200, body: "content-bytes" });
+      const c = new WisperClient({
+        baseUrl: mock.baseUrl,
+        hostId: "host-1",
+        mode: "v1",
+        resolveApiKey: () => API_KEY,
+        catalog: {
+          resolve: async (h: string, i: string) => ({ host_id: h, host_image_id: i }),
+        },
+        timeoutMs: 2000,
+      });
+
+      const bytes = await c.downloadLeaseFile("lease-v1", "/work/prompt.txt");
+
+      expect(bytes.toString("utf8")).toBe("content-bytes");
+      expect(mock.requests[0].url).toBe(
+        "/v1/leases/lease-v1/files?path=%2Fwork%2Fprompt.txt"
+      );
+      expect(mock.requests[0].headers.authorization).toBe(`Bearer ${API_KEY}`);
+    });
+
+    it("maps HTTP 404 not_found to a typed WisperApiError", async () => {
+      mock.respondWith({
+        status: 404,
+        body: {
+          error: { code: "not_found", message: "no such file", request_id: "r-nf" },
+        },
+      });
+
+      const err = await client()
+        .downloadLeaseFile("lease-1", "/work/gone.txt")
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(WisperApiError);
+      expect(err.code).toBe("not_found");
+      expect(err.httpStatus).toBe(404);
+      expect(err.retryable).toBe(false);
+    });
+
+    it("maps HTTP 409 lease_not_ready to a typed WisperApiError", async () => {
+      mock.respondWith({
+        status: 409,
+        body: {
+          error: { code: "lease_not_ready", message: "not active", request_id: "r-9" },
+        },
+      });
+
+      const err = await client()
+        .downloadLeaseFile("lease-1", "/work/f.txt")
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(WisperApiError);
+      expect(err.code).toBe("lease_not_ready");
+      expect(err.httpStatus).toBe(409);
+      expect(err.retryable).toBe(false);
+    });
+
+    it("maps HTTP 413 file_too_large to a typed WisperApiError", async () => {
+      mock.respondWith({
+        status: 413,
+        body: {
+          error: { code: "file_too_large", message: "over cap", request_id: "r-13" },
+        },
+      });
+
+      const err = await client()
+        .downloadLeaseFile("lease-1", "/work/big.bin")
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(WisperApiError);
+      expect(err.code).toBe("file_too_large");
+      expect(err.httpStatus).toBe(413);
+      expect(err.retryable).toBe(false);
+    });
+
+    it.each([
+      ["missing", ""],
+      ["relative", "relative/path"],
+      ["backslash", "/work\\prompt.txt"],
+      ["dotdot", "/work/../etc/passwd"],
+    ] as const)("refuses a malformed path locally (%s) with validation_error before sending", async (_label, path) => {
+      const err = await client()
+        .downloadLeaseFile("lease-1", path)
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(WisperApiError);
+      expect(err.code).toBe("validation_error");
+      expect(err.retryable).toBe(false);
+      // No request was ever sent.
+      expect(mock.requests).toHaveLength(0);
+    });
+
+    it("url-encodes the leaseId in the path", async () => {
+      mock.respondWith({ status: 200, body: "x" });
+      await client().downloadLeaseFile("lease/weird id", "/work/prompt.txt");
+      expect(mock.requests[0].url).toBe(
+        "/dev/leases/lease%2Fweird%20id/files?path=%2Fwork%2Fprompt.txt"
+      );
     });
   });
 

@@ -59,7 +59,12 @@ import { log, type Logger } from "../log";
 import type { ModuleRegistry } from "../modules/registry";
 import { getRuntime } from "../runtime";
 import { openDispatchLog, type DispatchLog } from "../services/dispatchLog";
-import { WisperApiError, type WisperClient } from "../wisper/client";
+import {
+  MAX_FILES_TOTAL_BYTES,
+  WisperApiError,
+  type LeaseFileSpec,
+  type WisperClient,
+} from "../wisper/client";
 
 import { getSnippetByName } from "../db/snippets";
 import type { SnippetKind } from "../interfaces";
@@ -1002,32 +1007,44 @@ export async function runDispatch(
       env: leaseInjectableEnv,
     });
 
-    // A runner may deliver the prompt through the lease environment (the windows
-    // command shape does; see the runner), where a single variable is capped at
-    // 32767 chars. A prompt past the runner's headroom bound would be silently
-    // truncated by the OS into a corrupt prompt, so it must fail the dispatch
-    // instead — but only on a windows lease, whose OS family is not known until
-    // createLease returns. So the oversized prompt is kept OUT of the lease env
-    // here (nothing would ever read it), and the dispatch is failed once the
-    // lease's OS is known, below. A runner without a bound never fails this way.
-    const promptTooLargeForWindows =
-      runner.maxWindowsPromptChars !== undefined &&
-      prompt.length > runner.maxWindowsPromptChars;
+    // Prompt-driven runners (the `claude-code` runner) stage the fully
+    // rendered prompt into the lease as a file at create time (the wisper
+    // contract's `files` array), and the built agent command reads it on
+    // stdin. No rendered prompt content ever appears in any exec command, so
+    // neither the windows argv/env caps nor the cmd 8191-char ceiling ever
+    // come into play regardless of prompt length. A runner without a
+    // `promptFilePath` (the `script` runner) stages no prompt file.
+    //
+    // The wisper contract caps the summed decoded byte size of every staged
+    // file at 1 MiB (MAX_FILES_TOTAL_BYTES). The rendered prompt is the only
+    // file the executor stages today, so an oversize prompt fails the
+    // dispatch HERE, BEFORE any lease is created, exactly like a missing
+    // secret. A larger overall budget will only ever add files (never
+    // subtract the prompt's own headroom), so this bound is tight enough.
+    const leaseFiles: LeaseFileSpec[] = [];
+    if (runner.promptFilePath) {
+      const promptBytes = Buffer.byteLength(prompt, "utf8");
+      if (promptBytes > MAX_FILES_TOTAL_BYTES) {
+        throw new Error(
+          `rendered prompt is ${promptBytes} bytes, exceeds the ${MAX_FILES_TOTAL_BYTES}-byte lease file budget`
+        );
+      }
+      leaseFiles.push({
+        path: runner.promptFilePath,
+        content_base64: Buffer.from(prompt, "utf8").toString("base64"),
+      });
+    }
 
     // The lease env is the resolved secrets — EXCLUDING any marked
     // `inject: "step-only"` (see `parseEnvRequirements`), so a one-shot secret
     // used in a `pre` step's command_template never persists in the container
-    // environment for the agent step to read — PLUS, unless oversized, the
-    // rendered prompt under the runner's prompt env var. This map is
-    // deliberately distinct from `env` (the map templates render against and
-    // maskSecrets redacts): the prompt is not a secret, so it must never enter
-    // maskSecrets — masking it would redact the whole log. A command shape that
-    // ignores this variable (the linux shape passes the prompt as an argv
-    // argument) makes carrying it there harmless.
+    // environment for the agent step to read. The rendered prompt is
+    // deliberately NOT in this map: it travels as a lease FILE (see
+    // `leaseFiles` above), not as an env variable, so the windows per-variable
+    // ceiling and cmd argv ceiling are unreachable here. `env` (the map
+    // templates render against and maskSecrets redacts) is a separate concern
+    // and stays keyed only on resolved secrets.
     const leaseEnv: Record<string, string> = { ...leaseInjectableEnv };
-    if (runner.promptEnvVar && !promptTooLargeForWindows) {
-      leaseEnv[runner.promptEnvVar] = prompt;
-    }
 
     // Capture the (server-requested) TTL now so the exec-timeout resolver has
     // a `remaining_ttl` to derive the per-call default from once the lease
@@ -1053,6 +1070,7 @@ export async function runDispatch(
       ttl_seconds: playbook.ttl_seconds,
       userdata,
       env: Object.keys(leaseEnv).length > 0 ? leaseEnv : undefined,
+      files: leaseFiles.length > 0 ? leaseFiles : undefined,
       signal: controller.signal,
     });
     leaseId = lease.leaseId;
@@ -1094,17 +1112,6 @@ export async function runDispatch(
         leaseStartedAtMs
       ),
     });
-
-    // Now the lease's OS is known: a windows lease with an over-limit prompt is
-    // failed with a clear error before any exec runs (the finally block still
-    // releases the lease), rather than letting the truncated env value reach the
-    // agent. A linux lease is unaffected — it carries the prompt as an argv
-    // argument, which has no such per-variable ceiling.
-    if (lease.os === "windows" && promptTooLargeForWindows) {
-      throw new Error(
-        `prompt too large for windows lease: ${prompt.length} chars exceeds the ${runner.maxWindowsPromptChars}-char limit`
-      );
-    }
 
     // --- pre steps (after lease creation, before the agent exec) -----------
     // Each is rendered with the same template engine as the prompt, with an
@@ -1151,13 +1158,15 @@ export async function runDispatch(
 
     // --- running -----------------------------------------------------------
     await updateDispatch(dispatchId, { status: "running" }, db);
-    // The prompt was rendered before the lease was created (above); the runner
-    // shapes the agent command from it and the lease OS. The playbook's opaque
-    // runner_config is passed through verbatim — only the runner interprets it.
-    // The command context carries the event and resolved secrets a template-driven
-    // runner renders its command against (e.g. the `script` runner's
-    // command_template); a prompt-driven runner ignores it.
-    const command = runner.buildCommand(prompt, runnerConfig, lease.os, {
+    // The runner shapes the agent command from its opaque runner_config and
+    // the lease OS. A prompt-driven runner (the `claude-code` runner) reads
+    // the rendered prompt from its `promptFilePath` on stdin; the prompt was
+    // staged into the lease as a file at create time (above), so no rendered
+    // prompt content appears in the built command. The command context
+    // carries the event and resolved secrets a template-driven runner renders
+    // its command against (e.g. the `script` runner's command_template); a
+    // prompt-driven runner ignores it.
+    const command = runner.buildCommand(runnerConfig, lease.os, {
       event: promptEvent,
       env,
     });

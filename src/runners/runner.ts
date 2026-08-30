@@ -53,16 +53,21 @@ export interface Runner {
 
   /**
    * Build the agent-step exec command for a lease of OS family `os`, from the
-   * fully rendered `prompt`, the runner's opaque `config`, and the shared
-   * {@link RunnerCommandContext}. `os` comes from the create-lease response; a
-   * runner may shape the command differently per OS (e.g. delivering the prompt
-   * via {@link promptEnvVar} rather than the command line). `null`/unrecognized
-   * values are the runner's own fallback case. `ctx` supplies the event and
-   * resolved secrets for a runner whose command is itself a rendered template;
-   * a prompt-driven runner ignores it.
+   * runner's opaque `config` and the shared {@link RunnerCommandContext}. `os`
+   * comes from the create-lease response; a runner may shape the command
+   * differently per OS (e.g. reading the prompt from {@link promptFilePath}
+   * via a per-OS stdin pipe). `null`/unrecognized values are the runner's own
+   * fallback case. `ctx` supplies the event and resolved secrets for a runner
+   * whose command is itself a rendered template; a prompt-driven runner
+   * ignores those and shapes a fixed invocation instead.
+   *
+   * A prompt-driven runner reads the RENDERED prompt from
+   * {@link promptFilePath} (the executor writes it there as a lease file at
+   * create time), so no rendered prompt content ever appears in the command
+   * string. That keeps every exec well under the windows argv/env caps
+   * regardless of prompt length.
    */
   buildCommand(
-    prompt: string,
     config: unknown,
     os: LeaseOs | null,
     ctx: RunnerCommandContext
@@ -116,18 +121,13 @@ export interface Runner {
   detectAuthFailure?(raw: string): string | null;
 
   /**
-   * When set, the environment variable the executor delivers the rendered prompt
-   * in (instead of on the command line). Some OS command shapes read the prompt
-   * from here; a runner that always carries the prompt on the command line omits
-   * it.
+   * When set, the ABSOLUTE unix-style path under which the executor stages the
+   * fully rendered prompt as a lease file at create time (before any exec
+   * runs). On windows leases the same unix-style path is mapped onto the
+   * container filesystem the same way exec working directories already
+   * resolve (see {@link buildCommand}, which shapes the per-OS way of reading
+   * from that path). A runner that never receives a prompt (the `script`
+   * runner) omits it and the executor stages no prompt file.
    */
-  readonly promptEnvVar?: string;
-
-  /**
-   * When set, the maximum prompt length (in chars) a windows lease can carry via
-   * {@link promptEnvVar}. A longer prompt fails a windows dispatch rather than
-   * being silently truncated by the OS. Omitted when the runner has no such
-   * bound.
-   */
-  readonly maxWindowsPromptChars?: number;
+  readonly promptFilePath?: string;
 }

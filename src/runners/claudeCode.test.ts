@@ -1,8 +1,10 @@
 import {
   buildAgentCommand,
+  claudeCodeRunner,
   detectAuthFailure,
   parseResultText,
   parseUsage,
+  PROMPT_FILE_PATH,
 } from "./claudeCode";
 
 /** Serialize objects onto their own lines, the shape stream-json emits. */
@@ -229,29 +231,25 @@ describe("detectAuthFailure", () => {
 });
 
 describe("buildAgentCommand", () => {
-  it("omits optional flags and escapes single quotes in the prompt", () => {
-    const command = buildAgentCommand(
-      { model: null, allowed_tools: null },
-      "it's a test"
-    );
+  it("omits optional flags and pipes the staged prompt file into claude on stdin (linux)", () => {
+    const command = buildAgentCommand({ model: null, allowed_tools: null });
     expect(command).toBe(
-      "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose 'it'\\''s a test'"
+      "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose < '/work/prompt.txt'"
     );
   });
 
   it("is byte-identical for os='linux' and a null/missing os", () => {
     const playbook = { model: "sonnet", allowed_tools: ["Read", "Bash"] };
-    const prompt = "line one\nline 'two'";
-    const legacy = buildAgentCommand(playbook, prompt);
-    expect(buildAgentCommand(playbook, prompt, null)).toBe(legacy);
-    expect(buildAgentCommand(playbook, prompt, "linux")).toBe(legacy);
-    // Sanity: the linux shape is the historical single-line POSIX-quoted form,
-    // now prefixed with IS_SANDBOX=1 (the CLI's container escape hatch for
-    // --dangerously-skip-permissions when running under root, which every wisp
-    // container exec is).
+    const legacy = buildAgentCommand(playbook);
+    expect(buildAgentCommand(playbook, null)).toBe(legacy);
+    expect(buildAgentCommand(playbook, "linux")).toBe(legacy);
+    // The linux shape reads the staged prompt file on STDIN via `< /work/prompt.txt`
+    // (a POSIX-single-quoted argument so a future path with metacharacters still
+    // survives /bin/sh -c). Prefixed IS_SANDBOX=1 so the CLI accepts
+    // --dangerously-skip-permissions under wisp's root execs.
     expect(legacy).toBe(
       "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose " +
-        "--model sonnet --allowedTools Read,Bash 'line one\nline '\\''two'\\'''"
+        "--model sonnet --allowedTools Read,Bash < '/work/prompt.txt'"
     );
   });
 
@@ -259,7 +257,6 @@ describe("buildAgentCommand", () => {
     for (const os of [undefined, null, "linux" as const]) {
       const command = buildAgentCommand(
         { model: null, allowed_tools: null },
-        "hi",
         os ?? null
       );
       // The prefix comes first so /bin/sh -c applies it as a one-shot env
@@ -268,112 +265,91 @@ describe("buildAgentCommand", () => {
     }
   });
 
-  it("windows command carries no IS_SANDBOX prefix (shape unchanged)", () => {
+  it("windows command carries no IS_SANDBOX prefix (linux-only concern)", () => {
     const command = buildAgentCommand(
       { model: null, allowed_tools: null },
-      "unused on windows",
       "windows"
     );
-    // The prefix belongs only on the linux shape — the whole windows command
-    // is base64 (no env-prefix syntax), and windows leases don't hit the
-    // linux root-refusal path.
+    // The prefix belongs only on the linux shape; windows leases don't hit
+    // the linux root-refusal path.
     expect(command).not.toContain("IS_SANDBOX");
   });
 
   describe("windows shape", () => {
-    /** Decode a `powershell -NoProfile -EncodedCommand <b64>` command's script. */
-    const decodeScript = (command: string): string => {
-      const prefix = "powershell -NoProfile -EncodedCommand ";
-      expect(command.startsWith(prefix)).toBe(true);
-      const b64 = command.slice(prefix.length);
-      return Buffer.from(b64, "base64").toString("utf16le");
-    };
-
-    it("is powershell -EncodedCommand of the fixed script with ZERO double quotes", () => {
+    it("pipes the staged prompt file into claude via `type C:\\work\\prompt.txt | claude ...`", () => {
       const command = buildAgentCommand(
         { model: null, allowed_tools: null },
-        "unused on windows",
         "windows"
       );
 
-      // Pinned exact literal: wisp receives this verbatim and wraps it in cmd /c.
-      // The whole command is base64 (A-Za-z0-9+/=) after the fixed prefix, so it
-      // carries no double quote, backslash, or cmd metacharacter to be mangled by
-      // Docker's MSVCRT argv-joining on Windows.
-      const script =
-        "$env:ORCH_AGENT_PROMPT | & claude --print " +
-        "--dangerously-skip-permissions --output-format stream-json --verbose";
-      const encoded = Buffer.from(script, "utf16le").toString("base64");
-      expect(command).toBe(`powershell -NoProfile -EncodedCommand ${encoded}`);
+      // Pinned exact literal: wisp receives this verbatim and wraps it in
+      // cmd /c. The whole command is a bare cmd pipeline (no double quotes,
+      // no PowerShell) so Docker's MSVCRT argv-joining on Windows has nothing
+      // to mangle.
+      expect(command).toBe(
+        "type C:\\work\\prompt.txt | claude --print " +
+          "--dangerously-skip-permissions --output-format stream-json --verbose"
+      );
 
       expect(command).not.toContain('"');
-      expect(command).not.toContain("\\");
-      expect(command).not.toContain("&");
-      expect(command).not.toContain("|");
-      expect(command).not.toContain("<");
-      expect(command).not.toContain(">");
       expect(command).not.toContain("^");
       expect(command).not.toContain("%");
       expect(command).not.toContain("$");
-    });
-
-    it("decodes (UTF-16LE) to the exact fixed claude invocation reading the env prompt", () => {
-      const command = buildAgentCommand(
-        { model: null, allowed_tools: null },
-        "unused on windows",
-        "windows"
-      );
-      const script = decodeScript(command);
-      expect(script).toBe(
-        "$env:ORCH_AGENT_PROMPT | & claude --print " +
-          "--dangerously-skip-permissions --output-format stream-json --verbose"
-      );
-      // The script PIPES the env prompt into claude on stdin (bypassing argv, which
-      // the npm claude.cmd batch shim mangles) and invokes claude via the `&` call
-      // operator — there is no positional prompt argument on the command line.
-      expect(script.startsWith("$env:ORCH_AGENT_PROMPT |")).toBe(true);
-      expect(script).toContain("$env:ORCH_AGENT_PROMPT");
-      expect(script).not.toMatch(/verbose\s+\S/); // nothing after the final flag
-    });
-
-    it("is fixed-length: identical regardless of the prompt argument", () => {
-      const playbook = { model: null, allowed_tools: null };
-      const tiny = buildAgentCommand(playbook, "hi", "windows");
-      const huge = buildAgentCommand(playbook, "x".repeat(100_000), "windows");
-      // The prompt never touches the command line, so its size is irrelevant.
-      expect(huge).toBe(tiny);
-      // ...and the command stays comfortably under the cmd 8191-char ceiling.
-      expect(huge.length).toBeLessThan(2000);
+      expect(command).not.toContain("<");
+      expect(command).not.toContain(">");
+      expect(command).not.toContain("&");
     });
 
     it("appends --model and --allowedTools flags to the piped claude invocation", () => {
       const command = buildAgentCommand(
         { model: "opus", allowed_tools: ["Read", "Edit"] },
-        "hi",
         "windows"
       );
-      const script = decodeScript(command);
-      expect(script).toBe(
-        "$env:ORCH_AGENT_PROMPT | & claude --print " +
+      expect(command).toBe(
+        "type C:\\work\\prompt.txt | claude --print " +
           "--dangerously-skip-permissions --output-format stream-json --verbose " +
           "--model opus --allowedTools Read,Edit"
       );
     });
 
-    it("never embeds the prompt (or its cmd-special bytes) on the command line", () => {
-      const prompt = "space split & pipe | redirect > here";
-      const command = buildAgentCommand(
-        { model: null, allowed_tools: null },
-        prompt,
-        "windows"
-      );
-      // None of the prompt's text reaches the command line — only the fixed
-      // base64-encoded invocation does, so cmd never sees the prompt's
-      // `&`/`|`/`>` metacharacters. The decoded script references the env var.
-      expect(command).not.toContain("space split");
-      expect(command).not.toContain("pipe");
-      expect(command).not.toContain("redirect");
-      expect(decodeScript(command)).toContain("$env:ORCH_AGENT_PROMPT");
+    it("is fixed-length: identical regardless of prompt size (the prompt travels as a file)", () => {
+      // buildAgentCommand no longer takes a prompt argument; the runner
+      // command is fixed and reads the staged prompt file at run time. This
+      // guards the invariant that the command length is unaffected by prompt
+      // size.
+      const playbook = { model: null, allowed_tools: null };
+      const one = buildAgentCommand(playbook, "windows");
+      const two = buildAgentCommand(playbook, "windows");
+      expect(one).toBe(two);
+      expect(one.length).toBeLessThan(2000);
     });
+  });
+});
+
+describe("claudeCodeRunner surface", () => {
+  it("declares PROMPT_FILE_PATH as the promptFilePath the executor stages", () => {
+    expect(PROMPT_FILE_PATH).toBe("/work/prompt.txt");
+    expect(claudeCodeRunner.promptFilePath).toBe(PROMPT_FILE_PATH);
+  });
+
+  it("ignores the runner command context (config alone shapes the command)", () => {
+    const command = claudeCodeRunner.buildCommand(
+      { model: null, allowed_tools: null },
+      "linux",
+      {
+        event: {
+          id: 1,
+          source: "s",
+          type: "t",
+          subject_ref: "r",
+          payload: {},
+        },
+        env: { SECRET: "should-not-appear" },
+      }
+    );
+    expect(command).not.toContain("should-not-appear");
+    expect(command).toBe(
+      "IS_SANDBOX=1 claude --print --dangerously-skip-permissions --output-format stream-json --verbose < '/work/prompt.txt'"
+    );
   });
 });

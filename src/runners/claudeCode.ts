@@ -5,9 +5,13 @@
  * executor only ever sees the {@link Runner} surface via the registry.
  *
  * Two concerns live here:
- *   - COMMAND: build the agent-step exec, per OS family. The prompt is delivered
- *     as a POSIX-quoted argv argument on linux and via {@link AGENT_PROMPT_ENV}
- *     on windows (where argv cannot carry the prompt intact).
+ *   - COMMAND: build the agent-step exec, per OS family. The RENDERED prompt is
+ *     shipped into the lease as a file at create time (see
+ *     {@link PROMPT_FILE_PATH}) and read into `claude` on STDIN by the built
+ *     command: `sh -c 'claude -p ... < /work/prompt.txt'` on linux, and
+ *     `cmd /c type C:\work\prompt.txt | claude -p ...` on windows. No rendered
+ *     prompt content ever appears in the exec command, so the windows argv
+ *     ceiling is unreachable regardless of prompt length.
  *   - OUTPUT: parse the `stream-json` envelopes the CLI emits — the result text,
  *     the summed token usage, and any auth-failure signature.
  *
@@ -36,27 +40,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** POSIX single-quote a value so it is a single, literal shell argument. */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
+/**
+ * Absolute unix-style path (see the wisper contract; windows leases map the
+ * same request path onto the container filesystem the same way exec working
+ * directories already resolve) under which the executor stages the fully
+ * rendered prompt as a lease file. Both per-OS command shapes read from this
+ * exact path via a stdin pipe, so it is the ONE seam the executor and the
+ * runner agree on.
+ */
+export const PROMPT_FILE_PATH = "/work/prompt.txt";
 
 /**
- * Environment variable a windows lease carries the fully rendered prompt in. The
- * windows agent command references it as `$env:ORCH_AGENT_PROMPT` instead of
- * embedding the prompt on the command line — see {@link buildWindowsAgentScript}
- * and the executor's lease-env injection.
+ * Windows presentation of {@link PROMPT_FILE_PATH}. The lease file itself is
+ * addressed by the unix-style path; only the `cmd /c type` invocation needs a
+ * `C:\...\...` string. Kept as a constant so any future path change stays in
+ * one place.
  */
-export const AGENT_PROMPT_ENV = "ORCH_AGENT_PROMPT";
-
-/**
- * Ceiling on a windows lease's rendered prompt length. Windows caps a single
- * environment variable at 32767 chars, and the prompt travels to the agent
- * through {@link AGENT_PROMPT_ENV}; a prompt at or under this bound leaves ample
- * headroom, while anything larger fails the dispatch (in the executor) rather
- * than being silently truncated by the OS into a corrupt prompt.
- */
-export const MAX_WINDOWS_PROMPT_CHARS = 30000;
+const PROMPT_FILE_PATH_WINDOWS = "C:\\work\\prompt.txt";
 
 /**
  * The fixed leading tokens of every `claude` headless-agent invocation, shared
@@ -73,8 +73,8 @@ const AGENT_BASE_FLAGS = [
 
 /**
  * The `claude` argv (base flags + the optional `--model` / `--allowedTools`),
- * WITHOUT the trailing prompt argument. The prompt is appended per-OS by the
- * callers, since each shape quotes it differently.
+ * WITHOUT any prompt argument. The prompt is fed on stdin by the per-OS
+ * pipeline built around this argv.
  */
 function agentArgvHead(config: ClaudeCodeConfig): string[] {
   const parts: string[] = [...AGENT_BASE_FLAGS];
@@ -88,89 +88,74 @@ function agentArgvHead(config: ClaudeCodeConfig): string[] {
 }
 
 /**
- * The linux agent command: the `claude` argv joined with spaces, with the prompt
- * as a single POSIX-single-quoted trailing argument. wisp wraps linux execs in
- * `/bin/sh -c`, so single-quoting yields exactly one literal argument, and an
- * `IS_SANDBOX=1` env prefix applies to just the `claude` invocation.
- *
- * The `IS_SANDBOX=1` prefix is the CLI's documented container escape hatch for
- * `--dangerously-skip-permissions`: without it `claude` hard-refuses to run under
- * root/sudo ("cannot be used with root/sudo privileges for security reasons"),
- * and wisp container execs run as root. Every wisp lease is by definition a
- * container/VM sandbox, so this is unconditionally correct for linux leases.
+ * POSIX single-quote a value so it is a single, literal shell argument. Used
+ * only for the fixed `claude` argv assembled below; the prompt itself never
+ * touches the command line.
  */
-function buildLinuxAgentCommand(
-  config: ClaudeCodeConfig,
-  prompt: string
-): string {
-  return ["IS_SANDBOX=1", ...agentArgvHead(config), shellQuote(prompt)].join(
-    " "
-  );
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
- * The fixed PowerShell script the windows agent command runs. It PIPES the prompt
- * read from `$env:ORCH_AGENT_PROMPT` into `claude` on STDIN — never as an argv
- * argument. `claude --print` reads the prompt from stdin when no positional prompt
- * is given (the documented `cat prompt | claude -p` pattern), and stdin is passed
- * through untouched by every layer (PowerShell → the npm `claude.cmd` batch shim →
- * node), whereas argv is not: the batch shim's argv cannot carry newlines or
- * embedded quotes, so it truncated the prompt at the first newline and mangled its
- * quotes. Piping bypasses argv entirely, so quotes, `%`, `$`, backticks, and
- * newlines in the prompt all reach the agent intact regardless of length. The
- * prompt rides the lease env (see the executor), so this script is fixed-size:
- * its length never depends on the prompt.
+ * The linux agent command. wisp wraps every linux exec in `/bin/sh -c`, so
+ * this runs `claude` with its argv and pipes {@link PROMPT_FILE_PATH} into
+ * its STDIN via shell redirection: `IS_SANDBOX=1 claude ... < /work/prompt.txt`.
+ * The prompt travels as a file, not on the command line, so quotes, `%`, `$`,
+ * backticks, and newlines in the prompt all reach the agent intact regardless
+ * of length.
+ *
+ * The `IS_SANDBOX=1` prefix is the CLI's documented container escape hatch for
+ * `--dangerously-skip-permissions`: without it `claude` hard-refuses to run
+ * under root/sudo, and wisp container execs run as root. Every wisp lease is
+ * by definition a container/VM sandbox, so this is unconditionally correct for
+ * linux leases.
  */
-export function buildWindowsAgentScript(config: ClaudeCodeConfig): string {
-  return [`$env:${AGENT_PROMPT_ENV}`, "|", "&", ...agentArgvHead(config)].join(
-    " "
-  );
+function buildLinuxAgentCommand(config: ClaudeCodeConfig): string {
+  return [
+    "IS_SANDBOX=1",
+    ...agentArgvHead(config),
+    "<",
+    shellQuote(PROMPT_FILE_PATH),
+  ].join(" ");
 }
 
 /**
  * The windows agent command. wisp passes an exec to the Docker API as
- * `Cmd=["cmd","/c","<command>"]`; on Windows Docker JOINS that argv into a single
- * process command line with MSVCRT escaping, so EVERY embedded double quote in
- * `<command>` becomes `\"`. cmd then strips the outer quotes and hands PowerShell a
- * tail with literal `\"` sequences, which MSVCRT parsing turns back into bare quote
- * characters — so a `-Command "..."` script arrives BEGINNING with a quote and
- * PowerShell evaluates it as a string literal (interpolating the prompt) and echoes
- * it instead of running claude. Any embedded double quote is unsafe end to end.
- *
- * The fix carries ZERO double quotes (and no cmd metacharacters at all): the fixed
- * script from {@link buildWindowsAgentScript} is encoded as UTF-16LE base64 and
- * passed via `-EncodedCommand`. base64 is `A-Za-z0-9+/=` only — nothing cmd or
- * MSVCRT can mangle — and because the prompt travels in the lease env the script is
- * short (~150-300 chars), so its base64 stays far under the cmd 8191-char ceiling.
+ * `Cmd=["cmd","/c","<command>"]`; the command here is a plain `cmd` pipeline
+ * that types the staged prompt file into `claude`'s STDIN:
+ * `type C:\work\prompt.txt | claude --print ...`. cmd's `type` reads the file
+ * as-is; `|` pipes it to `claude` unchanged, so quotes, `%`, `$`, and every
+ * other cmd-special byte in the prompt is never seen on the command line.
+ * That leaves the built command a short, fixed string dependent only on the
+ * runner's config (never the prompt), well under the cmd 8191-char ceiling.
  */
 function buildWindowsAgentCommand(config: ClaudeCodeConfig): string {
-  const encoded = Buffer.from(
-    buildWindowsAgentScript(config),
-    "utf16le"
-  ).toString("base64");
-  return `powershell -NoProfile -EncodedCommand ${encoded}`;
+  return [
+    "type",
+    PROMPT_FILE_PATH_WINDOWS,
+    "|",
+    ...agentArgvHead(config),
+  ].join(" ");
 }
 
 /**
- * Build the headless-agent exec command for a lease of OS family `os`: the fixed
- * `claude` stream-json invocation plus the optional `--model`/`--allowedTools`
- * flags from the config.
+ * Build the headless-agent exec command for a lease of OS family `os`: the
+ * fixed `claude` stream-json invocation plus the optional `--model` /
+ * `--allowedTools` flags from the config, wired to read the prompt from
+ * {@link PROMPT_FILE_PATH} via a per-OS stdin pipe.
  *
- * `os` comes from the create-lease response ({@link LeaseOs}). Only `"windows"`
- * takes the short `$env:ORCH_AGENT_PROMPT` shape (the prompt rides the lease env,
- * NOT the command line, so `prompt` is unused there); `"linux"`, `null` (older
- * servers), and any unrecognized value all fall back to the linux POSIX-quoted
- * shape with the prompt as a trailing argument, byte-identical to the historical
- * command.
+ * `os` comes from the create-lease response ({@link LeaseOs}). Only
+ * `"windows"` takes the `type ... | claude` shape; `"linux"`, `null` (older
+ * servers), and any unrecognized value all fall back to the linux
+ * `claude ... < /work/prompt.txt` shape.
  */
 export function buildAgentCommand(
   config: ClaudeCodeConfig,
-  prompt: string,
   os: LeaseOs | null = null
 ): string {
   return os === "windows"
     ? buildWindowsAgentCommand(config)
-    : buildLinuxAgentCommand(config, prompt);
+    : buildLinuxAgentCommand(config);
 }
 
 // --- output parsing --------------------------------------------------------
@@ -324,22 +309,24 @@ function narrowConfig(config: unknown): ClaudeCodeConfig {
 }
 
 /**
- * The `claude-code` runner. Delegates command building to {@link buildAgentCommand}
- * and output parsing to {@link parseResultText}/{@link parseUsage}, and carries
- * the windows prompt-delivery knobs the executor reads generically.
+ * The `claude-code` runner. Delegates command building to
+ * {@link buildAgentCommand} and output parsing to
+ * {@link parseResultText}/{@link parseUsage}, and declares
+ * {@link PROMPT_FILE_PATH} so the executor stages the rendered prompt as a
+ * lease file at create time.
  */
 export const claudeCodeRunner: Runner = {
   id: "claude-code",
 
   buildCommand(
-    prompt: string,
     config: unknown,
     os: LeaseOs | null,
     _ctx: RunnerCommandContext
   ): string {
-    // The `claude-code` command carries the fully rendered prompt; the event and
-    // resolved secrets in `_ctx` are not templated into it, so they are unused.
-    return buildAgentCommand(narrowConfig(config), prompt, os);
+    // The `claude-code` command reads the prompt from PROMPT_FILE_PATH on
+    // stdin; the event and resolved secrets in `_ctx` are not templated into
+    // it, so they are unused.
+    return buildAgentCommand(narrowConfig(config), os);
   },
 
   parseOutput(raw: string): RunnerOutput | null {
@@ -354,6 +341,5 @@ export const claudeCodeRunner: Runner = {
     return detectAuthFailure(raw);
   },
 
-  promptEnvVar: AGENT_PROMPT_ENV,
-  maxWindowsPromptChars: MAX_WINDOWS_PROMPT_CHARS,
+  promptFilePath: PROMPT_FILE_PATH,
 };

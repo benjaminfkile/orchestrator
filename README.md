@@ -107,14 +107,25 @@ The **executor** (`src/executor/executor.ts`) is the pipeline state machine:
    `WISPER_HOST_ID`) and image name are also resolved against the wisper catalog
    to concrete ids here, before leasing.
 2. `createLease` — provisioning runs in the lease `userdata`; the `POST
-   /dev/leases` 201 does not return until the lease is ready.
+   /dev/leases` 201 does not return until the lease is ready. For the
+   `claude-code` runner the executor also stages the fully rendered prompt
+   into the lease as a file at `/work/prompt.txt` via the wisper contract's
+   `files` array (the wisper server writes it in AFTER container start and
+   BEFORE `userdata` runs). A rendered prompt over the wisper file budget
+   (1 MiB total decoded bytes) fails the dispatch with a clear validation
+   error before any lease is created.
 3. Run each `pre` step as an exec (e.g. `git clone …` using a rendered or
    injected token).
 4. Run the agent step: a fixed `claude --print --dangerously-skip-permissions
    --output-format stream-json --verbose` invocation (prefixed `IS_SANDBOX=1`
-   on linux so the CLI accepts the flag under wisp's root execs), plus the playbook's
-   optional `--model`/`--allowedTools`, with the composed prompt as the trailing
-   argument. Its streamed exit code is the completion signal.
+   on linux so the CLI accepts the flag under wisp's root execs), plus the
+   playbook's optional `--model`/`--allowedTools`, wired to read the staged
+   prompt file on STDIN via a per-OS pipe:
+   `sh -c 'claude -p ... < /work/prompt.txt'` on linux and
+   `cmd /c type C:\work\prompt.txt | claude -p ...` on windows. **No
+   rendered prompt content ever appears in any exec command**, so the
+   windows argv/env caps are unreachable regardless of prompt size. Its
+   streamed exit code is the completion signal.
 5. On exit 0, run `collect` steps and persist their captured output plus any
    `<NOTES_TO_SAVE>` findings the agent emitted.
 6. **Always** `DELETE /dev/leases/:id` (`/v1/leases/:id` in v1 mode), on every
@@ -131,9 +142,18 @@ The **executor** (`src/executor/executor.ts`) is the pipeline state machine:
 
 The **wisper client** (`src/wisper/client.ts`) wraps the lease endpoints:
 `createLease`, `execSync`, `execStream` (SSE exec with robust frame parsing,
-terminating on the `exit` event), and `releaseLease`, all over a shared fetch
-wrapper with an `AbortController`. Secrets reach the container only via the
-`env` field and are masked in logs.
+terminating on the `exit` event), `releaseLease`, and `downloadLeaseFile`
+(single-file `GET /dev/leases/:id/files?path=...` or
+`GET /v1/leases/:id/files?path=...` returning raw bytes), all over a shared
+fetch wrapper with an `AbortController`. Secrets reach the container only via
+the `env` field and are masked in logs. `createLease` also accepts an
+optional `files` array (`[{path, content_base64}]`, at most 16 files summing
+to 1 MiB total decoded bytes, absolute unix-style paths only, no `..`, no
+backslash, at most 256 chars each, unique per request, valid base64) staged
+into the container after start and before `userdata` runs; the client
+validates every cap locally and refuses an over-budget or malformed request
+with a terminal `validation_error` before sending anything. File contents
+and paths are never logged.
 
 The client speaks one of two surfaces, chosen by `WISPER_MODE` (default `dev`):
 
@@ -422,6 +442,18 @@ container process's cmdline while that step runs. That is accepted; the goal is
 that it does not PERSIST in the lease environment for later steps (and the
 agent step) to read. Redaction covers step-only values in the dispatch log
 identically to lease-env values.
+
+**Prompt file.** The `claude-code` runner ships the fully rendered prompt into
+the lease as a file at `/work/prompt.txt` (via the wisper contract's `files`
+array on `createLease`), and the agent command reads it into `claude` on
+STDIN. The prompt file IS lease-visible (the agent inside the lease can read
+it), so it is rendered against the same LEASE-injectable env the prompt
+template always was. Step-only secrets therefore never reach the prompt file
+either (they render empty in `prompt_template`, `userdata_template`, and
+prompt-kind snippet content), and the executor's masking that once applied to
+the rendered prompt continues to apply to the prompt file contents the same
+way. Any secret VALUE the log path touches (command lines, streamed output)
+is redacted like every other resolved secret.
 
 The ADO module additionally reads a PAT under whatever name you set as its
 `pat_secret_ref` (e.g. `ado_pat`).
@@ -758,6 +790,23 @@ config; wisp never reads this repo.
 
 Store `CLAUDE_CODE_OAUTH_TOKEN` (see **Secrets**) so each lease can run the agent.
 Everything is read-only — every result lands as a **finding** on the **Runs** page.
+
+**Prompt delivery.** The `claude-code` runner ships the fully rendered prompt
+into the lease as a file at `/work/prompt.txt` on `createLease` (via the
+wisper contract's `files` array; the wisper server writes it in after
+container start, before `userdata` runs, so `userdata` and every exec can read
+it). The agent step's command shape then reads that file into `claude` on
+STDIN, via `sh -c 'claude -p ... < /work/prompt.txt'` on linux, and
+`cmd /c type C:\work\prompt.txt | claude -p ...` on windows (Windows leases
+use the same unix-style request path; wisp maps it onto the container
+filesystem the same way exec working directories already resolve, so the file
+is addressable as `C:\work\prompt.txt` in cmd). No rendered prompt content
+ever appears in any exec command, so the windows 32767-char per-variable
+ceiling and the 8191-char cmd command line ceiling are both unreachable
+regardless of prompt size. A rendered prompt over the wisper file budget
+(1 MiB total decoded bytes) fails the dispatch with a clear validation error
+BEFORE any lease is created, exactly like a missing secret. Step and
+`script`-runner command templates continue to render exactly as before.
 
 ## Notifications
 

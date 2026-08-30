@@ -265,6 +265,14 @@ function tempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/** Decode a lease file's utf-8 content from its base64 wire form. */
+function decodeLeaseFile(body: Record<string, unknown>, path: string): string {
+  const files = body.files as Array<{ path: string; content_base64: string }>;
+  const entry = files?.find((f) => f.path === path);
+  if (!entry) throw new Error(`no lease file at ${path}`);
+  return Buffer.from(entry.content_base64, "base64").toString("utf8");
+}
+
 describe("runDispatch pipeline", () => {
   let fake: FakeWisper;
   let db: Knex;
@@ -590,9 +598,9 @@ describe("runDispatch pipeline", () => {
     });
 
     expect(result.status).toBe("done");
-    // The resolved secrets are forwarded verbatim. The lease env also carries the
-    // rendered prompt under ORCH_AGENT_PROMPT (see the windows-prompt tests); it
-    // is a separate concern from secret resolution and is asserted there.
+    // The resolved secrets are forwarded verbatim. The rendered prompt is a
+    // separate concern (staged as a lease file at /work/prompt.txt, see the
+    // "prompt delivery" tests) and is not part of the lease env at all.
     expect(fake.createBodies[0].env).toMatchObject({
       SECRET_TOKEN: "s3cr3t",
       REGION: "westus",
@@ -748,11 +756,10 @@ describe("runDispatch pipeline", () => {
       expect(fake.createBodies[0].userdata).toBe(
         "#!/bin/sh\necho region=westus"
       );
-      // The rendered prompt (delivered as an argv on linux) carries the env
-      // values in the agent step command.
-      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
-        .command;
-      expect(agentCmd).toContain("Deploy in westus to worker-9.");
+      // The rendered prompt is staged as a lease file at /work/prompt.txt and
+      // carries the env values in its content.
+      const promptText = decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt");
+      expect(promptText).toContain("Deploy in westus to worker-9.");
     });
 
     it("excludes a step-only secret from BOTH prompt_template and userdata_template while still rendering it into a pre-step command", async () => {
@@ -799,12 +806,12 @@ describe("runDispatch pipeline", () => {
       expect(userdata).toBe("#!/bin/sh\necho lease=[lease-value] step=[]");
       expect(userdata).not.toContain("step-value");
 
-      // The step-only value is NOWHERE in the rendered prompt (delivered as an
-      // argv on linux) either. That is the whole point.
-      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
-        .command;
-      expect(agentCmd).toContain("lease=[lease-value] step=[]");
-      expect(agentCmd).not.toContain("step-value");
+      // The step-only value is NOWHERE in the rendered prompt (staged as a
+      // lease file, then read on stdin by the agent command). That is the
+      // whole point.
+      const promptText = decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt");
+      expect(promptText).toContain("lease=[lease-value] step=[]");
+      expect(promptText).not.toContain("step-value");
 
       // BUT the pre step's command DID splice the step-only value in: the one
       // exec that needs it still gets it.
@@ -840,10 +847,12 @@ describe("runDispatch pipeline", () => {
       });
 
       expect(result.status).toBe("done");
-      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
-        .command;
-      expect(agentCmd).toContain("[step=[]]");
-      expect(agentCmd).not.toContain("step-value");
+      // The staged prompt file is the ONLY place the rendered prompt lives;
+      // the exec command reads it on stdin, so the step-only secret can never
+      // reach the agent through this path either.
+      const promptText = decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt");
+      expect(promptText).toContain("[step=[]]");
+      expect(promptText).not.toContain("step-value");
     });
   });
 
@@ -1039,7 +1048,7 @@ describe("runDispatch pipeline", () => {
     expect(fake.releasedLeases).toHaveLength(0);
   });
 
-  it("builds the agent command with model, allowedTools, and a quoted prompt", async () => {
+  it("builds the agent command with model + allowedTools; prompt is read from a staged file on stdin", async () => {
     fake.planExec({ exitCode: 0, chunks: [`{"type":"result","result":"ok"}\n`] });
 
     const dispatchId = await seedDispatch({
@@ -1054,8 +1063,9 @@ describe("runDispatch pipeline", () => {
     );
     expect(command).toContain("--model claude-opus-4-8");
     expect(command).toContain("--allowedTools Bash,Read");
-    // The prompt is a single shell-quoted trailing argument.
-    expect(command).toMatch(/ '[\s\S]*'$/);
+    // The prompt is not on the command line at all: the command redirects
+    // stdin from the staged prompt file.
+    expect(command).toContain("< '/work/prompt.txt'");
   });
 
   describe("resolveExecTimeoutMs", () => {
@@ -1216,7 +1226,8 @@ describe("runDispatch pipeline", () => {
 
         expect(result.status).toBe("done");
         expect(fake.execs).toHaveLength(1);
-        expect(fake.execs[0].command).toContain("Start. INTRO_BLOCK End.");
+        expect(decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt"))
+          .toContain("Start. INTRO_BLOCK End.");
       });
 
       it("renders event/payload/env tokens INSIDE snippet content", async () => {
@@ -1239,9 +1250,8 @@ describe("runDispatch pipeline", () => {
         });
 
         expect(result.status).toBe("done");
-        expect(fake.execs[0].command).toContain(
-          "[type=thing.changed title=hello world tok=s3cr3t]"
-        );
+        expect(decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt"))
+          .toContain("[type=thing.changed title=hello world tok=s3cr3t]");
       });
 
       it("stacks nested prompt snippets", async () => {
@@ -1260,7 +1270,8 @@ describe("runDispatch pipeline", () => {
         const result = await runDispatch(dispatchId, deps());
 
         expect(result.status).toBe("done");
-        expect(fake.execs[0].command).toContain("outer<INNER>");
+        expect(decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt"))
+          .toContain("outer<INNER>");
       });
 
       it("fails BEFORE leasing on an unknown prompt snippet name", async () => {
@@ -1327,7 +1338,8 @@ describe("runDispatch pipeline", () => {
         });
         const result = await runDispatch(dispatchId, deps());
         expect(result.status).toBe("done");
-        expect(fake.execs[0].command).toContain("snippet:intro");
+        expect(decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt"))
+          .toContain("snippet:intro");
       });
     });
 
@@ -1497,7 +1509,8 @@ describe("runDispatch pipeline", () => {
       planOk();
       const first = await runDispatch(dispatchId, deps());
       expect(first.status).toBe("done");
-      expect(fake.execs[0].command).toContain("INTRO");
+      expect(decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt"))
+        .toContain("INTRO");
 
       // ...but after renaming the snippet, the by-name reference is dangling and
       // the next dispatch fails loudly before any lease is created.
@@ -1515,9 +1528,10 @@ describe("runDispatch pipeline", () => {
     });
   });
 
-  describe("windows lease prompt delivery", () => {
-    // A playbook whose rendered prompt is laden with the characters that break a
-    // cmd /c command line: quotes, %, $, backticks, pipes, and a newline.
+  describe("prompt delivery via lease file", () => {
+    // A rendered prompt laden with the characters that break a cmd /c command
+    // line: quotes, %, $, backticks, pipes, and a newline. It must reach the
+    // agent verbatim regardless of which channel delivers it.
     const HOSTILE_TEMPLATE =
       "It's a \"weird\" 100% $HOME `whoami` | pipe > redirect\n" +
       "second line for {{ payload.title }}.";
@@ -1525,7 +1539,38 @@ describe("runDispatch pipeline", () => {
       "It's a \"weird\" 100% $HOME `whoami` | pipe > redirect\n" +
       "second line for hello world.";
 
-    it("injects the exact rendered prompt into the lease env, not the command", async () => {
+    it("stages the fully rendered prompt as a base64 file at /work/prompt.txt on createLease (linux)", async () => {
+      fake.planLeaseOs("linux");
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      const dispatchId = await seedDispatch({
+        prompt_template: HOSTILE_TEMPLATE,
+      });
+      const result = await runDispatch(dispatchId, deps());
+
+      expect(result.status).toBe("done");
+      // The createLease body carries the rendered prompt as a lease file at
+      // the runner's promptFilePath, base64-encoded. Not on the command line,
+      // not in the env.
+      const files = fake.createBodies[0].files as Array<{
+        path: string;
+        content_base64: string;
+      }>;
+      expect(files).toHaveLength(1);
+      expect(files[0].path).toBe("/work/prompt.txt");
+      const decoded = Buffer.from(files[0].content_base64, "base64").toString(
+        "utf8"
+      );
+      expect(decoded).toContain(HOSTILE_RENDERED);
+
+      const env = (fake.createBodies[0].env ?? {}) as Record<string, string>;
+      expect(env.ORCH_AGENT_PROMPT).toBeUndefined();
+    });
+
+    it("stages the same file at /work/prompt.txt on a windows lease (unix-style path)", async () => {
       fake.planLeaseOs("windows");
       fake.planExec({
         exitCode: 0,
@@ -1538,94 +1583,129 @@ describe("runDispatch pipeline", () => {
       const result = await runDispatch(dispatchId, deps());
 
       expect(result.status).toBe("done");
-      // The lease env carries the fully rendered prompt verbatim — quotes and
-      // newline included — under ORCH_AGENT_PROMPT.
-      const env = fake.createBodies[0].env as Record<string, string>;
-      expect(env.ORCH_AGENT_PROMPT).toContain(HOSTILE_RENDERED);
-
-      // The agent exec command is the short, fixed powershell -EncodedCommand
-      // string that reads the prompt from the environment; none of the prompt's
-      // bytes appear on it, and it carries no double quotes to be mangled in
-      // transport.
-      const agentCmd = fake.execs.find((e) =>
-        e.command.startsWith("powershell")
-      )!.command;
-      const expectedScript =
-        "$env:ORCH_AGENT_PROMPT | & claude --print " +
-        "--dangerously-skip-permissions --output-format stream-json --verbose";
-      const expectedEncoded = Buffer.from(expectedScript, "utf16le").toString(
-        "base64"
+      // The wisper contract uses the same unix-style request path on both
+      // OSes; wisp maps it onto the container filesystem the same way exec
+      // working directories already resolve.
+      const files = fake.createBodies[0].files as Array<{
+        path: string;
+        content_base64: string;
+      }>;
+      expect(files).toHaveLength(1);
+      expect(files[0].path).toBe("/work/prompt.txt");
+      const decoded = Buffer.from(files[0].content_base64, "base64").toString(
+        "utf8"
       );
-      expect(agentCmd).toBe(
-        `powershell -NoProfile -EncodedCommand ${expectedEncoded}`
-      );
-      expect(agentCmd).not.toContain('"');
-      expect(agentCmd).not.toContain("weird");
-      expect(agentCmd.length).toBeLessThan(2000);
+      expect(decoded).toContain(HOSTILE_RENDERED);
     });
 
-    it("keeps the command short and fixed no matter how large the prompt is", async () => {
-      fake.planLeaseOs("windows");
-      fake.planExec({
-        exitCode: 0,
-        chunks: [`{"type":"result","result":"ok"}\n`],
-      });
-
-      // A ~20k-char prompt — well over the cmd 8191 ceiling, but comfortably
-      // under the windows per-variable limit.
-      const big = "context ".repeat(2500);
-      const dispatchId = await seedDispatch({ prompt_template: big });
-      const result = await runDispatch(dispatchId, deps());
-
-      expect(result.status).toBe("done");
-      const env = fake.createBodies[0].env as Record<string, string>;
-      expect(env.ORCH_AGENT_PROMPT).toContain(big);
-      const agentCmd = fake.execs.find((e) =>
-        e.command.startsWith("powershell")
-      )!.command;
-      expect(agentCmd.length).toBeLessThan(2000);
-    });
-
-    it("fails clearly (no truncation) when the prompt exceeds the windows limit", async () => {
-      fake.planLeaseOs("windows");
-      fake.planExec({
-        exitCode: 0,
-        chunks: [`{"type":"result","result":"ok"}\n`],
-      });
-
-      // Over the 30000-char env ceiling.
-      const huge = "x".repeat(30001);
-      const dispatchId = await seedDispatch({ prompt_template: huge });
-      const result = await runDispatch(dispatchId, deps());
-
-      expect(result.status).toBe("failed");
-      expect(result.error).toContain("prompt too large for windows lease");
-      // The over-limit prompt was never injected into the lease env...
-      const env = (fake.createBodies[0].env ?? {}) as Record<string, string>;
-      expect(env.ORCH_AGENT_PROMPT).toBeUndefined();
-      // ...the agent was never invoked, and the lease was still released.
-      expect(fake.execs.some((e) => e.command.includes("claude"))).toBe(false);
-      expect(fake.releasedLeases).toEqual(["lease-1"]);
-    });
-
-    it("does not fail an over-limit prompt on a linux lease (argv has no ceiling)", async () => {
+    it("linux agent command reads the staged prompt on stdin, with no rendered prompt content on the command line", async () => {
       fake.planLeaseOs("linux");
       fake.planExec({
         exitCode: 0,
         chunks: [`{"type":"result","result":"ok"}\n`],
       });
 
-      const huge = "x".repeat(30001);
+      const dispatchId = await seedDispatch({
+        prompt_template: HOSTILE_TEMPLATE,
+      });
+      const result = await runDispatch(dispatchId, deps());
+      expect(result.status).toBe("done");
+
+      const agentCmd = fake.execs.find((e) =>
+        e.command.includes("claude --print")
+      )!.command;
+      expect(agentCmd.endsWith("< '/work/prompt.txt'")).toBe(true);
+      // The prompt's identifying substrings never appear on the command line.
+      expect(agentCmd).not.toContain("weird");
+      expect(agentCmd).not.toContain("hello world");
+      expect(agentCmd).not.toContain("second line");
+    });
+
+    it("windows agent command is `type C:\\work\\prompt.txt | claude ...` with no rendered prompt content on the command line", async () => {
+      fake.planLeaseOs("windows");
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      const dispatchId = await seedDispatch({
+        prompt_template: HOSTILE_TEMPLATE,
+      });
+      const result = await runDispatch(dispatchId, deps());
+      expect(result.status).toBe("done");
+
+      const agentCmd = fake.execs.find((e) =>
+        e.command.includes("claude --print")
+      )!.command;
+      expect(agentCmd).toBe(
+        "type C:\\work\\prompt.txt | claude --print " +
+          "--dangerously-skip-permissions --output-format stream-json --verbose"
+      );
+      expect(agentCmd).not.toContain("weird");
+      expect(agentCmd).not.toContain("hello world");
+      expect(agentCmd).not.toContain('"');
+    });
+
+    it("keeps every exec command free of rendered prompt content even for a very large prompt", async () => {
+      fake.planLeaseOs("linux");
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      // A ~20k-char prompt, well over the historical windows env ceiling,
+      // and past what argv on windows could reasonably carry either. With the
+      // file-based delivery, no exec command should carry the prompt at all.
+      const big = "context ".repeat(2500);
+      const dispatchId = await seedDispatch({ prompt_template: big });
+      const result = await runDispatch(dispatchId, deps());
+
+      expect(result.status).toBe("done");
+      const promptText = decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt");
+      expect(promptText).toContain(big);
+      for (const exec of fake.execs) {
+        expect(exec.command).not.toContain(big);
+        expect(exec.command.length).toBeLessThan(2000);
+      }
+    });
+
+    it("fails BEFORE leasing when the rendered prompt exceeds the 1 MiB lease file budget", async () => {
+      fake.planLeaseOs("linux");
+      fake.planExec({
+        exitCode: 0,
+        chunks: [`{"type":"result","result":"ok"}\n`],
+      });
+
+      // 1 MiB + 1 byte of ASCII (one byte per char), so the rendered prompt
+      // (which includes some fixed scaffolding around this content) is
+      // guaranteed to exceed MAX_FILES_TOTAL_BYTES.
+      const huge = "x".repeat(1024 * 1024 + 1);
       const dispatchId = await seedDispatch({ prompt_template: huge });
       const result = await runDispatch(dispatchId, deps());
 
-      // Linux carries the prompt as an argv argument, so the size guard never
-      // fires and the run completes.
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("lease file budget");
+      // No lease was ever created and no exec was ever sent.
+      expect(fake.createBodies).toHaveLength(0);
+      expect(fake.execs).toHaveLength(0);
+      expect(fake.releasedLeases).toHaveLength(0);
+    });
+
+    it("script runner stages no prompt file on createLease (no promptFilePath on that runner)", async () => {
+      fake.planExec({ exitCode: 0, chunks: ["ok\n"] });
+
+      const dispatchId = await seedDispatch({
+        runner: "script",
+        prompt_template: "",
+        runner_config: { command_template: "true" },
+      });
+      const result = await runDispatch(dispatchId, deps());
       expect(result.status).toBe("done");
-      const agentCmd = fake.execs.find((e) => e.command.includes("claude"))!
-        .command;
-      expect(agentCmd).toContain(huge);
-      expect(agentCmd).not.toContain("$env:ORCH_AGENT_PROMPT");
+
+      // Neither a `files` array nor any /work/prompt.txt entry made it into
+      // the create body.
+      const files = fake.createBodies[0].files;
+      expect(files).toBeUndefined();
     });
   });
 
@@ -2038,12 +2118,11 @@ describe("runDispatch pipeline", () => {
     // ...and with the triggering event surfaced so a capability can default from it.
     expect(sawEventType).toBe("thing.changed");
     expect(sawEventPayload).toBeDefined();
-    // Its labelled block was rendered into the prompt handed to the agent exec.
-    const agentExec = fake.execs.find((e) =>
-      e.command.includes("SUPER-SECRET-CONTEXT-BLOCK")
-    );
-    expect(agentExec).toBeDefined();
-    expect(agentExec?.command).toContain("## Context for 42");
+    // Its labelled block was rendered into the prompt staged as a lease file
+    // (which the agent command reads on stdin).
+    const promptText = decodeLeaseFile(fake.createBodies[0], "/work/prompt.txt");
+    expect(promptText).toContain("SUPER-SECRET-CONTEXT-BLOCK");
+    expect(promptText).toContain("## Context for 42");
   });
 
   it("skips an unknown granted capability with a warning and still completes", async () => {
