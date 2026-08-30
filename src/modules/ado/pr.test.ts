@@ -29,6 +29,7 @@ function pr(
   fields: {
     title?: string;
     status?: string;
+    isDraft?: boolean;
     source?: string;
     target?: string;
     createdBy?: ADOIdentityRef | string;
@@ -52,6 +53,7 @@ function pr(
     pullRequestId: id,
     title: fields.title ?? `pr ${id}`,
     status: fields.status ?? "active",
+    isDraft: fields.isDraft ?? false,
     sourceRefName: fields.source ?? "refs/heads/feature/x",
     targetRefName: fields.target ?? "refs/heads/main",
     createdBy: fields.createdBy ?? { uniqueName: "ada@x.com", displayName: "Ada" },
@@ -232,6 +234,7 @@ describe("ado pull-request producer", () => {
         target_branch: "develop",
         created_by: { uniqueName: "bob@x.com", displayName: "Bob" },
         status: "active",
+        is_draft: false,
         url: expect.any(String),
       });
     });
@@ -332,12 +335,43 @@ describe("ado pull-request producer", () => {
       const updated = ofType(emitted, ADO_PR_EVENT_UPDATED);
       expect(updated).toHaveLength(1);
       expect(updated[0].dedupe_key).toBe(
-        `${ADO_PR_EVENT_UPDATED}:1:completed`
+        `${ADO_PR_EVENT_UPDATED}:1:completed:ready`
       );
       expect(updated[0].payload).toMatchObject({
         status: "completed",
         previous_status: "active",
       });
+    });
+
+    it("emits updated with previous_is_draft when a draft becomes ready", async () => {
+      const { emitted, client, tick } = setup();
+      client.board = [pr(1, { isDraft: true })];
+      await tick(); // seed
+
+      client.board = [pr(1, { isDraft: false })];
+      await tick();
+
+      const updated = ofType(emitted, ADO_PR_EVENT_UPDATED);
+      expect(updated).toHaveLength(1);
+      expect(updated[0].dedupe_key).toBe(
+        `${ADO_PR_EVENT_UPDATED}:1:active:ready`
+      );
+      expect(updated[0].payload).toMatchObject({
+        status: "active",
+        is_draft: false,
+        previous_status: "active",
+        previous_is_draft: true,
+      });
+    });
+
+    it("carries is_draft on created for a draft PR", async () => {
+      const { emitted, client, tick } = setup();
+      await tick(); // seed empty
+      client.board = [pr(2, { isDraft: true })];
+      await tick();
+      const created = ofType(emitted, ADO_PR_EVENT_CREATED);
+      expect(created).toHaveLength(1);
+      expect(created[0].payload).toMatchObject({ is_draft: true });
     });
 
     it("emits nothing when a PR is entirely unchanged", async () => {
@@ -473,10 +507,10 @@ describe("ado pull-request dedupe (real db + emitEvent)", () => {
     client.board = [pr(1, { status: "active" })];
     await producer.tick();
 
-    // active → completed: emits & inserts updated:1:completed.
+    // active → completed: emits & inserts updated:1:completed:ready.
     client.board = [pr(1, { status: "completed" })];
     await producer.tick();
-    // completed → active: a different key, inserts updated:1:active.
+    // completed → active: a different key, inserts updated:1:active:ready.
     client.board = [pr(1, { status: "active" })];
     await producer.tick();
     // active → completed again: SAME key as the first change; the cooldown folds it.
@@ -489,8 +523,8 @@ describe("ado pull-request dedupe (real db + emitEvent)", () => {
     // Three emits, one folded away by the dedupe cooldown → two persisted events.
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.dedupe_key)).toEqual([
-      `${ADO_PR_EVENT_UPDATED}:1:completed`,
-      `${ADO_PR_EVENT_UPDATED}:1:active`,
+      `${ADO_PR_EVENT_UPDATED}:1:completed:ready`,
+      `${ADO_PR_EVENT_UPDATED}:1:active:ready`,
     ]);
 
     scheduler.stop();

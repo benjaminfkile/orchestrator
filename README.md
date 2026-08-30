@@ -643,7 +643,10 @@ and **never committed** to this repo.
   payload carries `work_item_type`, `state`, `assignee`, `area_path`,
   `iteration_path`, `tags`, and `url`.
 - Pull requests: `ado.pullrequest.created` (+ `.updated`), payload including the
-  repo clone URL, source/target branch, and creator.
+  repo clone URL, source/target branch, creator, `status`, and `is_draft`.
+  `.updated` fires when the status or the draft flag changes and carries
+  `previous_status` and `previous_is_draft`, so a rule can match a PR leaving
+  draft with `payload.is_draft: false` and `payload.previous_is_draft: true`.
 
 **Events the `datadog` module emits** (read-only, aggregate-driven — never one
 per log line):

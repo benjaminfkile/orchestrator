@@ -6,13 +6,14 @@
  *
  * Per the ARCHITECTURE PRINCIPLE (see CLAUDE.md) this file learns nothing about
  * what a pull request *means*. It emits `ado.pullrequest.created` for a
- * newly-seen PR and `ado.pullrequest.updated` when a known PR's status changes;
+ * newly-seen PR and `ado.pullrequest.updated` when a known PR's status or draft
+ * flag changes;
  * those event `type` strings are the only place a domain word ever appears. The
  * event payload carries `repo_remote_url` (+ its scheme-stripped
  * `repo_remote_url_hostpath` for authenticated clones) and `source_branch`,
  * which together are enough for a playbook to clone the exact branch under review.
  *
- * SNAPSHOT & SEEDING. The snapshot is `Map<id, { status }>`. The FIRST tick after
+ * SNAPSHOT & SEEDING. The snapshot is `Map<id, { status, isDraft }>`. The FIRST tick after
  * start — and the first tick after any config change — SEEDS SILENTLY: it
  * populates the snapshot and emits nothing, so a restart (or a re-configure)
  * never replays every open PR as a flood of "created" events. Only subsequent
@@ -120,9 +121,10 @@ export interface PullRequestProducer {
   getStatus(): AdoProducerStatus;
 }
 
-/** The facets of a PR the poller diffs. Domain-neutral: just a status string. */
+/** The facets of a PR the poller diffs: the status string and the draft flag. */
 interface PrSnapshot {
   status: string;
+  isDraft: boolean;
 }
 
 /** Extract a human-readable message from any thrown value. */
@@ -263,6 +265,7 @@ export function createPullRequestProducer(
       target_branch: normalizeBranch(pr.targetRefName),
       created_by: createdByPayload(pr.createdBy),
       status: pr.status,
+      is_draft: pr.isDraft,
       url: pr.url,
     };
   }
@@ -301,7 +304,7 @@ export function createPullRequestProducer(
       if (!seeded) {
         snapshot.clear();
         for (const pr of prs) {
-          snapshot.set(pr.pullRequestId, { status: pr.status });
+          snapshot.set(pr.pullRequestId, { status: pr.status, isDraft: pr.isDraft });
         }
         seeded = true;
         status.seeded_count = snapshot.size;
@@ -325,7 +328,7 @@ export function createPullRequestProducer(
             payload: buildPayload(pr, remoteUrl),
             dedupe_key: `${ADO_PR_EVENT_CREATED}:${pr.pullRequestId}`,
           });
-        } else if (prev.status !== pr.status) {
+        } else if (prev.status !== pr.status || prev.isDraft !== pr.isDraft) {
           const remoteUrl = await resolveRemoteUrl(pr, client, repoUrlCache);
           await emit({
             source: ADO_EVENT_SOURCE,
@@ -335,11 +338,12 @@ export function createPullRequestProducer(
             payload: {
               ...buildPayload(pr, remoteUrl),
               previous_status: prev.status,
+              previous_is_draft: prev.isDraft,
             },
-            dedupe_key: `${ADO_PR_EVENT_UPDATED}:${pr.pullRequestId}:${pr.status}`,
+            dedupe_key: `${ADO_PR_EVENT_UPDATED}:${pr.pullRequestId}:${pr.status}:${pr.isDraft ? "draft" : "ready"}`,
           });
         }
-        snapshot.set(pr.pullRequestId, { status: pr.status });
+        snapshot.set(pr.pullRequestId, { status: pr.status, isDraft: pr.isDraft });
       }
       status.seeded_count = snapshot.size;
       status.last_error = null;

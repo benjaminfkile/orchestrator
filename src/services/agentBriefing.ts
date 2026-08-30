@@ -77,7 +77,8 @@ Key invariants you must respect:
   producer. All columns are addressable in rule criteria as \`event.<column>\`.
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
   .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
-  .updated\` (source \`ado\`).
+  .updated\` (source \`ado\`). PR payloads carry \`is_draft\`; \`.updated\` fires on
+  a status or draft-flag change with \`previous_status\` and \`previous_is_draft\`.
 - Datadog producer events (source \`datadog\`, aggregate-driven: never one per
   log line):
   - \`datadog.logs.alert\`: a watched log query's grouped count tripped a

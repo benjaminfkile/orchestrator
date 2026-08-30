@@ -14,6 +14,11 @@ owns the lease lifecycle, never the agent inside it.
 
 ### Added
 
+#### Pull requests
+
+- `ado.pullrequest.*` payloads carry `is_draft`; `.updated` fires when a PR's
+  draft flag changes and includes `previous_is_draft`.
+
 #### Foundation
 
 - knex + better-sqlite3 database bootstrap with a migration runner (migrations

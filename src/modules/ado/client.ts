@@ -152,6 +152,8 @@ export interface ADOPullRequest {
   pullRequestId: number;
   title: string;
   status: string;
+  /** True while the PR is a draft (`isDraft` in the API); false when absent. */
+  isDraft: boolean;
   sourceRefName: string;
   targetRefName: string;
   createdBy: ADOIdentityRef | string;
@@ -586,6 +588,7 @@ function normalizePullRequest(raw: unknown): ADOPullRequest {
     pullRequestId?: unknown;
     title?: unknown;
     status?: unknown;
+    isDraft?: unknown;
     sourceRefName?: unknown;
     targetRefName?: unknown;
     createdBy?: unknown;
@@ -603,6 +606,7 @@ function normalizePullRequest(raw: unknown): ADOPullRequest {
       typeof obj.pullRequestId === "number" ? obj.pullRequestId : 0,
     title: typeof obj.title === "string" ? obj.title : "",
     status: typeof obj.status === "string" ? obj.status : "",
+    isDraft: obj.isDraft === true,
     sourceRefName:
       typeof obj.sourceRefName === "string" ? obj.sourceRefName : "",
     targetRefName:
