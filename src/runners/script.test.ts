@@ -33,7 +33,6 @@ describe("scriptRunner", () => {
           "build --for {{ event.type }} --branch {{ payload.branch }} --token {{ env.TOKEN }}",
       };
       const command = scriptRunner.buildCommand(
-        "unused prompt",
         config,
         "linux",
         ctx({ TOKEN: "s3cr3t-value" })
@@ -43,10 +42,9 @@ describe("scriptRunner", () => {
       );
     });
 
-    it("ignores the prompt argument entirely", () => {
+    it("renders payload tokens with buildScriptCommand directly", () => {
       const config = { command_template: "echo {{ payload.title }}" };
-      const withPrompt = buildScriptCommand(config, ctx());
-      expect(withPrompt).toBe("echo hello world");
+      expect(buildScriptCommand(config, ctx())).toBe("echo hello world");
     });
 
     it("leaves unknown template paths as empty strings (shared engine behavior)", () => {
@@ -56,12 +54,16 @@ describe("scriptRunner", () => {
 
     it("does no OS branching — the same command for every lease OS", () => {
       const config = { command_template: "make {{ event.type }}" };
-      const linux = scriptRunner.buildCommand("", config, "linux", ctx());
-      const windows = scriptRunner.buildCommand("", config, "windows", ctx());
-      const legacy = scriptRunner.buildCommand("", config, null, ctx());
+      const linux = scriptRunner.buildCommand(config, "linux", ctx());
+      const windows = scriptRunner.buildCommand(config, "windows", ctx());
+      const legacy = scriptRunner.buildCommand(config, null, ctx());
       expect(linux).toBe("make thing.changed");
       expect(windows).toBe("make thing.changed");
       expect(legacy).toBe("make thing.changed");
+    });
+
+    it("does not declare a promptFilePath (executor stages no prompt file for scripts)", () => {
+      expect(scriptRunner.promptFilePath).toBeUndefined();
     });
 
     it("throws on a missing command_template", () => {

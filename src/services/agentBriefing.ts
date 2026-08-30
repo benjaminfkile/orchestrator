@@ -181,10 +181,21 @@ string (default \`findings\`) that the core never interprets.
 - \`runner\` (see \`GET /api/runners\`):
   - \`claude-code\` (default): runs Claude Code in the lease against the
     rendered \`prompt_template\`. \`runner_config\`: \`{model?, allowed_tools?}\`
-    (models list: \`GET /api/anthropic/models\`). On linux leases the command is
-    prefixed \`IS_SANDBOX=1\` so the claude CLI accepts
-    \`--dangerously-skip-permissions\` under root (wisp execs run as root); an
-    image only needs \`claude\` reachable on the default PATH.
+    (models list: \`GET /api/anthropic/models\`). The executor STAGES the fully
+    rendered prompt into the lease as a file at \`/work/prompt.txt\` on
+    createLease (via the wisper contract's \`files\` array), and the agent
+    command reads it into \`claude\` on STDIN:
+    \`sh -c 'claude -p ... < /work/prompt.txt'\` on linux and
+    \`cmd /c type C:\\work\\prompt.txt | claude -p ...\` on windows (Windows
+    leases use the same unix-style request path; wisp maps it onto the
+    container filesystem). No rendered prompt content ever appears in any
+    exec command, so a large prompt never trips the windows argv/env caps. A
+    rendered prompt over the wisper file budget (1 MiB total decoded bytes)
+    fails the dispatch with a clear validation error BEFORE any lease is
+    created. On linux leases the command is prefixed \`IS_SANDBOX=1\` so the
+    claude CLI accepts \`--dangerously-skip-permissions\` under root (wisp
+    execs run as root); an image only needs \`claude\` reachable on the
+    default PATH.
   - \`script\`: no LLM; \`runner_config.command_template\` (required; a missing/
     empty one fails the dispatch BEFORE leasing) is rendered
     and run as the agent step; its stdout is the run's result text. Exit 0 =
@@ -205,7 +216,8 @@ string (default \`findings\`) that the core never interprets.
   \`command_template\`s and the \`script\` runner's \`command_template\`; it is
   NEVER placed in the lease env, and \`prompt_template\` / \`userdata_template\` /
   \`prompt\`-kind snippet content also do NOT see it, so a step-only value can
-  never reach the lease (via userdata) or the prompt the agent sees). A missing
+  never reach the lease (via userdata, or via the staged \`/work/prompt.txt\`
+  prompt file) or the prompt the agent sees). A missing
   secret fails the dispatch before leasing under both shapes. Use
   \`inject: "step-only"\` for one-shot credentials (e.g. a PAT that a \`pre\`
   step's \`git clone\` needs once); the value still appears in that step's

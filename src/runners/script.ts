@@ -7,10 +7,11 @@
  * COMMAND: the runner's `command_template` is rendered with the SAME template
  * engine used for prompts and step commands ({@link renderTemplate}) — supporting
  * `{{event.*}}`, `{{payload.*}}`, and `{{env.*}}` (the resolved playbook secrets)
- * — and returned verbatim as the agent-step exec. The `prompt` argument is unused:
- * a script playbook's `prompt_template` may be empty. Whatever command the
- * template renders is run through the wisper client's existing per-OS exec
- * wrapping; this runner adds no OS branching of its own.
+ * and returned verbatim as the agent-step exec. There is no `promptFilePath`
+ * on this runner: a script playbook's `prompt_template` may be empty and the
+ * executor stages no prompt file for it. Whatever command the template renders
+ * is run through the wisper client's existing per-OS exec wrapping; this
+ * runner adds no OS branching of its own.
  *
  * OUTPUT: the raw captured stdout is the result text as-is, with no envelope
  * requirement — exit code 0 is the sole success signal (enforced by the
@@ -107,7 +108,6 @@ export const scriptRunner: Runner = {
   },
 
   buildCommand(
-    _prompt: string,
     config: unknown,
     _os: LeaseOs | null,
     ctx: RunnerCommandContext

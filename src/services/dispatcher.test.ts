@@ -290,10 +290,16 @@ describe("Dispatcher", () => {
       expect((await getDispatch(id, db))?.status).toBe("done");
     }
 
-    // The agent execs ran in strict oldest-first order: S=1, then S=2, then S=3.
-    const order = fake.streamCommands.map((c) => {
-      const m = c.match(/S=(\d)/);
-      return m ? m[1] : "?";
+    // The agent execs ran in strict oldest-first order: the rendered prompt
+    // for each dispatch is staged as a lease file at /work/prompt.txt on its
+    // createLease body, and each carries S=<subject_ref>.
+    const order = fake.createBodies.map((body) => {
+      const files = body.files as Array<{ path: string; content_base64: string }>;
+      const promptFile = files?.find((f) => f.path === "/work/prompt.txt");
+      const decoded = promptFile
+        ? Buffer.from(promptFile.content_base64, "base64").toString("utf8")
+        : "";
+      return decoded.match(/S=(\d)/)?.[1] ?? "?";
     });
     expect(order).toEqual(["1", "2", "3"]);
     // Leases were created and released one per dispatch, in the same order.
@@ -607,8 +613,16 @@ describe("Dispatcher", () => {
     expect((await getDispatch(third, db))?.status).toBe("done");
     expect(fake.createBodies).toHaveLength(3);
 
-    // FIFO order preserved end to end: S=1, then S=2, then S=3.
-    const order = fake.streamCommands.map((c) => c.match(/S=(\d)/)?.[1] ?? "?");
+    // FIFO order preserved end to end: the rendered prompt on each
+    // successive createLease body carries S=1, then S=2, then S=3.
+    const order = fake.createBodies.map((body) => {
+      const files = body.files as Array<{ path: string; content_base64: string }>;
+      const promptFile = files?.find((f) => f.path === "/work/prompt.txt");
+      const decoded = promptFile
+        ? Buffer.from(promptFile.content_base64, "base64").toString("utf8")
+        : "";
+      return decoded.match(/S=(\d)/)?.[1] ?? "?";
+    });
     expect(order).toEqual(["1", "2", "3"]);
   });
 

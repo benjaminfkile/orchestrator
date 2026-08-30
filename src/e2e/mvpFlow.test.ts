@@ -272,16 +272,20 @@ describe("E2E: full MVP flow against a fake wisper", () => {
       expect((await getDispatch(q.id, db))?.status).toBe("done");
     }
 
-    // The agent execs streamed oldest-first: Alpha's prompt before Beta's.
-    const order = fake.execs
-      .filter((e) => e.streaming)
-      .map((e) =>
-        e.command.includes("Alpha")
-          ? "Alpha"
-          : e.command.includes("Beta")
-            ? "Beta"
-            : "?"
-      );
+    // The dispatches streamed oldest-first: the rendered prompt on each
+    // successive createLease body is staged as a file at /work/prompt.txt
+    // and carries the payload's title (Alpha before Beta).
+    const order = fake.createRequests.map((body) => {
+      const files = (body as { files?: Array<{ path: string; content_base64: string }> })
+        .files;
+      const promptFile = files?.find((f) => f.path === "/work/prompt.txt");
+      const decoded = promptFile
+        ? Buffer.from(promptFile.content_base64, "base64").toString("utf8")
+        : "";
+      if (decoded.includes("Alpha")) return "Alpha";
+      if (decoded.includes("Beta")) return "Beta";
+      return "?";
+    });
     expect(order).toEqual(["Alpha", "Beta"]);
 
     // One lease per dispatch, each released, in the same order.
