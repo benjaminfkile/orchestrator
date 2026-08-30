@@ -167,6 +167,39 @@ export interface ConfigExportDocument {
   required_secrets: RequiredSecret[];
 }
 
+/**
+ * A per-export exclusion set: names of playbooks / rules / snippets / notifiers
+ * to leave out of the produced document. Names key against the exported
+ * document (a playbook by its `name`, a rule by its `name`, a notifier by its
+ * `name`, a snippet by its `name` (snippet identity is (kind, name) but the
+ * dialog groups all kinds together and names are unique WITHIN a kind, so
+ * excluding a name drops every snippet of that name across kinds). Selections
+ * are per-export only; nothing is persisted anywhere. Unknown names are a
+ * validation error (see {@link UnknownExclusionError}).
+ */
+export interface ExportExclude {
+  playbooks?: string[];
+  rules?: string[];
+  snippets?: string[];
+  notifiers?: string[];
+}
+
+/**
+ * One entry in an export's `warnings` array. Names an included rule whose
+ * dispatch or notify target refers to an excluded (or never-exported) entity,
+ * so the caller knows the import side must already have it.
+ */
+export interface ExportWarning {
+  /** The rule whose target is unresolvable within this document. */
+  rule: string;
+  /** Which target kind is dangling: dispatch (a playbook) or notify. */
+  kind: "dispatch" | "notify";
+  /** The missing entity's name (playbook or notifier). */
+  target: string;
+  /** A human-readable one-liner suitable for direct display. */
+  message: string;
+}
+
 /** A currently stored secret, passed in by the caller for the leak scan only. */
 export interface SecretEntry {
   name: string;
@@ -188,7 +221,24 @@ export interface ExportConfigOptions {
    * for public sharing.
    */
   scrub?: "environment";
+  /**
+   * Per-export exclusion set (names). Chosen at export time by the caller (the
+   * dialog on the Settings page); nothing is persisted anywhere. Excluding a
+   * notifier ALSO drops it from every remaining rule's notify targets, because
+   * the importer 409s on a dangling notify name. Excluding a playbook leaves
+   * every rule that dispatches it intact; the response's `warnings` names each
+   * such rule so the caller knows the import side must already have the
+   * referenced playbook (or that the target was dangling in the source).
+   * Unknown names throw {@link UnknownExclusionError}.
+   */
+  exclude?: ExportExclude;
   db?: Knex;
+}
+
+/** The result of an export: the document itself plus any dangling-reference warnings. */
+export interface ExportConfigResult {
+  document: ConfigExportDocument;
+  warnings: ExportWarning[];
 }
 
 /**
@@ -200,6 +250,31 @@ export class SecretLeakError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SecretLeakError";
+  }
+}
+
+/**
+ * Raised when an {@link ExportConfigOptions.exclude} entry names something that
+ * is not in the corresponding group. The message lists every unknown name in
+ * each group so the caller can render a single 400 with the full list.
+ */
+export class UnknownExclusionError extends Error {
+  readonly unknown: {
+    playbooks: string[];
+    rules: string[];
+    snippets: string[];
+    notifiers: string[];
+  };
+  constructor(unknown: UnknownExclusionError["unknown"]) {
+    const parts: string[] = [];
+    for (const group of ["playbooks", "rules", "snippets", "notifiers"] as const) {
+      if (unknown[group].length > 0) {
+        parts.push(`${group}: ${unknown[group].map((n) => JSON.stringify(n)).join(", ")}`);
+      }
+    }
+    super(`unknown exclude entries: ${parts.join("; ")}`);
+    this.name = "UnknownExclusionError";
+    this.unknown = unknown;
   }
 }
 
@@ -325,16 +400,29 @@ function scanForSecrets(
 }
 
 /**
+ * The stable identity string for an exported snippet: `<kind>:<name>`. Matches
+ * the importer's plan key so a UI that shows one and passes the other back is
+ * consistent. Excluded snippets are keyed the same way.
+ */
+export function snippetIdentity(s: { kind: SnippetKind; name: string }): string {
+  return `${s.kind}:${s.name}`;
+}
+
+/**
  * Build (and secret-scan) the portable config export document. Reads only
  * playbooks, rules, snippets, module_config, and app_settings — never the
  * secret store. Throws {@link SecretLeakError} when a stored secret value
- * appears anywhere in the document.
+ * appears anywhere in the document. When `exclude` is set, filters the named
+ * playbooks / rules / snippets / notifiers out and returns any dangling-
+ * reference warnings for included rules whose dispatch or notify target is
+ * excluded or was already unresolvable in the source.
  */
 export async function exportConfig(
   options: ExportConfigOptions
-): Promise<ConfigExportDocument> {
+): Promise<ExportConfigResult> {
   const db = options.db ?? getDb();
   const scrub = options.scrub === "environment";
+  const exclude = options.exclude ?? {};
 
   const [playbooks, rules, notifiers, snippets, moduleConfigs, allSettings] =
     await Promise.all([
@@ -356,17 +444,48 @@ export async function exportConfig(
   const notifierNameById = new Map<number, string>();
   for (const n of notifiers) notifierNameById.set(n.id, n.name);
 
-  const exportedPlaybooks = playbooks.map(exportPlaybook);
+  const allPlaybookNames = new Set(playbooks.map((p) => p.name));
+  const allRuleNames = new Set(rules.map((r) => r.name));
+  const allNotifierNames = new Set(notifiers.map((n) => n.name));
+  const allSnippetKeys = new Set(snippets.map(snippetIdentity));
+
+  // Validate exclusions up-front: any name that does not match a currently
+  // known entry is a caller error and 400s with the full list per group.
+  const excludePlaybooks = new Set(exclude.playbooks ?? []);
+  const excludeRules = new Set(exclude.rules ?? []);
+  const excludeNotifiers = new Set(exclude.notifiers ?? []);
+  const excludeSnippets = new Set(exclude.snippets ?? []);
+  const unknown: UnknownExclusionError["unknown"] = {
+    playbooks: [...excludePlaybooks].filter((n) => !allPlaybookNames.has(n)),
+    rules: [...excludeRules].filter((n) => !allRuleNames.has(n)),
+    notifiers: [...excludeNotifiers].filter((n) => !allNotifierNames.has(n)),
+    snippets: [...excludeSnippets].filter((n) => !allSnippetKeys.has(n)),
+  };
+  if (
+    unknown.playbooks.length +
+      unknown.rules.length +
+      unknown.notifiers.length +
+      unknown.snippets.length >
+    0
+  ) {
+    throw new UnknownExclusionError(unknown);
+  }
+
+  const exportedPlaybooks = playbooks
+    .filter((p) => !excludePlaybooks.has(p.name))
+    .map(exportPlaybook);
 
   // Notifiers are listed newest-first for the UI; sort by name so exports of
   // the same setup are diffable.
   const exportedNotifiers = notifiers
+    .filter((n) => !excludeNotifiers.has(n.name))
     .map(exportNotifier)
     .sort((a, b) => a.name.localeCompare(b.name));
 
   // Snippets are listed newest-first for the UI; sort by (kind, name) — their
   // stable identity — so exports of the same setup are diffable.
   const exportedSnippets = snippets
+    .filter((s) => !excludeSnippets.has(snippetIdentity(s)))
     .map(exportSnippet)
     .sort((a, b) =>
       a.kind === b.kind
@@ -374,21 +493,72 @@ export async function exportConfig(
         : a.kind.localeCompare(b.kind)
     );
 
-  const exportedRules: ExportedRule[] = rules.map((rule) => ({
-    name: rule.name,
-    enabled: rule.enabled,
-    match: rule.match,
-    dispatch: rule.dispatch.map((target) => {
-      const out: ExportedDispatchTarget = {
-        playbook: keyById.get(target.playbook_id) ?? null,
+  // Included playbooks (by name), used both to shape the rule warnings and to
+  // rebuild required_secrets from only the surviving playbooks.
+  const includedPlaybookNames = new Set(exportedPlaybooks.map((p) => p.name));
+
+  const warnings: ExportWarning[] = [];
+
+  const exportedRules: ExportedRule[] = rules
+    .filter((r) => !excludeRules.has(r.name))
+    .map((rule) => {
+      const dispatch: ExportedDispatchTarget[] = rule.dispatch.map((target) => {
+        const playbookName = keyById.get(target.playbook_id) ?? null;
+        const out: ExportedDispatchTarget = { playbook: playbookName };
+        if (target.bindings !== undefined) out.bindings = target.bindings;
+        // Warn when the dispatch target was already unresolvable in the source
+        // OR when the referenced playbook exists but was excluded from this
+        // export. Either way the import side must already have it.
+        if (playbookName === null) {
+          warnings.push({
+            rule: rule.name,
+            kind: "dispatch",
+            target: "",
+            message: `rule ${JSON.stringify(rule.name)} dispatches to a playbook that was unresolvable at export time; the import side must already have the intended playbook`,
+          });
+        } else if (!includedPlaybookNames.has(playbookName)) {
+          warnings.push({
+            rule: rule.name,
+            kind: "dispatch",
+            target: playbookName,
+            message: `rule ${JSON.stringify(rule.name)} dispatches to excluded playbook ${JSON.stringify(playbookName)}; the import side must already have it`,
+          });
+        }
+        return out;
+      });
+
+      // Notify targets that reference an EXCLUDED notifier are DROPPED (the
+      // importer 409s on a dangling notify name). A target that was already
+      // null in the source is kept and warned; the user can decide whether the
+      // import side already has the intended notifier.
+      const notify: ExportedNotifyTarget[] = [];
+      for (const target of rule.notify) {
+        const notifierName = notifierNameById.get(target.notifier_id) ?? null;
+        if (notifierName !== null && excludeNotifiers.has(notifierName)) {
+          // Dropped silently: an excluded notifier is a deliberate opt-out
+          // no warning, else the dialog would spam warnings for every rule
+          // that used to notify it.
+          continue;
+        }
+        if (notifierName === null) {
+          warnings.push({
+            rule: rule.name,
+            kind: "notify",
+            target: "",
+            message: `rule ${JSON.stringify(rule.name)} notifies a notifier that was unresolvable at export time; the import side must already have the intended notifier`,
+          });
+        }
+        notify.push({ notifier: notifierName });
+      }
+
+      return {
+        name: rule.name,
+        enabled: rule.enabled,
+        match: rule.match,
+        dispatch,
+        notify,
       };
-      if (target.bindings !== undefined) out.bindings = target.bindings;
-      return out;
-    }),
-    notify: rule.notify.map((target) => ({
-      notifier: notifierNameById.get(target.notifier_id) ?? null,
-    })),
-  }));
+    });
 
   const modules: Record<string, unknown> = {};
   for (const entry of moduleConfigs) {
@@ -406,8 +576,10 @@ export async function exportConfig(
       scrub && key === DEFAULT_LEASE_IMAGE_SETTING ? "" : value;
   }
 
-  // required_secrets: union of every playbook env_requirements entry and every
-  // module pat_secret_ref. Names only, each with a list of human-readable uses.
+  // required_secrets: union of every INCLUDED playbook's env_requirements plus
+  // every module pat_secret_ref. Names only, each with a list of human-readable
+  // uses. Excluded playbooks contribute no rows: their env requirements are
+  // irrelevant to the filtered document.
   const usesByName = new Map<string, string[]>();
   const addUse = (name: string, use: string): void => {
     const uses = usesByName.get(name);
@@ -444,7 +616,8 @@ export async function exportConfig(
   };
 
   // Defense in depth: scan every exported section for any stored secret VALUE
-  // and fail loudly, naming the offending object. We never mask-and-continue.
+  // and fail loudly, naming the offending object. Runs on the FILTERED
+  // document, so an excluded object cannot cause a leak that never leaves.
   for (const p of doc.playbooks) {
     scanForSecrets(`playbook ${p.key}`, p, options.secrets);
   }
@@ -464,5 +637,5 @@ export async function exportConfig(
     scanForSecrets(`app_settings ${key}`, value, options.secrets);
   }
 
-  return doc;
+  return { document: doc, warnings };
 }

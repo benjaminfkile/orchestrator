@@ -488,18 +488,30 @@ rename therefore breaks every reference by design.
 ## Portability
 
 - \`GET /api/config/export\` (add \`?scrub=environment\` to strip machine-local
-  values): one JSON document (\`schema_version\` 2): playbooks, rules (with
-  their \`dispatch\` AND \`notify\` targets), notifiers, snippets, module config
-  (always exported DISABLED), whitelisted settings (never \`identity_me\`);
-  secrets travel as NAMES only. Notifiers preserve their \`enabled\` bit (unlike
-  modules); they are reactive sinks that only fire when a matched rule
-  targets them. Rule \`notify\` targets are rewritten to reference notifiers by
-  NAME. 409s when a stored secret VALUE is found pasted inside a template OR
-  inside a notifier's free-form \`config\` blob. Note: NOTHING in the core
-  consumes notifier \`config\` today (delivery never reads it) and the leak
-  scan only catches values that match a currently STORED secret, so an
-  unstored credential pasted into \`config\` would slip through. Never paste
-  credentials into a notifier's \`config\` at all.
+  values): the FULL portable document (\`schema_version\` 2): playbooks, rules
+  (with their \`dispatch\` AND \`notify\` targets), notifiers, snippets, module
+  config (always exported DISABLED), whitelisted settings (never
+  \`identity_me\`); secrets travel as NAMES only. Notifiers preserve their
+  \`enabled\` bit (unlike modules); they are reactive sinks that only fire when
+  a matched rule targets them. Rule \`notify\` targets are rewritten to
+  reference notifiers by NAME. 409s when a stored secret VALUE is found pasted
+  inside a template OR inside a notifier's free-form \`config\` blob. Note:
+  NOTHING in the core consumes notifier \`config\` today (delivery never reads
+  it) and the leak scan only catches values that match a currently STORED
+  secret, so an unstored credential pasted into \`config\` would slip through.
+  Never paste credentials into a notifier's \`config\` at all.
+- \`POST /api/config/export\` body \`{exclude?: {playbooks?, rules?, snippets?,
+  notifiers?}, scrub?}\` -> \`{document, warnings}\`: the FILTERED export chosen
+  at export time. Excluding a notifier ALSO drops it from every remaining
+  rule's \`notify\` list (the importer would otherwise 409 on a dangling name);
+  excluding a playbook leaves rules that dispatch it intact and emits a
+  warning per included rule whose dispatch or notify target refers to an
+  excluded (or never-exported) entity so the caller knows the import side
+  must already have it. Snippet ids in \`exclude.snippets\` are \`<kind>:<name>\`.
+  Unknown names in \`exclude\` 400 with an \`unknown\` map per group. Selection
+  is per-export only; NOTHING is persisted anywhere (there are no per-entity
+  "exclude from export" flags in the schema). The leak scan runs on the
+  filtered document.
 - \`POST /api/config/import\` body \`{document, mode?, dry_run?}\`: \`mode\` is
   \`merge\` (default: skip name collisions) or \`overwrite\` (replace them);
   \`dry_run: true\` computes the full plan with NO writes. Notifiers are matched

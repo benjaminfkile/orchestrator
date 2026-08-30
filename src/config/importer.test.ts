@@ -285,7 +285,7 @@ describe("config importer", () => {
       { name: "vm-pb", image: "img", ttl_seconds: 60, isolation: "vm" },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -310,7 +310,7 @@ describe("config importer", () => {
     // sampleDoc's playbook has no isolation field at all -> stored null.
     expect(pb.isolation).toBeNull();
 
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -564,7 +564,7 @@ describe("config importer", () => {
       db
     );
 
-    const first = await exportConfig({
+    const { document: first } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -583,7 +583,7 @@ describe("config importer", () => {
 
       await importConfig({ document: first, secretNames: [], db: target });
 
-      const second = await exportConfig({
+      const { document: second } = await exportConfig({
         nowIso: "2026-07-16T00:00:00.000Z",
         secrets: [],
         db: target,

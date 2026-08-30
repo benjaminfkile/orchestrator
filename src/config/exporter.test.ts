@@ -18,6 +18,7 @@ import {
   EXPORT_SCHEMA_VERSION,
   exportConfig,
   SecretLeakError,
+  UnknownExclusionError,
 } from "./exporter";
 
 function tempDbFile(): string {
@@ -59,7 +60,7 @@ describe("config exporter", () => {
   });
 
   it("stamps kind, schema_version and the provided timestamp", async () => {
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -93,7 +94,7 @@ describe("config exporter", () => {
       },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -132,7 +133,7 @@ describe("config exporter", () => {
       },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -151,7 +152,7 @@ describe("config exporter", () => {
       },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -169,7 +170,7 @@ describe("config exporter", () => {
       },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -222,7 +223,7 @@ describe("config exporter", () => {
       db
     );
     // An empty stored value must not match every string in the document.
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [{ name: "EMPTY", value: "" }],
       db,
@@ -236,7 +237,7 @@ describe("config exporter", () => {
       { org: "contoso", project: "widgets", enabled: true },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -256,7 +257,7 @@ describe("config exporter", () => {
       },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -269,7 +270,7 @@ describe("config exporter", () => {
     await setSetting("run_budget_per_hour", "10", db);
     await setSetting("run_budget_window_minutes", "300", db);
     await setSetting("token_budget_per_window", "500000", db);
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -295,7 +296,7 @@ describe("config exporter", () => {
       { name: "plain", image: "img", ttl_seconds: 60 },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -324,7 +325,7 @@ describe("config exporter", () => {
       { kind: "prompt", name: "guardrails", content: "Never push." },
       db
     );
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -371,7 +372,7 @@ describe("config exporter", () => {
 
   it("emits no numeric ids anywhere in the document", async () => {
     await setSetting("dispatch_max_attempts", "5", db);
-    const doc = await exportConfig({
+    const { document: doc } = await exportConfig({
       nowIso: "2026-07-15T00:00:00.000Z",
       secrets: [],
       db,
@@ -381,5 +382,281 @@ describe("config exporter", () => {
     for (const p of doc.playbooks) {
       expect(p).not.toHaveProperty("id");
     }
+  });
+});
+
+describe("config exporter, per-export exclusion", () => {
+  let file: string;
+  let db: Knex;
+
+  beforeEach(async () => {
+    file = tempDbFile();
+    db = createDb(file);
+    await runMigrations(db);
+    setDb(db);
+    await db("rules").delete();
+    await db("playbooks").delete();
+    await db("notifiers").delete();
+    await db("module_config").delete();
+    await db("app_settings").delete();
+  });
+
+  afterEach(async () => {
+    await db.destroy();
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
+  });
+
+  it("drops excluded playbooks and rebuilds required_secrets without them", async () => {
+    await createPlaybook(
+      {
+        name: "keep",
+        image: "img",
+        ttl_seconds: 60,
+        env_requirements: ["KEEP_TOKEN"],
+      },
+      db
+    );
+    await createPlaybook(
+      {
+        name: "drop",
+        image: "img",
+        ttl_seconds: 60,
+        env_requirements: ["DROP_TOKEN"],
+      },
+      db
+    );
+    const { document: doc, warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      exclude: { playbooks: ["drop"] },
+      db,
+    });
+    expect(doc.playbooks.map((p) => p.name)).toEqual(["keep"]);
+    // required_secrets tracks only the surviving playbook's env requirements.
+    const names = doc.required_secrets.map((s) => s.name);
+    expect(names).toContain("KEEP_TOKEN");
+    expect(names).not.toContain("DROP_TOKEN");
+    expect(warnings).toEqual([]);
+  });
+
+  it("drops excluded rules but leaves everything else intact", async () => {
+    const playbook = await createPlaybook(
+      { name: "runner", image: "img", ttl_seconds: 60 },
+      db
+    );
+    await createRule(
+      {
+        name: "keep-rule",
+        match: {},
+        dispatch: [{ playbook_id: playbook.id }],
+      },
+      db
+    );
+    await createRule(
+      {
+        name: "drop-rule",
+        match: {},
+        dispatch: [{ playbook_id: playbook.id }],
+      },
+      db
+    );
+    const { document: doc, warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      exclude: { rules: ["drop-rule"] },
+      db,
+    });
+    expect(doc.rules.map((r) => r.name)).toEqual(["keep-rule"]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("drops excluded snippets identified by kind:name and leaves same-name entries in other kinds", async () => {
+    await createSnippet(
+      { kind: "prompt", name: "shared", content: "PROMPT" },
+      db
+    );
+    await createSnippet(
+      { kind: "userdata", name: "shared", content: "USERDATA" },
+      db
+    );
+    const { document: doc } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      exclude: { snippets: ["prompt:shared"] },
+      db,
+    });
+    expect(doc.snippets).toEqual([
+      {
+        kind: "userdata",
+        name: "shared",
+        description: "",
+        content: "USERDATA",
+      },
+    ]);
+  });
+
+  it("drops excluded notifiers AND removes them from every rule's notify targets", async () => {
+    const desktop = await createNotifier({ name: "desktop" }, db);
+    const email = await createNotifier({ name: "email" }, db);
+    await createRule(
+      {
+        name: "notify-both",
+        match: {},
+        dispatch: [],
+        notify: [
+          { notifier_id: desktop.id },
+          { notifier_id: email.id },
+        ],
+      },
+      db
+    );
+    const { document: doc, warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      exclude: { notifiers: ["desktop"] },
+      db,
+    });
+    expect(doc.notifiers.map((n) => n.name)).toEqual(["email"]);
+    const rule = doc.rules.find((r) => r.name === "notify-both");
+    // The excluded notifier is dropped in-place, keeping the surviving one.
+    expect(rule?.notify).toEqual([{ notifier: "email" }]);
+    // Dropping an excluded notifier is a deliberate opt-out and does NOT warn.
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns for included rules whose dispatch target is an excluded playbook", async () => {
+    const playbook = await createPlaybook(
+      { name: "excluded-pb", image: "img", ttl_seconds: 60 },
+      db
+    );
+    await createRule(
+      {
+        name: "still-here",
+        match: {},
+        dispatch: [{ playbook_id: playbook.id }],
+      },
+      db
+    );
+    const { document: doc, warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      exclude: { playbooks: ["excluded-pb"] },
+      db,
+    });
+    expect(doc.playbooks).toEqual([]);
+    // The rule survives with its dispatch target preserved (import side needs it).
+    const rule = doc.rules.find((r) => r.name === "still-here");
+    expect(rule?.dispatch).toEqual([{ playbook: "excluded-pb" }]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      rule: "still-here",
+      kind: "dispatch",
+      target: "excluded-pb",
+    });
+    expect(warnings[0].message).toContain("still-here");
+    expect(warnings[0].message).toContain("excluded-pb");
+  });
+
+  it("warns for included rules whose dispatch target was unresolvable in the source", async () => {
+    await createRule(
+      {
+        name: "dangling-source",
+        match: {},
+        dispatch: [{ playbook_id: 999999 }],
+      },
+      db
+    );
+    const { warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      db,
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      rule: "dangling-source",
+      kind: "dispatch",
+    });
+  });
+
+  it("warns for included rules whose notify target was unresolvable in the source", async () => {
+    await createRule(
+      {
+        name: "dangling-notify",
+        match: {},
+        dispatch: [],
+        notify: [{ notifier_id: 999999 }],
+      },
+      db
+    );
+    const { warnings } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [],
+      db,
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      rule: "dangling-notify",
+      kind: "notify",
+    });
+  });
+
+  it("throws UnknownExclusionError listing every unknown name across groups", async () => {
+    await createPlaybook({ name: "pb", image: "img", ttl_seconds: 60 }, db);
+    await createNotifier({ name: "desk" }, db);
+    await expect(
+      exportConfig({
+        nowIso: "2026-07-15T00:00:00.000Z",
+        secrets: [],
+        exclude: {
+          playbooks: ["pb", "nope-pb"],
+          notifiers: ["desk", "nope-notif"],
+        },
+        db,
+      })
+    ).rejects.toBeInstanceOf(UnknownExclusionError);
+    try {
+      await exportConfig({
+        nowIso: "2026-07-15T00:00:00.000Z",
+        secrets: [],
+        exclude: {
+          playbooks: ["nope-pb"],
+          rules: ["nope-rule"],
+        },
+        db,
+      });
+    } catch (err) {
+      expect(err).toBeInstanceOf(UnknownExclusionError);
+      const unknown = (err as UnknownExclusionError).unknown;
+      expect(unknown.playbooks).toEqual(["nope-pb"]);
+      expect(unknown.rules).toEqual(["nope-rule"]);
+    }
+  });
+
+  it("runs the secret leak scan on the FILTERED document (an excluded leaky playbook does not fail export)", async () => {
+    await createPlaybook(
+      {
+        name: "leaky",
+        image: "img",
+        ttl_seconds: 60,
+        prompt_template: "token=deadbeefcafef00d",
+      },
+      db
+    );
+    // Without exclusion, the leak scan fails.
+    await expect(
+      exportConfig({
+        nowIso: "2026-07-15T00:00:00.000Z",
+        secrets: [{ name: "TOKEN", value: "deadbeefcafef00d" }],
+        db,
+      })
+    ).rejects.toBeInstanceOf(SecretLeakError);
+    // With the leaky playbook excluded, the scan sees nothing offending.
+    const { document: doc } = await exportConfig({
+      nowIso: "2026-07-15T00:00:00.000Z",
+      secrets: [{ name: "TOKEN", value: "deadbeefcafef00d" }],
+      exclude: { playbooks: ["leaky"] },
+      db,
+    });
+    expect(doc.playbooks).toEqual([]);
   });
 });

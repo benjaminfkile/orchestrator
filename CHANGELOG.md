@@ -227,6 +227,22 @@ owns the lease lifecycle, never the agent inside it.
   reads both **v2** and **v1** documents; a v1 document (which had no
   notifiers and no rule `notify` field) imports cleanly, with those fields
   defaulting to empty.
+- `POST /api/config/export` body `{exclude?: {playbooks?, rules?, snippets?,
+  notifiers?}, scrub?}` returns `{document, warnings}`: a filtered export
+  chosen at the moment of export, with no per-entity "exclude from export"
+  flags stored anywhere in the schema. Excluding a notifier also drops it from
+  every remaining rule's `notify` list (the importer would otherwise 409 on a
+  dangling name); excluding a playbook keeps rules that dispatch it intact and
+  emits a warning per included rule whose dispatch or notify target refers to
+  an excluded (or never-exported) entity so the caller knows the import side
+  must already have it. Snippet ids in `exclude.snippets` are `<kind>:<name>`.
+  Unknown names in `exclude` are a 400 listing them per group. The existing
+  secret-leak scan and `schema_version` are unchanged and run on the FILTERED
+  document. The Settings page's Export button opens a dialog that lists every
+  exportable entry grouped by Playbooks / Rules / Snippets / Notifiers with a
+  checkbox per entry (all checked by default) and check-all / check-none per
+  group; Download calls the filtered POST with the unchecked names and
+  surfaces any warnings from the response before saving the JSON file.
 - Work-item event payloads carry the human web-UI `url`
   (`_apis/wit/workItems/{id}` → `_workitems/edit/{id}`, host/org/project
   preserved) so a click opens the item rather than raw REST JSON; the original
