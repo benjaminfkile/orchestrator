@@ -349,8 +349,9 @@ function errorMessage(err: unknown): string {
 /**
  * Prefix marking a playbook `image` as an indirect reference to an
  * `app_settings` key resolved at dispatch time, rather than a literal image
- * reference. The seed `researcher` playbook stores `setting:default_lease_image`
- * so the image can be reconfigured without editing the playbook.
+ * reference. The optional smoke-test seed (installed with `npm run
+ * seed:smoke-test`) uses `setting:default_lease_image` so the concrete image
+ * can be reconfigured without editing the playbook.
  */
 export const IMAGE_SETTING_PREFIX = "setting:";
 

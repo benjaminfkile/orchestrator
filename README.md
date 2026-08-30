@@ -2,7 +2,8 @@
 
 Event-driven lease orchestrator. It watches external systems (Azure DevOps
 first), matches what it sees against user-configured **rules**, and runs
-data-driven **playbooks** (e.g. the seeded first-launch smoke test) inside
+data-driven **playbooks** (the optional `npm run seed:smoke-test` command
+installs a working end-to-end example; see **Testing**) inside
 short-lived container **leases** rented from a locally running [wisper-api](https://github.com/benjaminfkile/wisper-api)
 (which brokers them down to [wisp](https://github.com/benjaminfkile/wisp) via
 [wisp-agent](https://github.com/benjaminfkile/wisp-agent)).
@@ -366,7 +367,7 @@ as TEXT; writes are whitelisted to the keys the core actually reads.
 
 | Key | Default | Effect |
 |---|---|---|
-| `default_lease_image` | *(none — required)* | Concrete image the seeded `smoke-test-clone-and-claude-linux` playbook resolves via its `setting:default_lease_image` reference. A dispatch fails if unset. |
+| `default_lease_image` | *(none; required)* | Concrete image any playbook resolves via a `setting:default_lease_image` reference (the smoke-test playbook installed by `npm run seed:smoke-test` uses this). A dispatch that names the reference fails if the setting is unset. |
 | `dispatch_concurrency` | `1` | In-flight dispatch cap. Values > 1 are clamped to 1 (single-flight for now). |
 | `dispatcher_interval_seconds` | `30` | Safety-net tick cadence for the dispatcher loop. |
 | `dispatch_max_attempts` | `3` | Max attempts before a retryable failure gives up. |
@@ -384,13 +385,13 @@ as TEXT; writes are whitelisted to the keys the core actually reads.
 ### Secrets
 
 Referenced **by name** from playbook `env_requirements` and module config; the
-values live only in the encrypted store. The seeded
-`smoke-test-clone-and-claude-linux` playbook requires:
+values live only in the encrypted store. The optional `npm run seed:smoke-test`
+playbook (see **Testing**) requires:
 
 | Secret name | Used by | Purpose |
 |---|---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | agent step | Authenticates the `claude` CLI inside the lease. |
-| `ADO_PAT` | `clone first repo in project` and credential-leak-hunt pre-steps (**step-only**) | Passed to `az repos list` via `AZURE_DEVOPS_EXT_PAT` and spliced into the clone URL; the leak-hunt step renders it again to grep the disk for its content. Delivered as `{name: "ADO_PAT", inject: "step-only"}` so it renders into pre-step templates but never lands in the lease environment — the agent step running inside the lease has no way to read it. The seeded playbook's third pre-step scrubs the credential from the git remote and clears `~/.azure`; the fourth (fatal) verifies the scrub. |
+| `ADO_PAT` | `clone first repo in project` and credential-leak-hunt pre-steps (**step-only**) | Passed to `az repos list` via `AZURE_DEVOPS_EXT_PAT` and spliced into the clone URL; the leak-hunt step renders it again to grep the disk for its content. Delivered as `{name: "ADO_PAT", inject: "step-only"}` so it renders into pre-step templates but never lands in the lease environment; the agent step running inside the lease has no way to read it. The seed playbook's third pre-step scrubs the credential from the git remote and clears `~/.azure`; the fourth (fatal) verifies the scrub. |
 
 **Lease-env vs step-only secrets.** Each `env_requirements` entry is either a
 plain string (the legacy shape) or an object `{name, inject: "step-only"}`. Both
@@ -889,10 +890,11 @@ configured (Modules page or step 5 of the runbook below):
 
 1. **Store the credentials as secrets** (Settings → Secrets, or `PUT
    /api/secrets`): at least `CLAUDE_CODE_OAUTH_TOKEN` and `ADO_PAT` (both
-   used by the seeded first-launch smoke test — the PAT is delivered
-   step-only, so it renders into the clone pre-step but never lands in the
-   lease environment). Optionally add `ANTHROPIC_API_KEY` so the Model
-   picker can list models (otherwise it falls back to `CLAUDE_CODE_OAUTH_TOKEN`).
+   used by the optional smoke-test seed installed via `npm run seed:smoke-test`;
+   the PAT is delivered step-only, so it renders into the clone pre-step
+   but never lands in the lease environment). Optionally add
+   `ANTHROPIC_API_KEY` so the Model picker can list models (otherwise it
+   falls back to `CLAUDE_CODE_OAUTH_TOKEN`).
 2. **Set `default_lease_image`** on the Settings page to your allow-listed runner
    image, and click **Resolve from ADO** on `identity_me` so `@Me` rules resolve.
 3. **Create a playbook** (Playbooks → *New*). The editor dialog groups the
@@ -954,12 +956,13 @@ trusted.
    **hostId** whose wisp-agent tunnel the leases should run through.
 
 2. **Build and allow-list a runner image.** Leases run the `claude` CLI, so the
-   image needs `node`, `git`, and the `claude` CLI on `PATH` (the seeded smoke
-   test installs git and the `claude` CLI itself when they are missing, so a
-   bare Debian/Ubuntu image also works for it). Build an image, then allow-list
-   it in the wisp host's image policy (see **Runner image**; only allow-listed
-   images may be leased). Its reference (e.g. `ghcr.io/acme/agent:latest`) is
-   what you'll store as `default_lease_image` in step 6.
+   image needs `node`, `git`, and the `claude` CLI on `PATH` (the optional
+   smoke-test seed installs git and the `claude` CLI itself when they are
+   missing, so a bare Debian/Ubuntu image also works for it). Build an image,
+   then allow-list it in the wisp host's image policy (see **Runner image**;
+   only allow-listed images may be leased). Its reference (e.g.
+   `ghcr.io/acme/agent:latest`) is what you'll store as `default_lease_image`
+   in step 6.
 
 3. **Configure and start orchestrator.**
 
@@ -981,8 +984,9 @@ trusted.
    claude setup-token          # prints a CLAUDE_CODE_OAUTH_TOKEN
    ```
 
-   Store it plus an ADO PAT (Work Items Read + Code Read — the seeded smoke
-   test uses the PAT to list a project's repos and clone the first one):
+   Store it plus an ADO PAT (Work Items Read + Code Read; the optional
+   smoke-test seed uses the PAT to list a project's repos and clone the first
+   one):
 
    ```sh
    curl -X PUT http://127.0.0.1:3007/api/secrets \
@@ -1007,10 +1011,10 @@ trusted.
           "watched":{"assignee_mode":"me","states":["Active"]}}'
    ```
 
-6. **Set the default lease image** to the reference from step 2. The seeded
-   `smoke-test-clone-and-claude-linux` playbook resolves its image through
-   `setting:default_lease_image` at dispatch time; a dispatch fails if the
-   setting is missing.
+6. **Set the default lease image** to the reference from step 2. Any playbook
+   that names `setting:default_lease_image` resolves the concrete image
+   through this setting at dispatch time; a dispatch that names the reference
+   fails if the setting is missing.
 
    ```sh
    curl -X PUT http://127.0.0.1:3007/api/settings \
@@ -1018,17 +1022,25 @@ trusted.
      -d '{"key":"default_lease_image","value":"ghcr.io/acme/agent:latest"}'
    ```
 
-7. **Fire the first-launch smoke test.** The seeded `smoke test:
-   ado.workitem.*` rules already dispatch the seeded playbook the instant
-   any observed work item carries the `smoke-test-clone-and-claude-linux`
-   tag, and the seeded `Smoke test started` / `Smoke test finished` /
-   `Smoke test failed` notify rules push a desktop toast on start, success,
-   and failure. So the trigger is:
+7. **Install the optional smoke-test seed and fire it.** A fresh install ships
+   NO playbooks, rules, or notifiers. To install a working end-to-end example
+   run the opt-in seeder (see **Testing** below for details):
+
+   ```sh
+   npm run seed:smoke-test
+   ```
+
+   That command installs the `smoke-test-clone-and-claude-linux` playbook,
+   seven `smoke test: ado.workitem.*` dispatch rules keyed to the playbook
+   name as a tag, the `desktop` notifier, and three notify rules
+   (`Smoke test started` / `Smoke test finished` / `Smoke test failed`) that
+   push a desktop toast on start, success, and failure. Once it has run, the
+   trigger is:
 
    ```
    Tag any work item the ADO module watches with the string
    smoke-test-clone-and-claude-linux and save it. The next touch of that
-   item (an edit, a state change, an assignment) will match a seeded rule
+   item (an edit, a state change, an assignment) will match a seed rule
    and dispatch the smoke test.
    ```
 
@@ -1069,6 +1081,37 @@ trusted.
    on 3007; the backend itself does not serve `web/dist`) shows the same via
    the Queue, Events, and Runs pages.
 
+## Testing
+
+A fresh install comes up empty. To install a working end-to-end example that
+exercises the full pipeline (ADO auth, lease, package installs, network,
+`claude` runner, notifications) run the optional smoke-test seeder:
+
+```sh
+npm run seed:smoke-test
+```
+
+That command writes through the same repo layer the REST API uses, targeting
+the DB file the server would open (`ORCH_DB_PATH` verbatim when set,
+otherwise `<ORCH_DATA_DIR|OS user-data>/orchestrator.sqlite`), and installs:
+
+- the `smoke-test-clone-and-claude-linux` playbook (env
+  `CLAUDE_CODE_OAUTH_TOKEN` lease-injected + `ADO_PAT` step-only; pre steps
+  install the azure CLI, clone the org's first repo, scrub the credential,
+  run a fatal credential-leak hunt, and install the `claude` CLI);
+- seven `smoke test: ado.workitem.*` dispatch rules that fire when a work
+  item's `tags` contains the playbook name;
+- the `desktop` notifier;
+- three notify rules (`Smoke test started` / `Smoke test finished` /
+  `Smoke test failed`) on the playbook's `run.started` / `run.completed` /
+  `run.failed` lifecycle events.
+
+The seeder is **idempotent by name**: a second run skips every row that
+already exists and never overwrites a user's edits. Once installed, the
+seeded content is user-editable exactly like anything created through the
+REST API or web UI. See step 7 of the **Local bring-up runbook** for how to
+fire the smoke-test playbook end-to-end.
+
 ## Layout
 
 - `index.ts`, `src/` — Express + better-sqlite3/knex backend (loopback only, no
@@ -1078,6 +1121,8 @@ trusted.
   Fluent UI baseline).
 - `runner/`: the `orchestrator-runner` lease image definitions (Linux and
   Windows) plus a reference wisp allow-list snippet.
+- `scripts/`: opt-in one-shot commands (see **Testing** above for
+  `seed-smoke-test.ts`).
 - `scripts/local/`: gitignored; a private team-automation install script lives
   here on a developer machine, never in the repo.
 

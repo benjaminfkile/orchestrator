@@ -858,10 +858,13 @@ describe("runDispatch pipeline", () => {
       ).toEqual([{ name: "PAT", inject: "step-only" }]);
     });
 
-    it("keeps ADO_PAT out of createLease env when running the SEEDED smoke-test playbook", async () => {
-      // Regression guard: even if the seed migration is ever edited, ADO_PAT
-      // must remain step-only, i.e. resolvable in step template rendering but
-      // never handed to createLease as part of the lease env.
+    it("keeps ADO_PAT out of createLease env when the smoke-test seed playbook drives the dispatch", async () => {
+      // Regression guard for the step-only injection contract: the same shape
+      // the `npm run seed:smoke-test` script installs must resolve ADO_PAT in
+      // step template rendering but never hand it to createLease as part of
+      // the lease env. The seed itself is opt-in and no longer ships in a
+      // migration, so this test builds the load-bearing pieces (env_requirements
+      // + a PAT-referencing pre step) through the repo layer directly.
       fake.planExec({
         exitCode: 0,
         chunks: [`{"type":"result","result":"ok"}\n`],
@@ -869,10 +872,35 @@ describe("runDispatch pipeline", () => {
       fake.planSync(() => ({ exitCode: 0 }));
       await setSetting("default_lease_image", "ghcr.io/example/img:1", db);
 
-      const seeded = await db("playbooks")
-        .where({ name: "smoke-test-clone-and-claude-linux" })
-        .first<{ id: number }>();
-      expect(seeded).toBeDefined();
+      const playbook = await createPlaybook(
+        {
+          name: "smoke-test-shape",
+          image: "setting:default_lease_image",
+          ttl_seconds: 600,
+          userdata_template: "#!/bin/sh\nexit 0",
+          prompt_template: "seed",
+          env_requirements: [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            { name: "ADO_PAT", inject: "step-only" },
+          ],
+          steps: [
+            {
+              phase: "pre",
+              label: "clone first repo in project",
+              command_template:
+                "AZURE_DEVOPS_EXT_PAT={{env.ADO_PAT}} az repos list --organization foo",
+            },
+            {
+              phase: "pre",
+              label: "scrub credentials",
+              command_template:
+                "git remote set-url origin \"$(git config --get remote.origin.url | sed 's|https://[^@]*@|https://|')\"; " +
+                "if git config --get remote.origin.url | grep -q '@'; then exit 1; fi",
+            },
+          ],
+        },
+        db
+      );
 
       const event = await insertEvent(
         {
@@ -883,14 +911,14 @@ describe("runDispatch pipeline", () => {
           payload: {
             api_url: "https://dev.azure.com/acme/_apis/wit/workItems/42",
             area_path: "Acme\\Widget\\Sub",
-            tags: ["smoke-test-clone-and-claude-linux"],
+            tags: ["smoke-test-shape"],
             title: "smoke",
           },
         },
         db
       );
       const dispatch = await createDispatch(
-        { event_id: event.id, playbook_id: seeded!.id },
+        { event_id: event.id, playbook_id: playbook.id },
         db
       );
 
@@ -911,8 +939,7 @@ describe("runDispatch pipeline", () => {
       expect(Object.values(leaseEnv)).not.toContain("pat-value-only-in-step");
 
       // The clone pre-step DID splice the PAT into its rendered command, and
-      // the scrub step DOES rewrite the remote URL to strip embedded creds —
-      // both are behaviors owned by the seed's step templates.
+      // the scrub step DOES rewrite the remote URL to strip embedded creds.
       const clone = fake.execs.find((e) =>
         e.command.includes("az repos list")
       );
@@ -923,7 +950,6 @@ describe("runDispatch pipeline", () => {
       expect(scrub?.command).toContain(
         "sed 's|https://[^@]*@|https://|'"
       );
-      // The scrub step also verifies the remote no longer carries an @-form.
       expect(scrub?.command).toContain(
         "if git config --get remote.origin.url | grep -q '@'"
       );

@@ -8,7 +8,7 @@
  * Streaming agent execs are scripted: each consumes the next {@link ScriptedAgentRun}
  * (the last one repeats), so a test can drive a success then a failure, or replay
  * the same run for every dispatch. Every synchronous exec (a playbook `pre`/`collect`
- * step, e.g. the researcher's `git clone`) simply succeeds with exit 0 — the flow
+ * step, e.g. a `git clone` pre step) simply succeeds with exit 0; the flow
  * under test cares about the agent step, not the shell steps.
  *
  * The fake is deliberately domain-neutral: it replays whatever claude stream-json
@@ -208,7 +208,7 @@ export class FakeWisper {
       if (streaming) {
         this.streamRun(this.nextRun(), res);
       } else {
-        // Synchronous steps (e.g. the researcher's git clone) always succeed;
+        // Synchronous steps (e.g. a `git clone` pre step) always succeed;
         // the flow under test asserts on the agent step, not the shell steps.
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ stdout: "", stderr: "", exit_code: 0 }));
