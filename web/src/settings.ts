@@ -70,6 +70,49 @@ export function getConfigExport(): Promise<unknown> {
   return apiFetch<unknown>(`/config/export`);
 }
 
+/**
+ * Per-export exclusion set for {@link postConfigExport}: names of playbooks /
+ * rules / notifiers, and `<kind>:<name>` identifiers of snippets, to leave out
+ * of the produced document. Names are chosen at export time in the UI's dialog
+ * and never persisted anywhere.
+ */
+export interface ConfigExportExclude {
+  playbooks?: string[];
+  rules?: string[];
+  snippets?: string[];
+  notifiers?: string[];
+}
+
+/** One dangling-reference warning attached to an export response. */
+export interface ConfigExportWarning {
+  rule: string;
+  kind: "dispatch" | "notify";
+  target: string;
+  message: string;
+}
+
+/** The response envelope from {@link postConfigExport}: document + warnings. */
+export interface ConfigExportResponse {
+  document: unknown;
+  warnings: ConfigExportWarning[];
+}
+
+/**
+ * Export with a per-export exclusion set (chosen in the dialog). GET
+ * {@link getConfigExport} is the full document; this POST filter is only
+ * reached from the dialog and returns a response envelope wrapping the
+ * filtered document plus any warnings for the dialog to surface before the
+ * download.
+ */
+export function postConfigExport(
+  exclude: ConfigExportExclude
+): Promise<ConfigExportResponse> {
+  return apiFetch<ConfigExportResponse>(`/config/export`, {
+    method: "POST",
+    body: { exclude },
+  });
+}
+
 /** Import collision strategy: skip name collisions, or replace them. */
 export type ImportMode = "merge" | "overwrite";
 

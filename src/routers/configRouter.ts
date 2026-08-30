@@ -1,6 +1,11 @@
 import express from "express";
 
-import { exportConfig, SecretLeakError } from "../config/exporter";
+import {
+  exportConfig,
+  SecretLeakError,
+  UnknownExclusionError,
+  type ExportExclude,
+} from "../config/exporter";
 import {
   importConfig,
   ImportError,
@@ -8,7 +13,13 @@ import {
 } from "../config/importer";
 import { getSecret, listSecretKeys } from "../secrets";
 
-import { handler, HttpError, requireBody } from "./http";
+import {
+  handler,
+  HttpError,
+  isPlainObject,
+  optionalStringArray,
+  requireBody,
+} from "./http";
 
 /**
  * `/api/config` — portable config export/import.
@@ -17,9 +28,19 @@ import { handler, HttpError, requireBody } from "./http";
  *                      module config, whitelisted settings, required-secrets
  *                      manifest) served as an attachment. `?scrub=environment`
  *                      additionally blanks environment identifiers for public
- *                      sharing.
+ *                      sharing. Serves the FULL export unconditionally; use
+ *                      `POST /export` to pick what to include.
  *
- *   POST /import        {document, mode?, dry_run?} — reproduces an export
+ *   POST /export       `{exclude?: {playbooks?, rules?, snippets?, notifiers?}}`
+ *                      returns the same document as `GET /export` minus the
+ *                      excluded entries, plus a `warnings` array listing any
+ *                      included rule whose dispatch or notify target refers to
+ *                      an excluded or never-exported entity. Unknown names in
+ *                      `exclude` are a 400 listing them. Selection is
+ *                      per-export only; nothing is persisted anywhere. The
+ *                      response envelope is `{document, warnings}`.
+ *
+ *   POST /import       `{document, mode?, dry_run?}`: reproduces an export
  *                      document locally. `mode` is "merge" (default, skip name
  *                      collisions) or "overwrite" (replace them). `dry_run` runs
  *                      no writes and returns the full plan. The apply is one
@@ -35,6 +56,29 @@ import { handler, HttpError, requireBody } from "./http";
  */
 const configRouter = express.Router();
 
+/**
+ * Read the stored secrets once for the leak scan. Names come from the store;
+ * values are resolved by name. The exporter never sees the store itself, only
+ * this snapshot list.
+ */
+function snapshotSecrets(): Array<{ name: string; value: string }> {
+  return listSecretKeys().map((name) => ({
+    name,
+    value: getSecret(name) ?? "",
+  }));
+}
+
+/** Render an {@link UnknownExclusionError} as the router's 400 body. */
+function unknownExclusionResponse(err: UnknownExclusionError): {
+  status: number;
+  body: { error: string; unknown: UnknownExclusionError["unknown"] };
+} {
+  return {
+    status: 400,
+    body: { error: err.message, unknown: err.unknown },
+  };
+}
+
 configRouter.get(
   "/export",
   handler(async (req, res) => {
@@ -44,19 +88,11 @@ configRouter.get(
     }
     const scrub = rawScrub === "environment" ? "environment" : undefined;
 
-    // Read the stored secrets ONCE, here, purely for the leak scan. Names come
-    // from the store; values are resolved by name. The exporter never sees the
-    // store — only this snapshot list.
-    const secrets = listSecretKeys().map((name) => ({
-      name,
-      value: getSecret(name) ?? "",
-    }));
-
-    let doc;
+    let result;
     try {
-      doc = await exportConfig({
+      result = await exportConfig({
         nowIso: new Date().toISOString(),
-        secrets,
+        secrets: snapshotSecrets(),
         scrub,
       });
     } catch (err) {
@@ -72,7 +108,75 @@ configRouter.get(
       "Content-Disposition",
       'attachment; filename="orchestrator-config.json"'
     );
-    res.status(200).json(doc);
+    res.status(200).json(result.document);
+  })
+);
+
+configRouter.post(
+  "/export",
+  handler(async (req, res) => {
+    // GET /export is the full document; POST /export accepts a per-export
+    // exclusion set chosen in the UI's dialog and returns the filtered doc
+    // alongside any dangling-reference warnings for the caller to display.
+    const body = req.body === undefined || req.body === null ? {} : req.body;
+    if (!isPlainObject(body)) {
+      throw new HttpError(400, "request body must be a JSON object");
+    }
+
+    const rawScrub = body.scrub;
+    if (rawScrub !== undefined && rawScrub !== "environment") {
+      throw new HttpError(400, "scrub must be 'environment' when present");
+    }
+    const scrub = rawScrub === "environment" ? "environment" : undefined;
+
+    let exclude: ExportExclude | undefined;
+    const rawExclude = body.exclude;
+    if (rawExclude !== undefined) {
+      if (!isPlainObject(rawExclude)) {
+        throw new HttpError(400, "exclude must be a JSON object when present");
+      }
+      const allowed = ["playbooks", "rules", "snippets", "notifiers"] as const;
+      for (const key of Object.keys(rawExclude)) {
+        if (!(allowed as readonly string[]).includes(key)) {
+          throw new HttpError(400, `unknown exclude field: ${key}`);
+        }
+      }
+      optionalStringArray(rawExclude.playbooks, "exclude.playbooks");
+      optionalStringArray(rawExclude.rules, "exclude.rules");
+      optionalStringArray(rawExclude.snippets, "exclude.snippets");
+      optionalStringArray(rawExclude.notifiers, "exclude.notifiers");
+      exclude = {
+        playbooks: rawExclude.playbooks as string[] | undefined,
+        rules: rawExclude.rules as string[] | undefined,
+        snippets: rawExclude.snippets as string[] | undefined,
+        notifiers: rawExclude.notifiers as string[] | undefined,
+      };
+    }
+
+    let result;
+    try {
+      result = await exportConfig({
+        nowIso: new Date().toISOString(),
+        secrets: snapshotSecrets(),
+        scrub,
+        exclude,
+      });
+    } catch (err) {
+      if (err instanceof UnknownExclusionError) {
+        const { status, body: payload } = unknownExclusionResponse(err);
+        res.status(status).json(payload);
+        return;
+      }
+      if (err instanceof SecretLeakError) {
+        throw new HttpError(409, err.message);
+      }
+      throw err;
+    }
+
+    res.status(200).json({
+      document: result.document,
+      warnings: result.warnings,
+    });
   })
 );
 

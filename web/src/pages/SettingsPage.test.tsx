@@ -8,15 +8,19 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteSecret,
-  getConfigExport,
   getSettings,
   getSystemInfo,
   importConfig,
   listSecrets,
+  postConfigExport,
   putSecret,
   putSetting,
   type ImportPlan,
 } from "../settings";
+import { listPlaybooks } from "../playbooks";
+import { listRules } from "../rules";
+import { listSnippets } from "../snippets";
+import { listNotifiers } from "../notifiers";
 import { getAdoMe } from "../discovery";
 import { SettingsPage } from "./SettingsPage";
 
@@ -29,9 +33,14 @@ vi.mock("../settings", async (importOriginal) => ({
   putSetting: vi.fn(),
   putSecret: vi.fn(),
   deleteSecret: vi.fn(),
-  getConfigExport: vi.fn(),
+  postConfigExport: vi.fn(),
   importConfig: vi.fn(),
 }));
+
+vi.mock("../playbooks", () => ({ listPlaybooks: vi.fn() }));
+vi.mock("../rules", () => ({ listRules: vi.fn() }));
+vi.mock("../snippets", () => ({ listSnippets: vi.fn() }));
+vi.mock("../notifiers", () => ({ listNotifiers: vi.fn() }));
 
 vi.mock("../discovery", () => ({
   getAdoMe: vi.fn(),
@@ -51,8 +60,12 @@ const mockPutSetting = vi.mocked(putSetting);
 const mockPutSecret = vi.mocked(putSecret);
 const mockDeleteSecret = vi.mocked(deleteSecret);
 const mockGetAdoMe = vi.mocked(getAdoMe);
-const mockGetConfigExport = vi.mocked(getConfigExport);
+const mockPostConfigExport = vi.mocked(postConfigExport);
 const mockImportConfig = vi.mocked(importConfig);
+const mockListPlaybooks = vi.mocked(listPlaybooks);
+const mockListRules = vi.mocked(listRules);
+const mockListSnippets = vi.mocked(listSnippets);
+const mockListNotifiers = vi.mocked(listNotifiers);
 
 /** A representative import plan the mocked importConfig returns. */
 function samplePlan(overrides: Partial<ImportPlan> = {}): ImportPlan {
@@ -98,7 +111,20 @@ beforeEach(() => {
     uniqueName: "resolved@contoso.com",
     displayName: "Resolved User",
   });
-  mockGetConfigExport.mockResolvedValue({ kind: "orchestrator-config-export" });
+  mockPostConfigExport.mockResolvedValue({
+    document: { kind: "orchestrator-config-export" },
+    warnings: [],
+  });
+  mockListPlaybooks.mockResolvedValue([
+    // Just the fields the dialog reads. The client type is broader.
+    { name: "pb-a" },
+    { name: "pb-b" },
+  ] as never);
+  mockListRules.mockResolvedValue([{ name: "r-a" }] as never);
+  mockListSnippets.mockResolvedValue([
+    { kind: "prompt", name: "s-a" },
+  ] as never);
+  mockListNotifiers.mockResolvedValue([{ name: "n-a" }] as never);
   mockImportConfig.mockImplementation((_doc, mode, dryRun) =>
     Promise.resolve(samplePlan({ mode, dry_run: dryRun, applied: !dryRun })),
   );
@@ -356,11 +382,10 @@ describe("SettingsPage", () => {
     expect(alert.textContent).toContain("kaboom");
   });
 
-  it("downloads the export document via the export button", async () => {
+  it("opens the export dialog listing every group and downloads via the filtered POST", async () => {
     const createObjectURL = vi.fn(() => "blob:mock");
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
-    // Anchor clicks would otherwise try to navigate in jsdom.
     const clickSpy = vi
       .spyOn(HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => {});
@@ -371,11 +396,102 @@ describe("SettingsPage", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Export configuration" }),
     );
-    await waitFor(() => expect(mockGetConfigExport).toHaveBeenCalledTimes(1));
+
+    // Each group shows up with a count and every entry as a checkbox.
+    await screen.findByText("Playbooks (2)");
+    expect(screen.getByText("Rules (1)")).toBeTruthy();
+    expect(screen.getByText("Snippets (1)")).toBeTruthy();
+    expect(screen.getByText("Notifiers (1)")).toBeTruthy();
+    // Every entry starts checked. Uncheck one of each group.
+    fireEvent.click(screen.getByRole("checkbox", { name: "pb-b" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "r-a" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "prompt: s-a" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "n-a" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+
+    await waitFor(() =>
+      expect(mockPostConfigExport).toHaveBeenCalledWith({
+        playbooks: ["pb-b"],
+        rules: ["r-a"],
+        snippets: ["prompt:s-a"],
+        notifiers: ["n-a"],
+      }),
+    );
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
     expect(clickSpy).toHaveBeenCalled();
 
     clickSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("check-all/none per group flips every entry in that group at once", async () => {
+    render(<SettingsPage />);
+    await screen.findByRole("table", { name: "Secrets" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Export configuration" }),
+    );
+
+    const playbooksGroup = await screen.findByRole("group", {
+      name: "Playbooks",
+    });
+    const pbA = within(playbooksGroup).getByRole("checkbox", {
+      name: "pb-a",
+    }) as HTMLInputElement;
+    const pbB = within(playbooksGroup).getByRole("checkbox", {
+      name: "pb-b",
+    }) as HTMLInputElement;
+    // Both start checked.
+    expect(pbA.checked).toBe(true);
+    expect(pbB.checked).toBe(true);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Uncheck all Playbooks" }),
+    );
+    expect(pbA.checked).toBe(false);
+    expect(pbB.checked).toBe(false);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Check all Playbooks" }),
+    );
+    expect(pbA.checked).toBe(true);
+    expect(pbB.checked).toBe(true);
+  });
+
+  it("renders response warnings before the download completes", async () => {
+    mockPostConfigExport.mockResolvedValueOnce({
+      document: { kind: "orchestrator-config-export" },
+      warnings: [
+        {
+          rule: "still-here",
+          kind: "dispatch",
+          target: "gone",
+          message: 'rule "still-here" dispatches to excluded playbook "gone"',
+        },
+      ],
+    });
+    const createObjectURL = vi.fn(() => "blob:mock");
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL,
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    render(<SettingsPage />);
+    await screen.findByRole("table", { name: "Secrets" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Export configuration" }),
+    );
+    await screen.findByText("Playbooks (2)");
+    fireEvent.click(screen.getByRole("checkbox", { name: "pb-a" }));
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+
+    const warnBar = await screen.findByLabelText("Export warnings");
+    expect(warnBar.textContent).toContain("still-here");
+    expect(warnBar.textContent).toContain("gone");
+
     vi.unstubAllGlobals();
   });
 

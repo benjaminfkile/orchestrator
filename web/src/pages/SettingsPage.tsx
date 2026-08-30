@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -31,19 +32,24 @@ import {
 } from "@fluentui/react-components";
 import {
   deleteSecret,
-  getConfigExport,
   getSettings,
   getSystemInfo,
   importConfig,
   listSecrets,
+  postConfigExport,
   putSecret,
   putSetting,
+  type ConfigExportWarning,
   type ImportMode,
   type ImportPlan,
   type ImportPlanItem,
   type SettingsMap,
   type SystemInfo,
 } from "../settings";
+import { listPlaybooks } from "../playbooks";
+import { listRules } from "../rules";
+import { listNotifiers } from "../notifiers";
+import { listSnippets, type SnippetKind } from "../snippets";
 import { getAdoMe } from "../discovery";
 import { useLiveRefetch } from "../components/useLiveRefetch";
 import {
@@ -57,6 +63,55 @@ import {
 const SECRETS_DEFAULT_SORT: SortState = {
   columnId: "name",
   direction: "ascending",
+};
+
+/**
+ * One entry in the export dialog: an identifier the POST body will use plus a
+ * human-readable label. Snippet identifiers are `<kind>:<name>` (matching the
+ * exported document's stable identity for a snippet); everything else is the
+ * bare name.
+ */
+interface ExportEntry {
+  id: string;
+  label: string;
+}
+
+/** The four exportable groups the dialog lists, keyed by group name. */
+interface ExportGroups {
+  playbooks: ExportEntry[];
+  rules: ExportEntry[];
+  snippets: ExportEntry[];
+  notifiers: ExportEntry[];
+}
+
+/**
+ * Per-group checkbox state: a map from entry id to whether the entry is
+ * INCLUDED (true) in the export. The POST body sends the unchecked ids.
+ */
+type GroupSelection = Record<string, boolean>;
+
+/** Per-group inclusion state for the export dialog, keyed by group name. */
+interface ExportSelection {
+  playbooks: GroupSelection;
+  rules: GroupSelection;
+  snippets: GroupSelection;
+  notifiers: GroupSelection;
+}
+
+type ExportGroupKey = keyof ExportGroups;
+
+const EXPORT_GROUP_KEYS: readonly ExportGroupKey[] = [
+  "playbooks",
+  "rules",
+  "snippets",
+  "notifiers",
+];
+
+const EXPORT_GROUP_TITLES: Record<ExportGroupKey, string> = {
+  playbooks: "Playbooks",
+  rules: "Rules",
+  snippets: "Snippets",
+  notifiers: "Notifiers",
 };
 
 /** The lone sort column for the secrets table (a list of names). */
@@ -254,6 +309,51 @@ const useStyles = makeStyles({
     margin: 0,
     paddingLeft: tokens.spacingHorizontalXL,
   },
+  exportDialogSurface: {
+    maxWidth: "720px",
+  },
+  exportGroups: {
+    display: "flex",
+    flexDirection: "column",
+    gap: tokens.spacingVerticalL,
+  },
+  exportGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: tokens.spacingVerticalXS,
+  },
+  exportGroupHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: tokens.spacingHorizontalM,
+  },
+  exportGroupTitle: {
+    fontWeight: tokens.fontWeightSemibold,
+  },
+  exportGroupToggles: {
+    display: "flex",
+    gap: tokens.spacingHorizontalS,
+  },
+  exportEntries: {
+    display: "flex",
+    flexDirection: "column",
+    paddingLeft: tokens.spacingHorizontalM,
+    maxHeight: "180px",
+    overflowY: "auto",
+  },
+  exportEmpty: {
+    color: tokens.colorNeutralForeground3,
+    fontStyle: "italic",
+    paddingLeft: tokens.spacingHorizontalM,
+  },
+  exportWarnings: {
+    marginTop: tokens.spacingVerticalM,
+  },
+  exportWarningList: {
+    margin: 0,
+    paddingLeft: tokens.spacingHorizontalXL,
+  },
 });
 
 /**
@@ -296,9 +396,21 @@ export function SettingsPage() {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
 
-  // Config export / import.
+  // Config export / import. The Export button opens a dialog listing everything
+  // the export would contain; the user unchecks anything they want to leave out
+  // and Download performs the filtered POST. Selection is per-export only.
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportWarnings, setExportWarnings] = useState<ConfigExportWarning[]>([]);
+  const [exportGroups, setExportGroups] = useState<ExportGroups | null>(null);
+  const [exportSelection, setExportSelection] = useState<ExportSelection>({
+    playbooks: {},
+    rules: {},
+    snippets: {},
+    notifiers: {},
+  });
   const [importText, setImportText] = useState("");
   const [importMode, setImportMode] = useState<ImportMode>("merge");
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
@@ -466,13 +578,111 @@ export function SettingsPage() {
     }
   }, [deleting, refresh]);
 
-  // Download the export document as a JSON file.
-  const onExport = useCallback(async () => {
+  // Open the export dialog: fetch what the export WOULD contain, populate the
+  // per-entry checkboxes (all checked by default), and clear any stale warnings
+  // from a prior open. The dialog is the ONLY export entry point; the direct
+  // GET /export flow is not surfaced to the user.
+  const onOpenExport = useCallback(async () => {
+    setExportError(null);
+    setExportWarnings([]);
+    setExportLoading(true);
+    setExportOpen(true);
+    try {
+      const [playbooks, rules, snippets, notifiers] = await Promise.all([
+        listPlaybooks(),
+        listRules(),
+        listSnippets(),
+        listNotifiers(),
+      ]);
+      if (!mounted.current) return;
+      const groups: ExportGroups = {
+        playbooks: playbooks
+          .map((p) => ({ id: p.name, label: p.name }))
+          .sort((a, b) => a.label.localeCompare(b.label)),
+        rules: rules
+          .map((r) => ({ id: r.name, label: r.name }))
+          .sort((a, b) => a.label.localeCompare(b.label)),
+        snippets: snippets
+          .map((s: { kind: SnippetKind; name: string }) => ({
+            id: `${s.kind}:${s.name}`,
+            label: `${s.kind}: ${s.name}`,
+          }))
+          .sort((a, b) => a.label.localeCompare(b.label)),
+        notifiers: notifiers
+          .map((n) => ({ id: n.name, label: n.name }))
+          .sort((a, b) => a.label.localeCompare(b.label)),
+      };
+      const selection: ExportSelection = {
+        playbooks: Object.fromEntries(groups.playbooks.map((e) => [e.id, true])),
+        rules: Object.fromEntries(groups.rules.map((e) => [e.id, true])),
+        snippets: Object.fromEntries(groups.snippets.map((e) => [e.id, true])),
+        notifiers: Object.fromEntries(groups.notifiers.map((e) => [e.id, true])),
+      };
+      setExportGroups(groups);
+      setExportSelection(selection);
+    } catch (err) {
+      if (!mounted.current) return;
+      setExportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (mounted.current) setExportLoading(false);
+    }
+  }, []);
+
+  const onCloseExport = useCallback(() => {
+    setExportOpen(false);
+    setExportError(null);
+    setExportWarnings([]);
+    setExportGroups(null);
+  }, []);
+
+  const toggleExportEntry = useCallback(
+    (group: ExportGroupKey, id: string, checked: boolean) => {
+      setExportSelection((prev) => ({
+        ...prev,
+        [group]: { ...prev[group], [id]: checked },
+      }));
+    },
+    [],
+  );
+
+  const setExportGroupAll = useCallback(
+    (group: ExportGroupKey, checked: boolean) => {
+      setExportSelection((prev) => {
+        const next = { ...prev[group] };
+        for (const id of Object.keys(next)) next[id] = checked;
+        return { ...prev, [group]: next };
+      });
+    },
+    [],
+  );
+
+  // Download the (filtered) export document as a JSON file. Excluded entries
+  // are the unchecked ids per group; warnings from the response render in the
+  // dialog before the file is saved so the user sees the dangling references
+  // before shipping the document.
+  const onDownloadExport = useCallback(async () => {
     setExporting(true);
     setExportError(null);
+    setExportWarnings([]);
     try {
-      const doc = await getConfigExport();
-      const blob = new Blob([JSON.stringify(doc, null, 2)], {
+      const exclude = {
+        playbooks: Object.keys(exportSelection.playbooks).filter(
+          (id) => !exportSelection.playbooks[id],
+        ),
+        rules: Object.keys(exportSelection.rules).filter(
+          (id) => !exportSelection.rules[id],
+        ),
+        snippets: Object.keys(exportSelection.snippets).filter(
+          (id) => !exportSelection.snippets[id],
+        ),
+        notifiers: Object.keys(exportSelection.notifiers).filter(
+          (id) => !exportSelection.notifiers[id],
+        ),
+      };
+      const response = await postConfigExport(exclude);
+      if (!mounted.current) return;
+      setExportWarnings(response.warnings ?? []);
+      const blob = new Blob([JSON.stringify(response.document, null, 2)], {
         type: "application/json",
       });
       const url = URL.createObjectURL(blob);
@@ -489,7 +699,7 @@ export function SettingsPage() {
     } finally {
       if (mounted.current) setExporting(false);
     }
-  }, []);
+  }, [exportSelection]);
 
   // Any change to the document or mode invalidates a previously previewed plan,
   // so Apply can only ever commit exactly what was last previewed.
@@ -805,21 +1015,22 @@ export function SettingsPage() {
         </Title3>
 
         <div className={styles.ioForm}>
-          {exportError && (
+          {exportError && !exportOpen && (
             <Text as="p" className={styles.error} role="alert">
               {exportError}
             </Text>
           )}
           <div className={styles.ioRow}>
             <Button
-              disabled={exporting}
-              onClick={() => void onExport()}
+              disabled={exportLoading || exporting}
+              onClick={() => void onOpenExport()}
             >
-              {exporting ? "Exporting…" : "Export configuration"}
+              Export configuration
             </Button>
             <Text className={styles.systemLabel}>
-              Downloads playbooks, rules, module config and settings as JSON.
-              Secrets are referenced by name only, never included.
+              Choose what to include, then download playbooks, rules, snippets,
+              notifiers, module config and settings as JSON. Secrets are
+              referenced by name only, never included.
             </Text>
           </div>
 
@@ -891,6 +1102,135 @@ export function SettingsPage() {
           )}
         </div>
       </div>
+
+      <Dialog
+        open={exportOpen}
+        onOpenChange={(_, d) => {
+          if (!d.open) onCloseExport();
+        }}
+      >
+        <DialogSurface className={styles.exportDialogSurface}>
+          <DialogBody>
+            <DialogTitle>Export configuration</DialogTitle>
+            <DialogContent>
+              {exportError && (
+                <Text as="p" className={styles.error} role="alert">
+                  {exportError}
+                </Text>
+              )}
+              {exportLoading ? (
+                <Spinner label="Loading exportable items…" />
+              ) : exportGroups ? (
+                <>
+                  <Text as="p" className={styles.systemLabel}>
+                    Uncheck anything you want to leave out. Selection is per
+                    export only and never persisted.
+                  </Text>
+                  <div className={styles.exportGroups}>
+                    {EXPORT_GROUP_KEYS.map((group) => {
+                      const entries = exportGroups[group];
+                      const anyChecked = entries.some(
+                        (e) => exportSelection[group][e.id],
+                      );
+                      const allChecked =
+                        entries.length > 0 &&
+                        entries.every((e) => exportSelection[group][e.id]);
+                      return (
+                        <div key={group} className={styles.exportGroup}>
+                          <div className={styles.exportGroupHeader}>
+                            <Text className={styles.exportGroupTitle}>
+                              {EXPORT_GROUP_TITLES[group]} ({entries.length})
+                            </Text>
+                            <div className={styles.exportGroupToggles}>
+                              <Button
+                                size="small"
+                                appearance="subtle"
+                                disabled={entries.length === 0 || allChecked}
+                                onClick={() => setExportGroupAll(group, true)}
+                                aria-label={`Check all ${EXPORT_GROUP_TITLES[group]}`}
+                              >
+                                All
+                              </Button>
+                              <Button
+                                size="small"
+                                appearance="subtle"
+                                disabled={entries.length === 0 || !anyChecked}
+                                onClick={() => setExportGroupAll(group, false)}
+                                aria-label={`Uncheck all ${EXPORT_GROUP_TITLES[group]}`}
+                              >
+                                None
+                              </Button>
+                            </div>
+                          </div>
+                          {entries.length === 0 ? (
+                            <Text className={styles.exportEmpty}>None.</Text>
+                          ) : (
+                            <div
+                              className={styles.exportEntries}
+                              role="group"
+                              aria-label={EXPORT_GROUP_TITLES[group]}
+                            >
+                              {entries.map((entry) => (
+                                <Checkbox
+                                  key={entry.id}
+                                  label={entry.label}
+                                  checked={!!exportSelection[group][entry.id]}
+                                  onChange={(_, d) =>
+                                    toggleExportEntry(
+                                      group,
+                                      entry.id,
+                                      d.checked === true,
+                                    )
+                                  }
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {exportWarnings.length > 0 && (
+                    <MessageBar
+                      intent="warning"
+                      layout="multiline"
+                      className={styles.exportWarnings}
+                      aria-label="Export warnings"
+                    >
+                      <MessageBarBody>
+                        <MessageBarTitle>Dangling references</MessageBarTitle>
+                        <ul className={styles.exportWarningList}>
+                          {exportWarnings.map((w, i) => (
+                            <li key={`${w.rule}-${w.kind}-${w.target}-${i}`}>
+                              {w.message}
+                            </li>
+                          ))}
+                        </ul>
+                      </MessageBarBody>
+                    </MessageBar>
+                  )}
+                </>
+              ) : null}
+            </DialogContent>
+            <DialogActions>
+              <Button
+                appearance="secondary"
+                disabled={exporting}
+                onClick={onCloseExport}
+              >
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={exporting || exportLoading || exportGroups === null}
+                onClick={() => void onDownloadExport()}
+              >
+                {exporting ? "Downloading…" : "Download"}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
 
       <Dialog
         open={deleting !== null}
