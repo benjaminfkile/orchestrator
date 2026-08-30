@@ -35,8 +35,8 @@ are a deliberate core OUTBOUND delivery mechanism and are exempt from the
 integration-module READ-ONLY rule. A notification is JUST a notification — there
 are no delivery kinds: every fired notifier always records one in-app log row and
 best-effort raises a desktop toast (on Windows a click opens the run page or the
-inbox in the web UI). A sink only delivers a rendered template — it emits nothing back into the pipeline and never
-fetches external data — so it does not reintroduce the coupling that rule guards
+inbox in the web UI). A sink only delivers a rendered template; it emits nothing
+back into the pipeline and never fetches external data, so it does not reintroduce the coupling that rule guards
 against. Sinks stay domain-neutral all the same: intent lives entirely in a
 notifier's name, `config`, and title/body templates, never in a code branch.
 Integration modules remain strictly read-only.
