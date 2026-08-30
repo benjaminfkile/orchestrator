@@ -6,6 +6,7 @@ import type { Knex } from "knex";
 
 import { createDb } from "../db";
 import { runMigrations } from "../migrate";
+import { createPlaybook } from "../playbooks";
 
 function tempDbFile(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orch-runner-mig-"));
@@ -54,16 +55,18 @@ describe("playbook runner migration", () => {
   });
 
   it("defaults new rows to the claude-code runner with an empty config", async () => {
-    // The seeded smoke-test playbook is inserted post-018 with the current
-    // column set, so it always carries the defaulted (runner, runner_config).
-    // Assert on it directly rather than depending on the 018 backfill path,
-    // which no longer sees the built-in seed on a fresh DB (the researcher
-    // row is removed by 023 as part of the same latest() pass).
-    const seeded = await db("playbooks")
-      .where({ name: "smoke-test-clone-and-claude-linux" })
-      .first();
-    expect(seeded.runner).toBe("claude-code");
-    expect(JSON.parse(seeded.runner_config)).toEqual({});
+    // A fresh DB no longer carries any seeded playbooks (the schema comes up
+    // empty), so insert one through the repo layer and assert its stored
+    // defaults directly. `createPlaybook` mirrors what the POST /api/playbooks
+    // route does and applies the same defaults the 018 migration installs on
+    // the column.
+    const created = await createPlaybook(
+      { name: "runner-defaults-check", image: "img", ttl_seconds: 60 },
+      db
+    );
+    const row = await db("playbooks").where({ id: created.id }).first();
+    expect(row.runner).toBe("claude-code");
+    expect(JSON.parse(row.runner_config)).toEqual({});
   });
 
   it("backfills runner_config from model/allowed_tools, omitting null fields", async () => {

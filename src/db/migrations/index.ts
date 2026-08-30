@@ -25,6 +25,7 @@ import * as dispatchReleaseTracking from "./20260713000022_dispatch_release_trac
 import * as seedSmokeTestPlaybook from "./20260713000023_seed_smoke_test_playbook";
 import * as smokeTestInstallClaudeNativeInstaller from "./20260713000024_smoke_test_install_claude_native_installer";
 import * as smokeTestCredentialLeakHunt from "./20260713000025_smoke_test_credential_leak_hunt";
+import * as dropSeedSmokeTestContent from "./20260713000026_drop_seed_smoke_test_content";
 
 type Migration = {
   up: (knex: Knex) => Promise<void>;
@@ -68,6 +69,7 @@ const migrations: Record<string, Migration> = {
     smokeTestInstallClaudeNativeInstaller,
   "20260713000025_smoke_test_credential_leak_hunt":
     smokeTestCredentialLeakHunt,
+  "20260713000026_drop_seed_smoke_test_content": dropSeedSmokeTestContent,
 };
 
 export const migrationSource: Knex.MigrationSource<string> = {

@@ -9,6 +9,7 @@
     "start": "npm run build && node dist/index.js",
     "test": "jest --runInBand --detectOpenHandles",
     "coverage": "jest --runInBand --detectOpenHandles --coverage",
+    "seed:smoke-test": "npm run build && node dist/scripts/seed-smoke-test.js",
     "install:web": "npm --prefix web install",
     "build:web": "npm --prefix web run build",
     "dev:web": "npm --prefix web run dev",

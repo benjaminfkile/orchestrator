@@ -444,25 +444,33 @@ rename therefore breaks every reference by design.
     Config \`{monitor_id?}\`; defaults to the event subject (a monitor id) when
     unset. Renders name, query, thresholds, options, states, url.
 
-## Seeded first-launch content
+## Optional smoke-test seed content
 
-- A fresh install ships working example content: the
-  \`smoke-test-clone-and-claude-linux\` playbook (env: \`CLAUDE_CODE_OAUTH_TOKEN\`
-  lease-injected + \`ADO_PAT\` step-only; pre steps install the azure CLI, clone
-  the org's first repo, scrub the credential, run a FATAL credential-leak hunt,
-  and install the claude CLI), seven \`smoke test: ado.workitem.*\` dispatch
-  rules that fire when a work item's \`tags\` contains the playbook name, a
-  \`desktop\` notifier, and three notify rules ("Smoke test started/finished/
-  failed") on its \`run.started\`/\`run.completed\`/\`run.failed\` events.
-- Tagging any watched work item \`smoke-test-clone-and-claude-linux\` therefore
-  fires an end-to-end pipeline test (event -> rule -> lease -> agent ->
-  findings -> release) with toasts on start, success, and failure. The leak
-  hunt exits non-zero (failing the dispatch loudly) if the scrubbed PAT is
-  discoverable in the container env, \`~/.azure\`, git remote/config, or on
-  disk.
-- Treat all seeded rows as user-editable examples, not fixtures: users may
-  rename, edit, or delete them freely (seed migrations never overwrite a row a
-  user has customized).
+- A product install starts EMPTY: no playbooks, rules, or notifiers ship with
+  the schema. The former first-launch seed rows (a \`researcher\` playbook,
+  and later the \`smoke-test-clone-and-claude-linux\` playbook plus its
+  dispatch/notify rules and \`desktop\` notifier) were removed from the
+  migrations; if a database still carries the untouched seed rows from an
+  older install they are cleaned up by a one-shot migration. Any user-edited
+  copy is preserved.
+- The example content is now available as an OPTIONAL seeder, invoked
+  explicitly with \`npm run seed:smoke-test\` (see the README's Testing
+  section). It installs the \`smoke-test-clone-and-claude-linux\` playbook
+  (env: \`CLAUDE_CODE_OAUTH_TOKEN\` lease-injected + \`ADO_PAT\` step-only;
+  pre steps install the azure CLI, clone the org's first repo, scrub the
+  credential, run a FATAL credential-leak hunt, and install the claude CLI),
+  seven \`smoke test: ado.workitem.*\` dispatch rules that fire when a work
+  item's \`tags\` contains the playbook name, the \`desktop\` notifier, and
+  three notify rules ("Smoke test started/finished/failed") on its
+  \`run.started\`/\`run.completed\`/\`run.failed\` events. The script is
+  idempotent by name (a second run skips every row that already exists) and
+  never overwrites a user's edits.
+- Tagging any watched work item \`smoke-test-clone-and-claude-linux\` (once
+  the seed is installed) fires an end-to-end pipeline test (event -> rule ->
+  lease -> agent -> findings -> release) with toasts on start, success, and
+  failure. The leak hunt exits non-zero (failing the dispatch loudly) if the
+  scrubbed PAT is discoverable in the container env, \`~/.azure\`, git
+  remote/config, or on disk.
 
 ## Portability
 
