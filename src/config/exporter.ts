@@ -171,9 +171,9 @@ export interface ConfigExportDocument {
  * A per-export exclusion set: names of playbooks / rules / snippets / notifiers
  * to leave out of the produced document. Names key against the exported
  * document (a playbook by its `name`, a rule by its `name`, a notifier by its
- * `name`, a snippet by its `name` (snippet identity is (kind, name) but the
- * dialog groups all kinds together and names are unique WITHIN a kind, so
- * excluding a name drops every snippet of that name across kinds). Selections
+ * `name`, a snippet by its `kind:name` key (snippet identity is (kind, name);
+ * the exclude entry must carry the kind prefix, e.g. `prompt:greeting`, and
+ * only that exact snippet is dropped). Selections
  * are per-export only; nothing is persisted anywhere. Unknown names are a
  * validation error (see {@link UnknownExclusionError}).
  */
