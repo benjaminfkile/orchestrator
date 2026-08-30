@@ -7,8 +7,10 @@
  *   - darwin: osascript `display notification`.
  *   - linux:  notify-send.
  *
- * The toast is display-only: it carries a title and body and NO click-through.
- * User text (title/body) is NEVER interpolated onto a command line. On Windows
+ * The toast carries a title and body. On Windows an optional http(s) launch
+ * URL makes a click open that URL in the default browser (protocol
+ * activation); macOS and Linux toasts are display-only. User text (title/body)
+ * is NEVER interpolated onto a command line. On Windows
  * it is XML-escaped and delivered over stdin as a single-line, single-quoted
  * PowerShell string; on macOS it is escaped into a single AppleScript `-e` argv
  * element; on Linux it is passed as separate argv elements. The invocation
@@ -23,10 +25,17 @@
 
 import { spawn as nodeSpawn } from "child_process";
 
-/** The content of a single desktop notification. Display-only: no click-through. */
+/** The content of a single desktop notification. */
 export interface DesktopNotification {
   title: string;
   body: string;
+  /** http(s) URL opened when the toast is clicked (Windows only); ignored otherwise. */
+  launchUrl?: string;
+}
+
+/** Only absolute http(s) URLs are accepted as a launch target. */
+export function isLaunchUrl(value: string | undefined): value is string {
+  return typeof value === "string" && /^https?:\/\/[^\s'"<>]+$/i.test(value);
 }
 
 /** Outcome of an attempt. `error` is a generic, secret-free diagnostic. */
@@ -115,8 +124,11 @@ function appleScriptEscape(value: string): string {
  */
 export function buildWindowsScript(input: DesktopNotification): string {
   // NB: join with no separator — the XML must be a single line (see above).
+  const launch = isLaunchUrl(input.launchUrl)
+    ? ` activationType="protocol" launch="${xmlEscape(input.launchUrl)}"`
+    : "";
   const xml = [
-    `<toast>`,
+    `<toast${launch}>`,
     `<visual>`,
     `<binding template="ToastGeneric">`,
     `<text>${xmlEscape(input.title)}</text>`,

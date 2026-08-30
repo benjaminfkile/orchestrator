@@ -1,5 +1,5 @@
 import type { ChildProcessLike, SpawnFn } from "./desktopNotify";
-import { WINDOWS_TOAST_SENTINEL, showDesktopNotification } from "./desktopNotify";
+import { WINDOWS_TOAST_SENTINEL, buildWindowsScript, showDesktopNotification } from "./desktopNotify";
 
 /** A hand-driven fake child process; the test emits `close`/`error` itself. */
 class FakeChild implements ChildProcessLike {
@@ -434,4 +434,27 @@ describe("showDesktopNotification", () => {
       expect(() => child.emit("close", 0)).not.toThrow();
     });
   });
+
+describe("launch URL", () => {
+  it("adds protocol activation to the Windows toast when a launch URL is given", () => {
+    const script = buildWindowsScript({
+      title: "T",
+      body: "B",
+      launchUrl: "http://localhost:4400/runs/7?x=1&y=2",
+    });
+    expect(script).toContain(
+      `<toast activationType="protocol" launch="http://localhost:4400/runs/7?x=1&amp;y=2">`
+    );
+  });
+
+  it("omits activation when the launch URL is missing or not http(s)", () => {
+    expect(buildWindowsScript({ title: "T", body: "B" })).toContain("<toast>");
+    expect(
+      buildWindowsScript({ title: "T", body: "B", launchUrl: "file:///etc/passwd" })
+    ).toContain("<toast>");
+    expect(
+      buildWindowsScript({ title: "T", body: "B", launchUrl: "http://x/'>evil" })
+    ).toContain("<toast>");
+  });
+});
 });

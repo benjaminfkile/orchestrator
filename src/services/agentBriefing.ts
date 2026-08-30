@@ -74,7 +74,7 @@ Key invariants you must respect:
   it to discover valid \`match.type\` strings before writing a rule.
 - Shape: \`{id, source, type, subject_kind, subject_ref, payload, dedupe_key,
   ts, last_dispatched_at, cleared_at}\`. Payload is opaque JSON from the
-  producer. All columns are addressable in rule criteria as \`event.<column>\`.
+  producer. All columns are addressable in rule criteria as \`event.<column>\`. Only the newest 1000 events are kept (dispatch-referenced ones survive).
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
   .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
   .updated/.pushed/.comment.created/.thread.status_changed/.vote/.completed/
@@ -315,7 +315,7 @@ rename therefore breaks every reference by design.
   \`{name, title_template?, body_template?, enabled?, config?}\` (templates use
   the same \`{{...}}\` engine against the triggering event).
 - Every fired notification is recorded in-app AND best-effort raised as a
-  native desktop toast. \`GET /api/notifications\`, \`POST /api/notifications/:id/read\`,
+  native desktop toast (on Windows a click opens the run page, or the inbox; ORCH_WEB_URL sets the web origin). \`GET /api/notifications\`, \`POST /api/notifications/:id/read\`,
   \`/read-all\`, \`GET /api/notifications/unread-count\`. \`GET /api/notifications\`
   takes \`?q=<text>\` to substring-search (case-insensitive, terms ANDed) across
   title, body, status, and error; it composes with the cursor and \`unread=1\`.

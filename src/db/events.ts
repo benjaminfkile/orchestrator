@@ -98,6 +98,26 @@ function fromRow(row: EventRow): EventRecord {
  * Insert a new event and return the stored record. `ts` defaults to the current
  * time; `payload` is JSON-serialized; lifecycle columns start null.
  */
+/**
+ * How many events are kept. Older events beyond this count are deleted after
+ * each insert, except events that a dispatch still references (dispatch
+ * history stays readable).
+ */
+export const EVENT_RETENTION_MAX = 1000;
+
+/**
+ * Delete the oldest events beyond `max`, skipping any event a dispatch
+ * references. Returns the number of rows removed.
+ */
+export async function pruneEvents(
+  db: Knex = getDb(),
+  max: number = EVENT_RETENTION_MAX
+): Promise<number> {
+  const keep = db("events").select("id").orderBy("id", "desc").limit(max);
+  const referenced = db("dispatches").distinct("event_id");
+  return db("events").whereNotIn("id", keep).whereNotIn("id", referenced).delete();
+}
+
 export async function insertEvent(
   event: NewEvent,
   db: Knex = getDb()
@@ -116,6 +136,7 @@ export async function insertEvent(
       cleared_at: null,
     })
     .returning("*");
+  await pruneEvents(db);
   return fromRow(row);
 }
 

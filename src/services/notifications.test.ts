@@ -107,8 +107,15 @@ describe("deliverForEvent", () => {
       showDesktop,
     });
 
-    // A single toast attempt carrying only title/body — no click-through url.
-    expect(calls).toEqual([{ title: "thing.changed", body: "Widget broke" }]);
+    // A single toast attempt; the click target is the inbox because the event
+    // names no dispatch.
+    expect(calls).toEqual([
+      {
+        title: "thing.changed",
+        body: "Widget broke",
+        launchUrl: "http://localhost:4400/notifications",
+      },
+    ]);
   });
 
   it("uses the same template engine: unresolved tokens render empty", async () => {
@@ -238,4 +245,14 @@ describe("deliverForEvent", () => {
     );
     expect(written.map((r) => r.title)).toEqual(["A", "B"]);
   });
+
+describe("launchUrlFor", () => {
+  it("opens the run page for an event carrying a dispatch_id, else the inbox", async () => {
+    const { launchUrlFor } = await import("./notifications");
+    const base = { id: 1, source: "orchestrator", type: "run.completed", subject_kind: "dispatch", subject_ref: "9", ts: 0, last_dispatched_at: null, cleared_at: null, dedupe_key: null };
+    expect(launchUrlFor({ ...base, payload: { dispatch_id: 9 } } as never, "http://web.local/")).toBe("http://web.local/runs/9");
+    expect(launchUrlFor({ ...base, payload: { dispatch_id: "9" } } as never, "http://web.local")).toBe("http://web.local/notifications");
+    expect(launchUrlFor({ ...base, payload: null } as never, "http://web.local")).toBe("http://web.local/notifications");
+  });
+});
 });

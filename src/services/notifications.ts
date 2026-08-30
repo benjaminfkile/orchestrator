@@ -39,6 +39,7 @@ import {
   type DesktopNotifyResult,
 } from "./desktopNotify";
 import { emitNotification } from "./notificationEmitter";
+import { getConfig } from "../config";
 
 /** Raise a native desktop notification; matches {@link showDesktopNotification}. */
 export type ShowDesktop = (
@@ -51,6 +52,22 @@ export interface DeliverDeps {
   logger?: Logger;
   /** Desktop-toast sink; defaults to {@link showDesktopNotification}. */
   showDesktop?: ShowDesktop;
+  /** Web UI origin for the toast click target; defaults to the configured webUrl. */
+  webUrl?: string;
+}
+
+/**
+ * The page a desktop notification opens when clicked: the run page when the
+ * event names a dispatch (`payload.dispatch_id`), else the notifications inbox.
+ */
+export function launchUrlFor(event: EventRecord, webUrl: string): string {
+  const base = webUrl.replace(/\/+$/, "");
+  const payload = event.payload as { dispatch_id?: unknown } | null;
+  const dispatchId = payload && typeof payload === "object" ? payload.dispatch_id : undefined;
+  if (typeof dispatchId === "number" && Number.isInteger(dispatchId) && dispatchId > 0) {
+    return `${base}/runs/${dispatchId}`;
+  }
+  return `${base}/notifications`;
 }
 
 /**
@@ -116,6 +133,7 @@ export async function deliverForEvent(
 ): Promise<NotificationLogRecord[]> {
   const logger = deps.logger ?? log;
   const showDesktop = deps.showDesktop ?? showDesktopNotification;
+  const webUrl = deps.webUrl ?? getConfig().webUrl;
   const written: NotificationLogRecord[] = [];
 
   for (const target of targets) {
@@ -134,7 +152,11 @@ export async function deliverForEvent(
 
       // Best-effort desktop toast: attempted for every notification but never
       // allowed to fail or hide it. A failure is captured as the row's error.
-      const toast = await showDesktop({ title, body });
+      const toast = await showDesktop({
+        title,
+        body,
+        launchUrl: launchUrlFor(event, webUrl),
+      });
 
       written.push(
         await persist(

@@ -267,7 +267,7 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | Method & path | Purpose |
 |---|---|
 | `GET /api/health` | Liveness probe: `{ status, db, wisper }` (wisper `/healthz` probed with a 2 s timeout, cached 30 s). |
-| `GET /api/events` · `GET /api/events/:id` | List / read stored events. The list is newest-first and cursor-paginated: `?limit=` (1..500, default 50), `?before=<id>` pages past an id, and `?q=` substring-searches (case-insensitive, whitespace-separated terms ANDed) across source, type, subject fields, and the raw payload JSON. |
+| `GET /api/events` · `GET /api/events/:id` | List / read stored events. The newest 1000 are kept; older ones are deleted after each insert unless a dispatch references them. The list is newest-first and cursor-paginated: `?limit=` (1..500, default 50), `?before=<id>` pages past an id, and `?q=` substring-searches (case-insensitive, whitespace-separated terms ANDed) across source, type, subject fields, and the raw payload JSON. |
 | `POST /api/events` | Mint a synthetic event through the normal intake so a dispatch can be created on a fresh stack that has no integration modules configured. Body: `{ source? (default "manual"), type (required, e.g. "test.manual"), subject_ref (required), subject_kind? (default "manual"), payload? (JSON object) }`. A deterministic `dedupe_key` of `manual:<source>:<type>:<subject_ref>` is applied so the normal `event_dedupe_cooldown_seconds` cooldown collapses repeats: a first mint returns `201` with the created event; a mint that lands inside the cooldown returns `200` with the existing event. Rules match the minted event exactly as if a producer had emitted it. |
 | `GET /api/events/facets` | Distinct `source` + `type` values (DB distincts merged with the registered modules' advertised event types), for the Events filters and Rule source/type pickers. |
 | `GET /api/rules` · `GET /api/rules/:id` | List / read rules. |
@@ -351,6 +351,7 @@ silently fall back to their default so a typo never blocks boot.
 | `WISPER_HOST_ID` | *(unset)* | The **default host** a playbook uses when it sets no `host`. In `dev` mode it is the hostId targeted on the `/dev/leases` endpoints; in `v1` mode it is the default catalog host **id or name** resolved against `GET /v1/catalog` at dispatch time. **Required to rent leases** — validated lazily, so an unset value does not crash boot but leaves leasing (and the dispatcher) idle. |
 | `WISPER_CREATE_LEASE_TIMEOUT_MS` | `150000` | Client timeout (ms) for the blocking create-lease call. The `POST /dev/leases` 201 is not sent until the lease is fully provisioned (clone/build/host can take minutes for heavy images), so this is the longest per-operation timeout. Raise it when provisioning is slow. Unset or invalid → default. |
 | `WISPER_EXEC_TIMEOUT_MS` | *(unset; derived per call)* | Explicit operator override for the per-call **exec** timeout (ms): pre steps, the streaming agent exec, and collect steps. For the streaming agent exec it is an inter-chunk **idle** window, *not* a wall-clock cap on total run time (the per-dispatch deadline bounds that). When UNSET the executor derives the value per call from the lease's **remaining TTL** plus a small margin, capped at about 6 hours, so a step or agent command that runs the length of a lease is not killed by a fixed 60 s client timeout. Set an explicit value here only to fix a single timeout across every exec. Precedence: this override wins over the executor's computed default. Unset or invalid falls back to the computed default. Release has its own, shorter timeout: see `WISPER_RELEASE_TIMEOUT_MS`. |
+| `ORCH_WEB_URL` | `http://localhost:4400` | Public URL of the web UI; the click target of desktop notifications (`/runs/<dispatch id>` for run events, else `/notifications`). |
 | `WISPER_RELEASE_TIMEOUT_MS` | `60000` | Per-call timeout (ms) for wisper lease-release requests: the executor's finally-block release, boot's orphan reconcile, the periodic release sweep, and the dispatcher's late release before a retryable requeue. Release is a quick control-plane DELETE and MUST NOT reuse the multi-hour exec-timeout cap: boot awaits the orphan reconcile sequentially before the dispatcher starts, and a hung socket per row would otherwise stall startup (or a whole sweep pass) for hours per row. Unset or invalid falls back to the default. |
 | `ORCH_DISABLE_KEYCHAIN` | *(unset)* | Set `1` to force the passphrase-derived key even when an OS keychain is available. |
 | `ORCH_MASTER_KEY` | *(unset)* | Passphrase the secret-store key is derived from (scrypt against a persisted salt) when no keychain is used. Keep it stable or the store won't decrypt. |
@@ -782,10 +783,13 @@ are no delivery kinds. Every fired notifier ALWAYS:
   `ToastNotificationManager`) on Windows, `osascript display notification` on
   macOS, `notify-send` on Linux.
 
-The toast is **display-only** — no click-through / launch URL. A desktop failure
-never hides the notification: the log row stays `delivered` and the toast's error
-(a missing tool, a non-zero exit, a timeout) is recorded in the row's `error`
-column (null on success).
+On Windows, clicking the toast opens the web UI: the run page
+(`<ORCH_WEB_URL>/runs/<dispatch id>`) when the event carries a
+`dispatch_id` (every `run.*` event does), otherwise the Notifications inbox.
+macOS and Linux toasts are display-only. A desktop failure never hides the
+notification: the log row stays `delivered` and the toast's error (a missing
+tool, a non-zero exit, a timeout) is recorded in the row's `error` column
+(null on success).
 
 **Templates.** `title_template` and `body_template` render through the **same**
 engine the executor uses for prompts — `{{event.*}}` roots into the event row
@@ -808,8 +812,7 @@ Server-Sent Events feed that pushes one frame per newly written row, so the web
 inbox and bell update live without polling (see the REST API table above).
 
 **Web pages.** A **bell** in the app header shows the live unread count (seeded
-from `unread-count`, kept current off the SSE stream) and each streamed row also
-raises a Fluent **toast** (capped so a burst can't bury the UI). The
+from `unread-count`, kept current off the SSE stream). The
 **Notifications** page is the inbox (list, mark read / mark all read — plain
 entries with no click-through); the **Notifiers** page manages sinks (name,
 title/body templates, enabled); and the **Rules** editor has a notify-targets

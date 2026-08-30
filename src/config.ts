@@ -63,6 +63,13 @@ export interface Config {
    * via WISPER_RELEASE_TIMEOUT_MS.
    */
   wisperReleaseTimeoutMs: number;
+  /**
+   * Public URL of the web UI, used as the click target of desktop
+   * notifications (a notification for a run opens `<webUrl>/runs/<dispatch id>`,
+   * any other opens `<webUrl>/notifications`). ORCH_WEB_URL; default
+   * http://localhost:4400 (the Vite dev server).
+   */
+  webUrl: string;
   /** True once a wisper host id is configured; false leaves leasing disabled. */
   isWisperConfigured(): boolean;
 }
@@ -267,6 +274,9 @@ function parseBaseUrl(
  * Build the typed config from an environment map (defaults to `process.env`).
  * Throws {@link ConfigError} with a clear message on any malformed value.
  */
+/** Default web UI origin: the Vite dev server. */
+const DEFAULT_WEB_URL = "http://localhost:4400";
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = parsePort(env.PORT);
   const wisperBaseUrl = parseBaseUrl(
@@ -290,6 +300,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     env.WISPER_RELEASE_TIMEOUT_MS,
     DEFAULT_RELEASE_TIMEOUT_MS
   );
+  const webUrl = (env.ORCH_WEB_URL?.trim() || DEFAULT_WEB_URL).replace(/\/+$/, "");
 
   return {
     port,
@@ -300,6 +311,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     wisperCreateLeaseTimeoutMs,
     wisperExecTimeoutMs,
     wisperReleaseTimeoutMs,
+    webUrl,
     isWisperConfigured() {
       return this.wisperHostId !== undefined;
     },

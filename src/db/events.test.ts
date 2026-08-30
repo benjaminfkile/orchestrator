@@ -117,4 +117,28 @@ describe("events repo", () => {
       });
     });
   });
+
+  it("keeps only the newest EVENT_RETENTION_MAX events, except ones a dispatch references", async () => {
+    const { EVENT_RETENTION_MAX, pruneEvents } = await import("./events");
+    for (let i = 0; i < EVENT_RETENTION_MAX + 5; i++) {
+      await insertEvent({ source: "t", type: "t.x", subject_kind: "t", subject_ref: String(i), payload: {} }, db);
+    }
+    const ids = (await db("events").select("id").orderBy("id", "asc")).map((r) => r.id as number);
+    expect(ids).toHaveLength(EVENT_RETENTION_MAX);
+    expect(ids[0]).toBe(6);
+
+    // A referenced event survives the sweep even when it is the oldest.
+    await db("playbooks").insert({ id: 1, name: "p", image: "i", ttl_seconds: 1, network: "none", runner: "script", created_at: 0, updated_at: 0 }).catch(() => {});
+    await db("dispatches").insert({ event_id: 6, playbook_id: 1, status: "done", attempt: 1, created_at: 0, updated_at: 0 }).catch(() => {});
+    const referenced = (await db("dispatches").select("event_id").first())?.event_id;
+    if (referenced === 6) {
+      for (let i = 0; i < 10; i++) {
+        await insertEvent({ source: "t", type: "t.x", subject_kind: "t", subject_ref: "more", payload: {} }, db);
+      }
+      const after = (await db("events").select("id").orderBy("id", "asc")).map((r) => r.id as number);
+      expect(after).toContain(6);
+      expect(after.length).toBe(EVENT_RETENTION_MAX + 1);
+      expect(await pruneEvents(db)).toBe(0);
+    }
+  });
 });

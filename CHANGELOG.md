@@ -14,6 +14,14 @@ owns the lease lifecycle, never the agent inside it.
 
 ### Added
 
+#### Notifications and events
+
+- Desktop notifications open the run page (or the inbox) when clicked on
+  Windows; `ORCH_WEB_URL` sets the web UI origin.
+- The web app no longer shows transient toasts; the bell and inbox are the
+  in-app surface.
+- Events are capped at the newest 1000 (dispatch-referenced events are kept).
+
 #### Pull requests
 
 - `ado.pullrequest.*` payloads carry `is_draft`; `.updated` fires when a PR's

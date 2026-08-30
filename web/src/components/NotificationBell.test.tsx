@@ -111,15 +111,6 @@ describe("NotificationBell", () => {
     await screen.findByRole("button", { name: "Notifications, 2 unread" });
   });
 
-  it("raises a toast for each pushed notification", async () => {
-    renderBell();
-    await waitFor(() => expect(mockSubscribe).toHaveBeenCalled());
-
-    pushNotification();
-    expect(await screen.findByText("Build failed")).toBeTruthy();
-    expect(await screen.findByText("See the run logs")).toBeTruthy();
-  });
-
   it("navigates to the inbox when clicked", async () => {
     renderBell();
     await waitFor(() => expect(mockGetUnreadCount).toHaveBeenCalled());

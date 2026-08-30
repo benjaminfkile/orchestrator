@@ -8,14 +8,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  Toast,
-  Toaster,
-  ToastBody,
-  ToastTitle,
-  useId,
-  useToastController,
-} from "@fluentui/react-components";
-import {
   getUnreadCount,
   subscribeNotificationStream,
 } from "../notifications";
@@ -41,23 +33,15 @@ export function useNotifications(): NotificationsContextValue {
   return ctx;
 }
 
-/** Cap on concurrently visible toasts so a burst can't bury the UI. */
-const MAX_TOASTS = 3;
-
 /**
- * Owns the app's ambient notification concerns in one place:
- *   - seeds the unread count from `GET /unread-count` and keeps it live off the
- *     SSE stream (incrementing per pushed row) and mark-read actions;
- *   - raises a Fluent toast for each streamed notification (title + body),
- *     capped at {@link MAX_TOASTS} concurrent toasts.
- *
- * Must render inside a FluentProvider so its Toaster is themed. The bell reads
- * `unreadCount`; the inbox calls `refreshUnread` after marking rows read.
+ * Owns the app's ambient notification state: seeds the unread count from
+ * `GET /unread-count` and keeps it live off the SSE stream (incrementing per
+ * pushed row) and mark-read actions. The bell reads `unreadCount`; the inbox
+ * calls `refreshUnread` after marking rows read. Desktop notifications are
+ * raised by the backend; the web app shows nothing transient.
  */
 export function NotificationsProvider({ children }: { children: ReactNode }) {
   const [unreadCount, setUnreadCount] = useState(0);
-  const toasterId = useId("notification-toaster");
-  const { dispatchToast } = useToastController(toasterId);
 
   // Guard against a late async count landing after unmount.
   const mounted = useRef(true);
@@ -76,29 +60,21 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     mounted.current = true;
     void refreshUnread();
     const unsubscribe = subscribeNotificationStream({
-      onNotification: (record) => {
+      onNotification: () => {
         if (!mounted.current) return;
         // Every streamed row is a freshly written (unread) notification.
         setUnreadCount((count) => count + 1);
-        dispatchToast(
-          <Toast>
-            <ToastTitle>{record.title || "Notification"}</ToastTitle>
-            {record.body ? <ToastBody>{record.body}</ToastBody> : null}
-          </Toast>,
-          { intent: record.status === "failed" ? "error" : "info" },
-        );
       },
     });
     return () => {
       mounted.current = false;
       unsubscribe();
     };
-  }, [refreshUnread, dispatchToast]);
+  }, [refreshUnread]);
 
   return (
     <NotificationsContext.Provider value={{ unreadCount, refreshUnread }}>
       {children}
-      <Toaster toasterId={toasterId} limit={MAX_TOASTS} />
     </NotificationsContext.Provider>
   );
 }
