@@ -209,9 +209,9 @@ describe("seed-smoke-test script", () => {
       expect((await listRules(db)).length).toBe(10);
     });
 
-    it("preserves a user's rename by not resurrecting a missing row", async () => {
+    it("re-creates a seed row the user deleted (rows are matched by name)", async () => {
       await seedSmokeTest(db);
-      // The user deletes one of the rules; a second seed run must not re-add it.
+      // The user deletes one of the rules; a second seed run restores it.
       await db("rules").where({ name: "smoke test: ado.workitem.tagged" }).delete();
       const before = (await listRules(db)).length;
       const second = await seedSmokeTest(db);

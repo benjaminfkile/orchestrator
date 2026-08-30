@@ -15,7 +15,8 @@ import type { Knex } from "knex";
  * write, so the user has not renamed or edited it. Any customized copy is
  * left untouched.
  *
- * Deletion order is chosen so no dangling reference survives:
+ * Deletion order (a user-edited rule that still points at a removed playbook
+ * or notifier is kept as-is; event intake fails closed on such a reference):
  *
  *   1. Seeded RULES first (their `notify` targets reference the notifier by
  *      `notifier_id`, their `dispatch` targets reference the playbook by

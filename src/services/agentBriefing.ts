@@ -447,15 +447,9 @@ rename therefore breaks every reference by design.
 ## Optional smoke-test seed content
 
 - A product install starts EMPTY: no playbooks, rules, or notifiers ship with
-  the schema. The former first-launch seed rows (a \`researcher\` playbook,
-  and later the \`smoke-test-clone-and-claude-linux\` playbook plus its
-  dispatch/notify rules and \`desktop\` notifier) were removed from the
-  migrations; if a database still carries the untouched seed rows from an
-  older install they are cleaned up by a one-shot migration. Any user-edited
-  copy is preserved.
-- The example content is now available as an OPTIONAL seeder, invoked
-  explicitly with \`npm run seed:smoke-test\` (see the README's Testing
-  section). It installs the \`smoke-test-clone-and-claude-linux\` playbook
+  the schema.
+- Example content is available as an OPTIONAL seeder, invoked explicitly with
+  \`npm run seed:smoke-test\` (see the README's Testing section). It installs the \`smoke-test-clone-and-claude-linux\` playbook
   (env: \`CLAUDE_CODE_OAUTH_TOKEN\` lease-injected + \`ADO_PAT\` step-only;
   pre steps install the azure CLI, clone the org's first repo, scrub the
   credential, run a FATAL credential-leak hunt, and install the claude CLI),
