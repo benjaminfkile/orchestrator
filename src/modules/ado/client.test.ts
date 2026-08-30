@@ -389,6 +389,7 @@ describe("ADOClient", () => {
           isDraft: false,
           sourceRefName: "refs/heads/feature/widget",
           targetRefName: "refs/heads/main",
+          sourceCommit: "",
           createdBy: { displayName: "Ada", uniqueName: "ada@x.com" },
           repository: {
             id: "repo-guid",
@@ -397,6 +398,7 @@ describe("ADOClient", () => {
             webUrl: "https://dev.azure.com/contoso/web/_git/web",
             url: undefined,
           },
+          reviewers: [],
           url: "https://dev.azure.com/contoso/_apis/git/pullRequests/11",
         },
       ]);
@@ -430,6 +432,7 @@ describe("ADOClient", () => {
           isDraft: false,
           sourceRefName: "",
           targetRefName: "",
+          sourceCommit: "",
           createdBy: "",
           repository: {
             id: undefined,
@@ -438,6 +441,7 @@ describe("ADOClient", () => {
             webUrl: undefined,
             url: undefined,
           },
+          reviewers: [],
           url: "",
         },
       ]);
@@ -525,6 +529,11 @@ describe("ADOClient", () => {
           "resolveMeIdentity",
           "listPullRequests",
           "getRepository",
+          "prUrl",
+          "getPullRequest",
+          "listPullRequestIterations",
+          "listIterationChanges",
+          "listPullRequestThreads",
         ])
       );
     });
@@ -544,6 +553,11 @@ describe("ADOClient", () => {
         "resolveMeIdentity",
         "listPullRequests",
         "getRepository",
+        "prUrl",
+        "getPullRequest",
+        "listPullRequestIterations",
+        "listIterationChanges",
+        "listPullRequestThreads",
       ]);
       const names = Object.getOwnPropertyNames(ADOClient.prototype).filter(
         (n) => !readOps.has(n)

@@ -77,8 +77,14 @@ Key invariants you must respect:
   producer. All columns are addressable in rule criteria as \`event.<column>\`.
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
   .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
-  .updated\` (source \`ado\`). PR payloads carry \`is_draft\`; \`.updated\` fires on
-  a status or draft-flag change with \`previous_status\` and \`previous_is_draft\`.
+  .updated/.pushed/.comment.created/.thread.status_changed/.vote/.completed/
+  .abandoned\` (source \`ado\`). PR payloads carry \`is_draft\`; \`.updated\` fires on a
+  status or draft-flag change with \`previous_status\` and \`previous_is_draft\`;
+  \`.pushed\` carries \`iteration_id\`, \`source_commit\`, \`changed_files\`;
+  \`.comment.created\` carries \`thread_id\`, \`comment_id\`, \`parent_comment_id\`
+  (null unless a reply), \`author\`, \`content\`, \`file_path\`, \`line\`;
+  \`.thread.status_changed\` carries \`status\` and \`previous_status\`; \`.vote\`
+  carries \`vote\`, \`vote_label\`, \`previous_vote\`; the README lists every field.
 - Datadog producer events (source \`datadog\`, aggregate-driven: never one per
   log line):
   - \`datadog.logs.alert\`: a watched log query's grouped count tripped a

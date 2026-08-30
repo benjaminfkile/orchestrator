@@ -18,6 +18,9 @@ owns the lease lifecycle, never the agent inside it.
 
 - `ado.pullrequest.*` payloads carry `is_draft`; `.updated` fires when a PR's
   draft flag changes and includes `previous_is_draft`.
+- New listen-only events: `ado.pullrequest.pushed` (per iteration, with changed
+  files), `.comment.created` (top-level and replies), `.thread.status_changed`,
+  `.vote`, `.completed`, `.abandoned`.
 
 #### Foundation
 

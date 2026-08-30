@@ -6,14 +6,18 @@
  *
  * Per the ARCHITECTURE PRINCIPLE (see CLAUDE.md) this file learns nothing about
  * what a pull request *means*. It emits `ado.pullrequest.created` for a
- * newly-seen PR and `ado.pullrequest.updated` when a known PR's status or draft
- * flag changes;
+ * newly-seen PR, `ado.pullrequest.updated` when a known PR's status or draft
+ * flag changes, `ado.pullrequest.pushed` per new iteration, `.comment.created`
+ * per new thread comment, `.thread.status_changed`, `.vote` per reviewer vote
+ * change, and `.completed` / `.abandoned` when a PR leaves the active list;
  * those event `type` strings are the only place a domain word ever appears. The
  * event payload carries `repo_remote_url` (+ its scheme-stripped
  * `repo_remote_url_hostpath` for authenticated clones) and `source_branch`,
  * which together are enough for a playbook to clone the exact branch under review.
  *
- * SNAPSHOT & SEEDING. The snapshot is `Map<id, { status, isDraft }>`. The FIRST tick after
+ * SNAPSHOT & SEEDING. The snapshot holds, per PR, the status, draft flag,
+ * source commit, last iteration id, each thread's status and last comment id,
+ * and each reviewer's vote. The FIRST tick after
  * start — and the first tick after any config change — SEEDS SILENTLY: it
  * populates the snapshot and emits nothing, so a restart (or a re-configure)
  * never replays every open PR as a flood of "created" events. Only subsequent
@@ -34,7 +38,10 @@ import {
   ADOClient,
   type ADOClientOptions,
   type ADOIdentityRef,
+  type ADOIterationChange,
   type ADOPullRequest,
+  type ADOPullRequestIteration,
+  type ADOPullRequestThread,
   type ADORepositoryRef,
 } from "./client";
 import {
@@ -54,6 +61,31 @@ export const ADO_PR_SUBJECT_KIND = "pull_request";
 /** Event `type` strings — the sole place a domain word is allowed to appear. */
 export const ADO_PR_EVENT_CREATED = "ado.pullrequest.created";
 export const ADO_PR_EVENT_UPDATED = "ado.pullrequest.updated";
+export const ADO_PR_EVENT_PUSHED = "ado.pullrequest.pushed";
+export const ADO_PR_EVENT_COMMENT_CREATED = "ado.pullrequest.comment.created";
+export const ADO_PR_EVENT_THREAD_STATUS_CHANGED =
+  "ado.pullrequest.thread.status_changed";
+export const ADO_PR_EVENT_VOTE = "ado.pullrequest.vote";
+export const ADO_PR_EVENT_COMPLETED = "ado.pullrequest.completed";
+export const ADO_PR_EVENT_ABANDONED = "ado.pullrequest.abandoned";
+
+/** Statuses that end a pull request; mapped to their own event types. */
+const TERMINAL_EVENT_BY_STATUS: Record<string, string> = {
+  completed: ADO_PR_EVENT_COMPLETED,
+  abandoned: ADO_PR_EVENT_ABANDONED,
+};
+
+/** Human labels for ADO's numeric reviewer votes. */
+const VOTE_LABELS: Record<number, string> = {
+  10: "approved",
+  5: "approved_with_suggestions",
+  0: "no_vote",
+  [-5]: "waiting_for_author",
+  [-10]: "rejected",
+};
+
+/** Comment types ADO generates itself; not emitted as comment events. */
+const GENERATED_COMMENT_TYPES = new Set(["system", "codeChange"]);
 
 /** Prefix stripped from a full ref name to yield a bare branch name. */
 const REFS_HEADS_PREFIX = "refs/heads/";
@@ -91,6 +123,20 @@ export interface AdoPrConnectionConfig {
 export interface AdoPrReadClient {
   listPullRequests(): Promise<ADOPullRequest[]>;
   getRepository(repositoryId: string): Promise<ADORepositoryRef>;
+  getPullRequest(repositoryId: string, pullRequestId: number): Promise<ADOPullRequest>;
+  listPullRequestIterations(
+    repositoryId: string,
+    pullRequestId: number
+  ): Promise<ADOPullRequestIteration[]>;
+  listIterationChanges(
+    repositoryId: string,
+    pullRequestId: number,
+    iterationId: number
+  ): Promise<ADOIterationChange[]>;
+  listPullRequestThreads(
+    repositoryId: string,
+    pullRequestId: number
+  ): Promise<ADOPullRequestThread[]>;
 }
 
 /** Builds a read client from resolved connection options; injectable for tests. */
@@ -121,10 +167,31 @@ export interface PullRequestProducer {
   getStatus(): AdoProducerStatus;
 }
 
-/** The facets of a PR the poller diffs: the status string and the draft flag. */
+/** Per-thread facets the poller diffs. */
+interface ThreadSnapshot {
+  status: string;
+  lastCommentId: number;
+}
+
+/** The facets of a PR the poller diffs. */
 interface PrSnapshot {
   status: string;
   isDraft: boolean;
+  repositoryId: string;
+  sourceCommit: string;
+  lastIterationId: number;
+  threads: Map<number, ThreadSnapshot>;
+  votes: Map<string, number>;
+}
+
+/** Key a reviewer by its identity id, falling back to the unique name. */
+function reviewerKey(r: { id: string; uniqueName: string }): string {
+  return r.id !== "" ? r.id : r.uniqueName;
+}
+
+/** Label for a numeric vote; unknown values stringify. */
+function voteLabel(vote: number): string {
+  return VOTE_LABELS[vote] ?? String(vote);
 }
 
 /** Extract a human-readable message from any thrown value. */
@@ -270,6 +337,224 @@ export function createPullRequestProducer(
     };
   }
 
+  /**
+   * Read a PR's current iterations and threads into a fresh snapshot entry.
+   * Used when seeding and when a PR is first seen, so pre-existing pushes and
+   * comments are recorded without being emitted.
+   */
+  async function captureState(
+    pr: ADOPullRequest,
+    client: AdoPrReadClient
+  ): Promise<PrSnapshot> {
+    const repositoryId = pr.repository.id ?? "";
+    const entry: PrSnapshot = {
+      status: pr.status,
+      isDraft: pr.isDraft,
+      repositoryId,
+      sourceCommit: pr.sourceCommit,
+      lastIterationId: 0,
+      threads: new Map(),
+      votes: new Map(pr.reviewers.map((r) => [reviewerKey(r), r.vote])),
+    };
+    if (repositoryId === "") return entry;
+    const iterations = await client.listPullRequestIterations(repositoryId, pr.pullRequestId);
+    for (const it of iterations) {
+      if (it.id > entry.lastIterationId) entry.lastIterationId = it.id;
+    }
+    const threads = await client.listPullRequestThreads(repositoryId, pr.pullRequestId);
+    for (const t of threads) {
+      entry.threads.set(t.id, {
+        status: t.status,
+        lastCommentId: Math.max(0, ...t.comments.map((c) => c.id)),
+      });
+    }
+    return entry;
+  }
+
+  /** Common payload fields plus the PR's clone URL, for the secondary events. */
+  async function basePayload(
+    pr: ADOPullRequest,
+    client: AdoPrReadClient,
+    cache: Map<string, string>
+  ): Promise<Record<string, unknown>> {
+    return buildPayload(pr, await resolveRemoteUrl(pr, client, cache));
+  }
+
+  /** Emit one `pushed` event per iteration newer than the snapshot's. */
+  async function diffPushes(
+    pr: ADOPullRequest,
+    prev: PrSnapshot,
+    client: AdoPrReadClient,
+    cache: Map<string, string>
+  ): Promise<void> {
+    if (prev.repositoryId === "" || prev.sourceCommit === pr.sourceCommit) return;
+    const iterations = await client.listPullRequestIterations(
+      prev.repositoryId,
+      pr.pullRequestId
+    );
+    let previousCommit = prev.sourceCommit;
+    for (const it of iterations) {
+      if (it.id <= prev.lastIterationId) {
+        previousCommit = it.sourceCommit;
+        continue;
+      }
+      const changes = await client.listIterationChanges(
+        prev.repositoryId,
+        pr.pullRequestId,
+        it.id
+      );
+      await emit({
+        source: ADO_EVENT_SOURCE,
+        type: ADO_PR_EVENT_PUSHED,
+        subject_kind: ADO_PR_SUBJECT_KIND,
+        subject_ref: String(pr.pullRequestId),
+        payload: {
+          ...(await basePayload(pr, client, cache)),
+          iteration_id: it.id,
+          source_commit: it.sourceCommit,
+          previous_source_commit: previousCommit,
+          changed_files: changes.map((c) => ({ path: c.path, change_type: c.changeType })),
+        },
+        dedupe_key: `${ADO_PR_EVENT_PUSHED}:${pr.pullRequestId}:${it.id}`,
+      });
+      previousCommit = it.sourceCommit;
+      prev.lastIterationId = it.id;
+    }
+    prev.sourceCommit = pr.sourceCommit;
+  }
+
+  /** Emit comment and thread-status events for anything new since the snapshot. */
+  async function diffThreads(
+    pr: ADOPullRequest,
+    prev: PrSnapshot,
+    client: AdoPrReadClient,
+    cache: Map<string, string>
+  ): Promise<void> {
+    if (prev.repositoryId === "") return;
+    const threads = await client.listPullRequestThreads(prev.repositoryId, pr.pullRequestId);
+    for (const t of threads) {
+      if (t.isDeleted) continue;
+      const known = prev.threads.get(t.id);
+      const lastSeen = known?.lastCommentId ?? 0;
+      let maxId = lastSeen;
+      const fresh = t.comments
+        .filter((c) => c.id > lastSeen && !c.isDeleted && !GENERATED_COMMENT_TYPES.has(c.commentType))
+        .sort((a, b) => a.id - b.id);
+      for (const c of fresh) {
+        await emit({
+          source: ADO_EVENT_SOURCE,
+          type: ADO_PR_EVENT_COMMENT_CREATED,
+          subject_kind: ADO_PR_SUBJECT_KIND,
+          subject_ref: String(pr.pullRequestId),
+          payload: {
+            ...(await basePayload(pr, client, cache)),
+            thread_id: t.id,
+            comment_id: c.id,
+            parent_comment_id: c.parentCommentId,
+            author: createdByPayload(c.author),
+            content: c.content,
+            file_path: t.filePath,
+            line: t.line,
+            thread_status: t.status,
+            published_at: c.publishedDate,
+          },
+          dedupe_key: `${ADO_PR_EVENT_COMMENT_CREATED}:${pr.pullRequestId}:${t.id}:${c.id}`,
+        });
+      }
+      for (const c of t.comments) if (c.id > maxId) maxId = c.id;
+      if (known && known.status !== t.status) {
+        await emit({
+          source: ADO_EVENT_SOURCE,
+          type: ADO_PR_EVENT_THREAD_STATUS_CHANGED,
+          subject_kind: ADO_PR_SUBJECT_KIND,
+          subject_ref: String(pr.pullRequestId),
+          payload: {
+            ...(await basePayload(pr, client, cache)),
+            thread_id: t.id,
+            status: t.status,
+            previous_status: known.status,
+            file_path: t.filePath,
+            line: t.line,
+          },
+          dedupe_key: `${ADO_PR_EVENT_THREAD_STATUS_CHANGED}:${pr.pullRequestId}:${t.id}:${t.status}`,
+        });
+      }
+      prev.threads.set(t.id, { status: t.status, lastCommentId: maxId });
+    }
+  }
+
+  /** Emit a `vote` event for every reviewer whose vote changed. */
+  async function diffVotes(
+    pr: ADOPullRequest,
+    prev: PrSnapshot,
+    client: AdoPrReadClient,
+    cache: Map<string, string>
+  ): Promise<void> {
+    for (const r of pr.reviewers) {
+      const key = reviewerKey(r);
+      const before = prev.votes.get(key) ?? 0;
+      if (before === r.vote) {
+        prev.votes.set(key, r.vote);
+        continue;
+      }
+      await emit({
+        source: ADO_EVENT_SOURCE,
+        type: ADO_PR_EVENT_VOTE,
+        subject_kind: ADO_PR_SUBJECT_KIND,
+        subject_ref: String(pr.pullRequestId),
+        payload: {
+          ...(await basePayload(pr, client, cache)),
+          reviewer: { uniqueName: r.uniqueName, displayName: r.displayName },
+          vote: r.vote,
+          vote_label: voteLabel(r.vote),
+          previous_vote: before,
+          previous_vote_label: voteLabel(before),
+          is_required: r.isRequired,
+        },
+        dedupe_key: `${ADO_PR_EVENT_VOTE}:${pr.pullRequestId}:${key}:${r.vote}`,
+      });
+      prev.votes.set(key, r.vote);
+    }
+  }
+
+  /**
+   * A snapshot PR missing from the active list: read it once to learn whether it
+   * completed or was abandoned, emit that, and forget it. Anything else (still
+   * active but filtered out, or unreadable) is dropped silently.
+   */
+  async function diffVanished(
+    id: number,
+    prev: PrSnapshot,
+    client: AdoPrReadClient,
+    cache: Map<string, string>
+  ): Promise<void> {
+    snapshot.delete(id);
+    if (prev.repositoryId === "") return;
+    let pr: ADOPullRequest;
+    try {
+      pr = await client.getPullRequest(prev.repositoryId, id);
+    } catch (err) {
+      logger.warn("could not read a pull request that left the active list", {
+        pullRequestId: id,
+        error: errorMessage(err),
+      });
+      return;
+    }
+    const type = TERMINAL_EVENT_BY_STATUS[pr.status];
+    if (!type) return;
+    await emit({
+      source: ADO_EVENT_SOURCE,
+      type,
+      subject_kind: ADO_PR_SUBJECT_KIND,
+      subject_ref: String(id),
+      payload: {
+        ...(await basePayload(pr, client, cache)),
+        previous_status: prev.status,
+      },
+      dedupe_key: `${type}:${id}`,
+    });
+  }
+
   /** Run one poll: list, filter, then either seed silently or diff-and-emit. */
   async function tick(): Promise<void> {
     status.running = true;
@@ -304,7 +589,7 @@ export function createPullRequestProducer(
       if (!seeded) {
         snapshot.clear();
         for (const pr of prs) {
-          snapshot.set(pr.pullRequestId, { status: pr.status, isDraft: pr.isDraft });
+          snapshot.set(pr.pullRequestId, await captureState(pr, client));
         }
         seeded = true;
         status.seeded_count = snapshot.size;
@@ -316,7 +601,9 @@ export function createPullRequestProducer(
       }
 
       const repoUrlCache = new Map<string, string>();
+      const seen = new Set<number>();
       for (const pr of prs) {
+        seen.add(pr.pullRequestId);
         const prev = snapshot.get(pr.pullRequestId);
         if (!prev) {
           const remoteUrl = await resolveRemoteUrl(pr, client, repoUrlCache);
@@ -328,7 +615,10 @@ export function createPullRequestProducer(
             payload: buildPayload(pr, remoteUrl),
             dedupe_key: `${ADO_PR_EVENT_CREATED}:${pr.pullRequestId}`,
           });
-        } else if (prev.status !== pr.status || prev.isDraft !== pr.isDraft) {
+          snapshot.set(pr.pullRequestId, await captureState(pr, client));
+          continue;
+        }
+        if (prev.status !== pr.status || prev.isDraft !== pr.isDraft) {
           const remoteUrl = await resolveRemoteUrl(pr, client, repoUrlCache);
           await emit({
             source: ADO_EVENT_SOURCE,
@@ -342,8 +632,15 @@ export function createPullRequestProducer(
             },
             dedupe_key: `${ADO_PR_EVENT_UPDATED}:${pr.pullRequestId}:${pr.status}:${pr.isDraft ? "draft" : "ready"}`,
           });
+          prev.status = pr.status;
+          prev.isDraft = pr.isDraft;
         }
-        snapshot.set(pr.pullRequestId, { status: pr.status, isDraft: pr.isDraft });
+        await diffPushes(pr, prev, client, repoUrlCache);
+        await diffThreads(pr, prev, client, repoUrlCache);
+        await diffVotes(pr, prev, client, repoUrlCache);
+      }
+      for (const [id, prev] of [...snapshot.entries()]) {
+        if (!seen.has(id)) await diffVanished(id, prev, client, repoUrlCache);
       }
       status.seeded_count = snapshot.size;
       status.last_error = null;

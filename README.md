@@ -642,11 +642,35 @@ and **never committed** to this repo.
   `.iteration_changed` (+ `previous_iteration`), `.tagged`, `.updated`. Each
   payload carries `work_item_type`, `state`, `assignee`, `area_path`,
   `iteration_path`, `tags`, and `url`.
-- Pull requests: `ado.pullrequest.created` (+ `.updated`), payload including the
-  repo clone URL, source/target branch, creator, `status`, and `is_draft`.
-  `.updated` fires when the status or the draft flag changes and carries
-  `previous_status` and `previous_is_draft`, so a rule can match a PR leaving
-  draft with `payload.is_draft: false` and `payload.previous_is_draft: true`.
+- Pull requests (every payload carries `id`, `title`, `repository`,
+  `repo_remote_url`, `repo_remote_url_hostpath`, `source_branch`,
+  `target_branch`, `created_by`, `status`, `is_draft`, `url`):
+  - `ado.pullrequest.created`: a PR appeared in the active list.
+  - `ado.pullrequest.updated`: status or draft flag changed; adds
+    `previous_status` and `previous_is_draft` (a PR leaving draft matches
+    `payload.is_draft: false` and `payload.previous_is_draft: true`).
+  - `ado.pullrequest.pushed`: one event per new iteration (push); adds
+    `iteration_id`, `source_commit`, `previous_source_commit`, and
+    `changed_files: [{path, change_type}]`.
+  - `ado.pullrequest.comment.created`: a new human comment in any thread; adds
+    `thread_id`, `comment_id`, `parent_comment_id` (null for a top-level
+    comment, the parent id for a reply), `author`, `content`, `file_path`,
+    `line`, `thread_status`, `published_at`. ADO-generated comments are not
+    emitted.
+  - `ado.pullrequest.thread.status_changed`: a thread moved between active,
+    fixed, wontFix, closed, byDesign, pending; adds `thread_id`, `status`,
+    `previous_status`, `file_path`, `line`.
+  - `ado.pullrequest.vote`: a reviewer's vote changed; adds `reviewer`,
+    `vote` (10, 5, 0, -5, -10), `vote_label` (approved,
+    approved_with_suggestions, no_vote, waiting_for_author, rejected),
+    `previous_vote`, `previous_vote_label`, `is_required`.
+  - `ado.pullrequest.completed` / `ado.pullrequest.abandoned`: the PR left the
+    active list with that status; adds `previous_status`.
+
+  The poller only reads. Per tick it lists active PRs once, reads each PR's
+  threads once, reads iterations only when the source commit changed, and reads
+  a PR by id once when it disappears from the active list. Pre-existing pushes
+  and comments on a PR are recorded silently when it is first seen.
 
 **Events the `datadog` module emits** (read-only, aggregate-driven — never one
 per log line):

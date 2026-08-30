@@ -11,13 +11,27 @@ import { createLogger } from "../../log";
 import { emitEvent } from "../../services/eventIntake";
 import { TriggerScheduler } from "../../services/triggerScheduler";
 
-import type { ADOPullRequest, ADORepositoryRef, ADOIdentityRef } from "./client";
+import type {
+  ADOIdentityRef,
+  ADOIterationChange,
+  ADOPullRequest,
+  ADOPullRequestIteration,
+  ADOPullRequestThread,
+  ADORepositoryRef,
+  ADOReviewer,
+} from "./client";
 import {
   createAdoModule,
   type AdoModuleConfig,
 } from "./poller";
 import {
+  ADO_PR_EVENT_ABANDONED,
+  ADO_PR_EVENT_COMMENT_CREATED,
+  ADO_PR_EVENT_COMPLETED,
   ADO_PR_EVENT_CREATED,
+  ADO_PR_EVENT_PUSHED,
+  ADO_PR_EVENT_THREAD_STATUS_CHANGED,
+  ADO_PR_EVENT_VOTE,
   ADO_PR_EVENT_UPDATED,
   ADO_PR_PRODUCER_ID,
   ADO_PR_SUBJECT_KIND,
@@ -30,6 +44,8 @@ function pr(
     title?: string;
     status?: string;
     isDraft?: boolean;
+    sourceCommit?: string;
+    reviewers?: ADOReviewer[];
     source?: string;
     target?: string;
     createdBy?: ADOIdentityRef | string;
@@ -54,6 +70,8 @@ function pr(
     title: fields.title ?? `pr ${id}`,
     status: fields.status ?? "active",
     isDraft: fields.isDraft ?? false,
+    sourceCommit: fields.sourceCommit ?? "c0",
+    reviewers: fields.reviewers ?? [],
     sourceRefName: fields.source ?? "refs/heads/feature/x",
     targetRefName: fields.target ?? "refs/heads/main",
     createdBy: fields.createdBy ?? { uniqueName: "ada@x.com", displayName: "Ada" },
@@ -65,7 +83,12 @@ function pr(
 /** A mutable fake ADO PR read client backed by an in-memory list. */
 class FakePrClient {
   board: ADOPullRequest[] = [];
+  /** PRs readable by id even when not active (completed/abandoned). */
+  archive: ADOPullRequest[] = [];
   repos = new Map<string, ADORepositoryRef>();
+  iterations = new Map<number, ADOPullRequestIteration[]>();
+  changes = new Map<string, ADOIterationChange[]>();
+  threads = new Map<number, ADOPullRequestThread[]>();
   getRepositoryCalls: string[] = [];
 
   async listPullRequests(): Promise<ADOPullRequest[]> {
@@ -74,6 +97,20 @@ class FakePrClient {
   async getRepository(repositoryId: string): Promise<ADORepositoryRef> {
     this.getRepositoryCalls.push(repositoryId);
     return this.repos.get(repositoryId) ?? {};
+  }
+  async getPullRequest(_repositoryId: string, pullRequestId: number): Promise<ADOPullRequest> {
+    const found = [...this.board, ...this.archive].find((p) => p.pullRequestId === pullRequestId);
+    if (!found) throw new Error("not found");
+    return found;
+  }
+  async listPullRequestIterations(_r: string, pullRequestId: number): Promise<ADOPullRequestIteration[]> {
+    return this.iterations.get(pullRequestId) ?? [];
+  }
+  async listIterationChanges(_r: string, pullRequestId: number, iterationId: number): Promise<ADOIterationChange[]> {
+    return this.changes.get(`${pullRequestId}:${iterationId}`) ?? [];
+  }
+  async listPullRequestThreads(_r: string, pullRequestId: number): Promise<ADOPullRequestThread[]> {
+    return this.threads.get(pullRequestId) ?? [];
   }
 }
 
@@ -528,5 +565,206 @@ describe("ado pull-request dedupe (real db + emitEvent)", () => {
     ]);
 
     scheduler.stop();
+  });
+});
+
+describe("ado pull-request activity events", () => {
+  function thread(
+    id: number,
+    status: string,
+    comments: Array<{ id: number; parent?: number; type?: string; deleted?: boolean; content?: string }>,
+    file = "/src/a.ts",
+    line: number | null = 12
+  ): ADOPullRequestThread {
+    return {
+      id,
+      status,
+      filePath: file,
+      line,
+      isDeleted: false,
+      comments: comments.map((c) => ({
+        id: c.id,
+        parentCommentId: c.parent ?? null,
+        author: { uniqueName: "rev@x.com", displayName: "Rev" },
+        content: c.content ?? `comment ${c.id}`,
+        commentType: c.type ?? "text",
+        isDeleted: c.deleted ?? false,
+        publishedDate: "2026-08-30T00:00:00Z",
+      })),
+    };
+  }
+  const reviewer = (vote: number, id = "r1"): ADOReviewer => ({
+    id,
+    uniqueName: "rev@x.com",
+    displayName: "Rev",
+    vote,
+    isRequired: true,
+  });
+
+  it("emits one pushed event per new iteration with its changed files", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1, { sourceCommit: "c1" })];
+    client.iterations.set(1, [{ id: 1, sourceCommit: "c1" }]);
+    await tick(); // seed
+
+    client.board = [pr(1, { sourceCommit: "c3" })];
+    client.iterations.set(1, [
+      { id: 1, sourceCommit: "c1" },
+      { id: 2, sourceCommit: "c2" },
+      { id: 3, sourceCommit: "c3" },
+    ]);
+    client.changes.set("1:2", [{ path: "/src/a.ts", changeType: "edit" }]);
+    client.changes.set("1:3", [{ path: "/src/b.ts", changeType: "add" }]);
+    await tick();
+
+    const pushed = ofType(emitted, ADO_PR_EVENT_PUSHED);
+    expect(pushed).toHaveLength(2);
+    expect(pushed[0].dedupe_key).toBe(`${ADO_PR_EVENT_PUSHED}:1:2`);
+    expect(pushed[0].payload).toMatchObject({
+      id: 1,
+      iteration_id: 2,
+      source_commit: "c2",
+      previous_source_commit: "c1",
+      changed_files: [{ path: "/src/a.ts", change_type: "edit" }],
+    });
+    expect(pushed[1].payload).toMatchObject({
+      iteration_id: 3,
+      source_commit: "c3",
+      previous_source_commit: "c2",
+      changed_files: [{ path: "/src/b.ts", change_type: "add" }],
+    });
+
+    await tick();
+    expect(ofType(emitted, ADO_PR_EVENT_PUSHED)).toHaveLength(2);
+  });
+
+  it("records a new PR's existing pushes and comments without emitting them", async () => {
+    const { emitted, client, tick } = setup();
+    await tick(); // seed empty
+    client.board = [pr(4, { sourceCommit: "c9" })];
+    client.iterations.set(4, [{ id: 1, sourceCommit: "c9" }]);
+    client.threads.set(4, [thread(40, "active", [{ id: 400 }])]);
+    await tick();
+
+    expect(ofType(emitted, ADO_PR_EVENT_CREATED)).toHaveLength(1);
+    expect(ofType(emitted, ADO_PR_EVENT_PUSHED)).toHaveLength(0);
+    expect(ofType(emitted, ADO_PR_EVENT_COMMENT_CREATED)).toHaveLength(0);
+  });
+
+  it("emits comment.created for top-level comments and replies, skipping generated comments", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1)];
+    client.threads.set(1, [thread(10, "active", [{ id: 100 }])]);
+    await tick(); // seed
+
+    client.threads.set(1, [
+      thread(10, "active", [
+        { id: 100 },
+        { id: 101, parent: 100, content: "reply" },
+        { id: 102, type: "system" },
+      ]),
+      thread(11, "active", [{ id: 110, content: "new thread" }], "", null),
+    ]);
+    await tick();
+
+    const comments = ofType(emitted, ADO_PR_EVENT_COMMENT_CREATED);
+    expect(comments).toHaveLength(2);
+    expect(comments[0].dedupe_key).toBe(`${ADO_PR_EVENT_COMMENT_CREATED}:1:10:101`);
+    expect(comments[0].payload).toMatchObject({
+      thread_id: 10,
+      comment_id: 101,
+      parent_comment_id: 100,
+      author: { uniqueName: "rev@x.com", displayName: "Rev" },
+      content: "reply",
+      file_path: "/src/a.ts",
+      line: 12,
+      thread_status: "active",
+    });
+    expect(comments[1].payload).toMatchObject({
+      thread_id: 11,
+      comment_id: 110,
+      parent_comment_id: null,
+      file_path: "",
+      line: null,
+    });
+
+    await tick();
+    expect(ofType(emitted, ADO_PR_EVENT_COMMENT_CREATED)).toHaveLength(2);
+  });
+
+  it("emits thread.status_changed when a thread is resolved", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1)];
+    client.threads.set(1, [thread(10, "active", [{ id: 100 }])]);
+    await tick(); // seed
+
+    client.threads.set(1, [thread(10, "fixed", [{ id: 100 }])]);
+    await tick();
+
+    const changed = ofType(emitted, ADO_PR_EVENT_THREAD_STATUS_CHANGED);
+    expect(changed).toHaveLength(1);
+    expect(changed[0].dedupe_key).toBe(`${ADO_PR_EVENT_THREAD_STATUS_CHANGED}:1:10:fixed`);
+    expect(changed[0].payload).toMatchObject({
+      thread_id: 10,
+      status: "fixed",
+      previous_status: "active",
+      file_path: "/src/a.ts",
+    });
+  });
+
+  it("emits vote when a reviewer's vote changes, with labels", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1, { reviewers: [reviewer(0)] })];
+    await tick(); // seed
+
+    client.board = [pr(1, { reviewers: [reviewer(-5)] })];
+    await tick();
+    client.board = [pr(1, { reviewers: [reviewer(10), reviewer(5, "r2")] })];
+    await tick();
+
+    const votes = ofType(emitted, ADO_PR_EVENT_VOTE);
+    expect(votes).toHaveLength(3);
+    expect(votes[0].dedupe_key).toBe(`${ADO_PR_EVENT_VOTE}:1:r1:-5`);
+    expect(votes[0].payload).toMatchObject({
+      reviewer: { uniqueName: "rev@x.com", displayName: "Rev" },
+      vote: -5,
+      vote_label: "waiting_for_author",
+      previous_vote: 0,
+      previous_vote_label: "no_vote",
+      is_required: true,
+    });
+    expect(votes[1].payload).toMatchObject({ vote: 10, vote_label: "approved", previous_vote: -5 });
+    expect(votes[2].payload).toMatchObject({ vote: 5, vote_label: "approved_with_suggestions", previous_vote: 0 });
+  });
+
+  it("emits completed or abandoned when a PR leaves the active list", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1), pr(2)];
+    await tick(); // seed
+
+    client.board = [];
+    client.archive = [pr(1, { status: "completed" }), pr(2, { status: "abandoned" })];
+    await tick();
+
+    const completed = ofType(emitted, ADO_PR_EVENT_COMPLETED);
+    const abandoned = ofType(emitted, ADO_PR_EVENT_ABANDONED);
+    expect(completed).toHaveLength(1);
+    expect(completed[0].dedupe_key).toBe(`${ADO_PR_EVENT_COMPLETED}:1`);
+    expect(completed[0].payload).toMatchObject({ id: 1, status: "completed", previous_status: "active" });
+    expect(abandoned).toHaveLength(1);
+    expect(abandoned[0].payload).toMatchObject({ id: 2, status: "abandoned" });
+
+    await tick();
+    expect(ofType(emitted, ADO_PR_EVENT_COMPLETED)).toHaveLength(1);
+  });
+
+  it("drops a vanished PR silently when it is still active (filtered out) or unreadable", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [pr(1), pr(2)];
+    await tick(); // seed
+    client.board = [];
+    client.archive = [pr(1, { status: "active" })];
+    await tick();
+    expect(emitted).toHaveLength(0);
   });
 });
