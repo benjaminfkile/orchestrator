@@ -61,6 +61,7 @@ const STATUS_COLOR: Record<DispatchStatus, BadgeProps["color"]> = {
   collecting: "brand",
   done: "success",
   failed: "danger",
+  cancelled: "subtle",
 };
 
 /** Longest error text shown inline in the Outcome column before it is elided. */
@@ -460,7 +461,8 @@ export function RunsPage() {
                   </TableCell>
                   <TableCell>{r.findings_count}</TableCell>
                   <TableCell>
-                    {r.status === "failed" && r.error ? (
+                    {(r.status === "failed" || r.status === "cancelled") &&
+                    r.error ? (
                       <span
                         className={styles.outcomeError}
                         title={r.error}
@@ -479,7 +481,7 @@ export function RunsPage() {
                       className={styles.actions}
                       onClick={(e) => e.stopPropagation()}
                     >
-                      {r.status === "failed" && (
+                      {(r.status === "failed" || r.status === "cancelled") && (
                         <Button
                           size="small"
                           disabled={busy.has(r.dispatch_id)}

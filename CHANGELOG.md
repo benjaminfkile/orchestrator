@@ -14,6 +14,23 @@ owns the lease lifecycle, never the agent inside it.
 
 ### Added
 
+#### Dispatch cancellation
+
+- `POST /api/dispatches/:id/cancel` aborts a non-terminal dispatch: a queued
+  row is marked `cancelled` immediately; a leasing/running/collecting row is
+  torn down through the dispatcher's per-dispatch abort seam and its lease is
+  still released via the normal finally path (with `release_pending` fallback
+  intact when the DELETE fails). 409 when the dispatch is already terminal
+  (done/failed/cancelled); 404 for an unknown id. `cancelled` is a new
+  terminal status, retryable in place through the existing
+  `POST /api/dispatches/:id/retry` and never auto-retried by the dispatcher's
+  retry/backoff logic. A cancel between two pipeline steps stops before the
+  next step starts. A `run.cancelled` lifecycle event fires either way
+  (documented alongside `run.started`/`run.completed`/`run.failed`) so rules
+  can react to user aborts distinctly from failures. The web Queue page and
+  the run detail page carry a Cancel action on any non-terminal dispatch, with
+  a confirm and a live status flip.
+
 #### Notifications and events
 
 - Desktop notifications open the run page (or the inbox) when clicked on

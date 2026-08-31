@@ -40,6 +40,7 @@ import {
   attemptLeaseRelease,
   DEFAULT_RELEASE_TIMEOUT_MS,
   DEFAULT_SWEEP_BACKOFF_MS,
+  DispatchCancelledError,
   runDispatch,
   sweepPendingReleases,
   type EnvResolver,
@@ -165,6 +166,18 @@ export class Dispatcher {
   private readonly releaseTimeoutMs?: number;
   private readonly now: () => number;
 
+  /**
+   * In-process registry of the per-dispatch {@link AbortController} for every
+   * dispatch currently executing under {@link runDispatch}. Populated inside
+   * {@link processDispatch} for the life of the run and cleared in its
+   * finally; {@link Dispatcher.cancel} looks a dispatch up here to abort its
+   * in-flight wisper calls. The map is process-local (the dispatcher is
+   * single-flight, so there is at most one entry), but it survives multi-step
+   * pipelines and is the seam every cancel of a non-queued dispatch flows
+   * through.
+   */
+  private inflight: Map<number, AbortController> = new Map();
+
   /** Safety-interval handle; undefined while stopped. */
   private timer: ReturnType<typeof setInterval> | undefined;
   /**
@@ -288,6 +301,23 @@ export class Dispatcher {
   }
 
   /**
+   * Cancel an in-flight dispatch by aborting its per-dispatch signal. Returns
+   * true when the dispatch was being processed and its controller was aborted;
+   * false when no in-flight run for that id is registered (a queued dispatch,
+   * or one that has already reached terminal). The abort tears down the
+   * executor's in-flight wisper calls through the same seam
+   * {@link RunDispatchDeps.signal} carries; the executor's finally block still
+   * releases the lease. The router owns the queued-cancel fast path; this
+   * method is only for runs the dispatcher is actively driving.
+   */
+  cancel(dispatchId: number): boolean {
+    const controller = this.inflight.get(dispatchId);
+    if (!controller) return false;
+    controller.abort(new DispatchCancelledError());
+    return true;
+  }
+
+  /**
    * Schedule an immediate drain pass. Coalesced and single-flight: a kick while a
    * pass is already running just flags a re-run; otherwise it starts the pass.
    * A no-op once stopped or when leasing is unconfigured.
@@ -390,22 +420,44 @@ export class Dispatcher {
     // dispatches never reach this point, so nothing bogus is emitted.
     await this.emitStartedEvent(dispatch);
 
-    const outcome = await runDispatch(dispatch.id, {
-      wisper: this.wisper,
-      resolveEnv: this.resolveEnv,
-      db: this.db,
-      logger: this.logger,
-      logBaseDir: this.logBaseDir,
-      workingEnvironment: this.workingEnvironment,
-      execTimeoutMs: this.execTimeoutMs,
-      releaseTimeoutMs: this.releaseTimeoutMs,
-      now: this.now,
-    });
+    // Register the per-dispatch abort controller BEFORE calling into the
+    // executor so a cancel that races with the first wisper call still finds a
+    // controller to abort. The entry is removed in the finally regardless of
+    // outcome so a stale controller never lingers for a later dispatch id
+    // collision (ids are monotonic; the guard is belt-and-braces).
+    const controller = new AbortController();
+    this.inflight.set(dispatch.id, controller);
+    let outcome;
+    try {
+      outcome = await runDispatch(dispatch.id, {
+        wisper: this.wisper,
+        resolveEnv: this.resolveEnv,
+        db: this.db,
+        logger: this.logger,
+        logBaseDir: this.logBaseDir,
+        workingEnvironment: this.workingEnvironment,
+        execTimeoutMs: this.execTimeoutMs,
+        releaseTimeoutMs: this.releaseTimeoutMs,
+        signal: controller.signal,
+        now: this.now,
+      });
+    } finally {
+      this.inflight.delete(dispatch.id);
+    }
 
-    if (outcome.status !== "failed") {
-      // done — the terminal success. Feed a `run.completed` event back into the
+    if (outcome.status === "done") {
+      // The terminal success. Feed a `run.completed` event back into the
       // pipeline so rules can react to the outcome.
       await this.emitTerminalEvent(outcome, "done");
+      return;
+    }
+
+    if (outcome.status === "cancelled") {
+      // Operator-initiated cancel routed through the abort seam above. Emit
+      // `run.cancelled` (NOT `run.failed`) so a rule reacting to failures does
+      // not fire for a user abort; a cancelled dispatch is never auto-retried.
+      this.logger.info("dispatch cancelled", { dispatchId: dispatch.id });
+      await this.emitTerminalEvent(outcome, "cancelled");
       return;
     }
 
@@ -532,7 +584,7 @@ export class Dispatcher {
    */
   private async emitTerminalEvent(
     dispatch: DispatchRecord,
-    status: "done" | "failed"
+    status: "done" | "failed" | "cancelled"
   ): Promise<void> {
     try {
       await emitRunEvent(dispatch, status, {

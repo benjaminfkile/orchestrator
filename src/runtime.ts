@@ -17,9 +17,23 @@ import type { AnthropicModelsDeps } from "./services/anthropicModels";
 import type { TriggerScheduler } from "./services/triggerScheduler";
 import type { WisperHostsDeps } from "./services/wisperHosts";
 
-/** The one dispatcher affordance the API uses: nudge it to drain the queue. */
+/**
+ * The dispatcher affordances the API uses: nudge the loop to drain the queue,
+ * and cancel an in-flight dispatch through the per-dispatch abort seam. Both
+ * are OPTIONAL on the handle so a test can wire a partial fake (only `kick`,
+ * for example) and the router still behaves: the cancel path degrades to
+ * "no in-flight controller found", which is exactly the semantics a caller
+ * gets when leasing is unconfigured.
+ */
 export interface DispatcherHandle {
   kick(): void;
+  /**
+   * Signal the dispatcher to abort the in-flight run for `dispatchId`. Returns
+   * true when a run was aborted; false when no in-flight controller for that
+   * id is registered (a queued dispatch, or one already terminal). See
+   * {@link import("./services/dispatcher").Dispatcher.cancel}.
+   */
+  cancel?(dispatchId: number): boolean;
 }
 
 /** The app-level services the routers reach through this module. */

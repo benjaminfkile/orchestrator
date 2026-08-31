@@ -37,7 +37,11 @@ export const RUN_RETENTION_MAX_SETTING = "run_retention_max";
 export const DEFAULT_RUN_RETENTION_MAX = 2000;
 
 /** The terminal dispatch statuses this pass considers for pruning. */
-const TERMINAL_STATUSES: readonly DispatchStatus[] = ["done", "failed"];
+const TERMINAL_STATUSES: readonly DispatchStatus[] = [
+  "done",
+  "failed",
+  "cancelled",
+];
 
 /** How many dispatches to delete per transaction, bounding a single batch. */
 const PRUNE_BATCH_SIZE = 500;

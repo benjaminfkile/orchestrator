@@ -22,6 +22,7 @@ import { useNavigate } from "react-router-dom";
 import { ApiError } from "../api";
 import {
   ACTIVE_DISPATCH_STATUSES,
+  cancelDispatch,
   createDispatch,
   listDispatches,
   listEvents,
@@ -74,6 +75,7 @@ const STATUS_COLOR: Record<DispatchStatus, BadgeProps["color"]> = {
   collecting: "brand",
   done: "success",
   failed: "danger",
+  cancelled: "subtle",
 };
 
 const useStyles = makeStyles({
@@ -209,6 +211,8 @@ export function QueuePage() {
   const [error, setError] = useState<string | null>(null);
   // Dispatch ids with a re-run in flight, so their row actions disable.
   const [rerunning, setRerunning] = useState<Set<number>>(new Set());
+  // Dispatch ids with a cancel in flight, so the row's Cancel button disables.
+  const [cancelling, setCancelling] = useState<Set<number>>(new Set());
   const [dialog, setDialog] = useState<RunDialogState | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -295,6 +299,41 @@ export function QueuePage() {
     visible,
     sortColumns,
     QUEUE_DEFAULT_SORT,
+  );
+
+  // Cancel a non-terminal dispatch. The queue only lists non-terminal work, so
+  // every row here is a valid cancel target: a queued row lands in `cancelled`
+  // immediately; an in-flight one is aborted server-side and its status flips
+  // live via useLiveRefetch. Uses window.confirm to keep the flow scoped:
+  // clicking Cancel then confirming triggers the endpoint.
+  const onCancel = useCallback(
+    async (d: Dispatch) => {
+      const ok = window.confirm(
+        `Cancel dispatch #${d.id}? Its lease will still be released.`,
+      );
+      if (!ok) return;
+      setCancelling((prev) => new Set(prev).add(d.id));
+      try {
+        await cancelDispatch(d.id);
+        if (!mounted.current) return;
+        setSuccess(`Dispatch #${d.id} cancelled.`);
+        setError(null);
+        await refresh();
+      } catch (err) {
+        if (mounted.current) {
+          setError(err instanceof ApiError ? err.message : String(err));
+        }
+      } finally {
+        if (mounted.current) {
+          setCancelling((prev) => {
+            const next = new Set(prev);
+            next.delete(d.id);
+            return next;
+          });
+        }
+      }
+    },
+    [refresh],
   );
 
   // Re-run a dispatch: queue a fresh dispatch of the same playbook on the same
@@ -505,6 +544,13 @@ export function QueuePage() {
                       }
                     >
                       Run playbook
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={cancelling.has(d.id)}
+                      onClick={() => void onCancel(d)}
+                    >
+                      {cancelling.has(d.id) ? "Cancelling…" : "Cancel"}
                     </Button>
                   </div>
                 </TableCell>

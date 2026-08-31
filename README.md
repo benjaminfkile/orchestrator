@@ -233,6 +233,11 @@ existing machinery — no new tables, no new transport.
   failure whose lease release keeps failing is converted to terminal `failed`
   early (the dispatcher refuses to requeue a row still holding an unreleased
   lease; the release sweep then owns the release) and emits `run.failed` then.
+- **`run.cancelled`** fires on a terminal `cancelled`. Emitted for BOTH the
+  queued-cancel fast path and an in-flight cancel driven through the
+  executor's abort seam, so a rule watching cancellation reacts consistently
+  regardless of when the cancel landed. `run.failed` is NOT emitted for a
+  cancel: a rule matching failures does not fire for user aborts.
 
 Every callback event carries `source` **`orchestrator`**, copies the originating
 event's `subject_kind`/`subject_ref`, and has a null `dedupe_key`. `run.started`
@@ -246,7 +251,7 @@ carries a start-time subset of the terminal payload — no `status`, `exit_code`
 | `run_id` | Latest run's id, or `null` if the dispatch failed before any run opened (terminal only). |
 | `playbook_id` · `playbook_name` | The dispatched playbook (`playbook_name` `null` if it was deleted). |
 | `rule_id` | Rule that enqueued the dispatch, or `null` for a manual dispatch. |
-| `status` | `"done"` or `"failed"` — mirrors the event type (terminal only). |
+| `status` | `"done"`, `"failed"`, or `"cancelled"`, mirroring the event type (terminal only). |
 | `exit_code` | The agent step's exit code, or `null` (terminal only). |
 | `error` | The dispatch's failure message, or `null` (terminal only). |
 | `findings` | Array of `{content, tags}` findings the run recorded (terminal only). |
@@ -301,7 +306,8 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `GET /api/dispatches` · `GET /api/dispatches/:id` | Read the dispatch queue (newest-first). `?status=` filters to one state, `?active=1` to the non-terminal work (queued/leasing/running/collecting), `?q=` substring-searches status, error, subject fields, event type, and playbook name. `GET /:id` embeds the dispatch's runs, each with its findings. A queued dispatch held by the run/token budget gate is annotated with `waiting_reason: "budget"` plus `window_count`/`budget`/`next_eligible_at`. |
 | `POST /api/dispatches` | Manually queue a playbook against an event: `{event_id, playbook_id}` → 201 with the created `queued` dispatch (`rule_id` null). No rule matching; 404 if either id is unknown. Bypasses the per-event cap. |
 | `GET /api/dispatches/:id/log` | Tail the per-dispatch log as chunked `text/plain`: current content, then appended bytes, until the dispatch is terminal or the client disconnects; 404 until the log file exists. |
-| `POST /api/dispatches/:id/retry` | Requeue a `failed` dispatch (attempts reset) and kick the dispatcher; 409 unless the status is `failed`, and 409 while the dispatch still holds an unreleased lease (the release sweep must resolve it first). |
+| `POST /api/dispatches/:id/retry` | Requeue a `failed` or `cancelled` dispatch (attempts reset) and kick the dispatcher; 409 unless the status is `failed` or `cancelled`, and 409 while the dispatch still holds an unreleased lease (the release sweep must resolve it first). |
+| `POST /api/dispatches/:id/cancel` | Abort a non-terminal dispatch. A `queued` row is marked `cancelled` immediately (no lease was created); a `leasing`/`running`/`collecting` row is aborted through the dispatcher's per-dispatch signal so its in-flight wisper calls tear down and the executor's finally block still releases the lease (with `release_pending` fallback intact when the DELETE fails). Cancelled runs are never auto-retried by the dispatcher's retry/backoff logic. A cancel that lands BETWEEN two pipeline steps stops before the next step starts. Response carries the current dispatch row; 409 when the dispatch is already terminal (done/failed/cancelled); 404 for an unknown id. Emits `run.cancelled` on both paths. |
 | `GET /api/runs` | Run history, newest-first: one row per dispatch with its latest run's outcome joined in. `?status=` filters to a dispatch status, `?limit=` (1..1000, default 200) caps rows, `?q=` substring-searches playbook name, status, error, subject fields, and each run's result text, collected output, and findings content. |
 | `GET /api/runs/:id` | Read a run with its collected output, findings, and the triggering event's subject fields. |
 | `GET /api/notifiers` · `GET /api/notifiers/:id` | List / read notifiers (outbound sinks). |

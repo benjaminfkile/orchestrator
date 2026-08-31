@@ -332,6 +332,71 @@ describe("dispatches router", () => {
       expect(res.status).toBe(200);
       expect(res.body.status).toBe("queued");
     });
+
+    it("also requeues a cancelled dispatch (cancelled is retryable in place)", async () => {
+      const id = await seedDispatch("cancelled");
+      const res = await request(app).post(`/api/dispatches/${id}/retry`);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("queued");
+      expect(res.body.attempts).toBe(0);
+    });
+  });
+
+  describe("POST /api/dispatches/:id/cancel", () => {
+    it("marks a queued dispatch cancelled immediately", async () => {
+      const id = await seedDispatch("queued");
+      const res = await request(app).post(`/api/dispatches/${id}/cancel`);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("cancelled");
+      const reloaded = await getDispatch(id, db);
+      expect(reloaded?.status).toBe("cancelled");
+      expect(reloaded?.error).toBe("cancelled");
+    });
+
+    it("routes an in-flight dispatch through the dispatcher's cancel seam", async () => {
+      const id = await seedDispatch("running");
+      let cancelledFor: number | null = null;
+      setRuntime({
+        dispatcher: {
+          kick: () => {},
+          cancel: (dispatchId) => {
+            cancelledFor = dispatchId;
+            return true;
+          },
+        },
+      });
+      const res = await request(app).post(`/api/dispatches/${id}/cancel`);
+      expect(res.status).toBe(200);
+      // The router does not touch the row for an in-flight cancel; the
+      // executor's finally will flip it to `cancelled` asynchronously.
+      expect(res.body.status).toBe("running");
+      expect(cancelledFor).toBe(id);
+    });
+
+    it("409s an in-flight cancel when no dispatcher controller is registered", async () => {
+      const id = await seedDispatch("running");
+      setRuntime({
+        dispatcher: { kick: () => {}, cancel: () => false },
+      });
+      const res = await request(app).post(`/api/dispatches/${id}/cancel`);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no in-flight/i);
+    });
+
+    it("409s a cancel of a terminal dispatch (done/failed/cancelled) with the current status", async () => {
+      for (const status of ["done", "failed", "cancelled"] as const) {
+        const id = await seedDispatch(status);
+        const res = await request(app).post(`/api/dispatches/${id}/cancel`);
+        expect(res.status).toBe(409);
+        expect(res.body.error).toContain(status);
+      }
+    });
+
+    it("404s for an unknown id", async () => {
+      const res = await request(app).post("/api/dispatches/9999/cancel");
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: expect.any(String) });
+    });
   });
 
   describe("POST /api/dispatches", () => {

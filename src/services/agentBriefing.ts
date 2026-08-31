@@ -108,16 +108,19 @@ Key invariants you must respect:
 - Run-lifecycle events (source \`orchestrator\`): \`run.started\` fires each time
   the dispatcher hands a claimed dispatch to the executor; a retried dispatch
   emits it once per attempt (never for dispatches that stay queued or are
-  dropped by a cap/gate); \`run.completed\` / \`run.failed\`
-  fire on terminal dispatch outcomes. \`run.started\` payload: \`{dispatch_id,
-  playbook_id, playbook_name, rule_id, origin, chain_depth}\`: the start-time
-  subset, with no terminal fields. Terminal payload: \`{dispatch_id, run_id,
-  playbook_id, playbook_name, rule_id, status, exit_code, error, findings,
-  findings_count, collected, duration_ms, total_tokens, origin, chain_depth}\`.
-  \`origin\` is an OBJECT describing the triggering event (\`{event_id, source,
-  type, subject_kind, subject_ref}\`), so a chaining rule matches e.g.
-  \`payload.origin.subject_ref\`; \`findings\` is \`[{content, tags}]\`.
-  Rules can match these to notify or CHAIN playbooks; the
+  dropped by a cap/gate); \`run.completed\` / \`run.failed\` / \`run.cancelled\`
+  fire on terminal dispatch outcomes. \`run.cancelled\` fires when a dispatch
+  ends via \`POST /api/dispatches/:id/cancel\` (both the queued fast path and
+  an in-flight abort emit it); \`run.failed\` is NOT emitted for a cancel, so a
+  rule watching failures does not fire for user aborts. \`run.started\`
+  payload: \`{dispatch_id, playbook_id, playbook_name, rule_id, origin,
+  chain_depth}\`: the start-time subset, with no terminal fields. Terminal
+  payload: \`{dispatch_id, run_id, playbook_id, playbook_name, rule_id, status,
+  exit_code, error, findings, findings_count, collected, duration_ms,
+  total_tokens, origin, chain_depth}\`. \`origin\` is an OBJECT describing the
+  triggering event (\`{event_id, source, type, subject_kind, subject_ref}\`), so
+  a chaining rule matches e.g. \`payload.origin.subject_ref\`; \`findings\` is
+  \`[{content, tags}]\`. Rules can match these to notify or CHAIN playbooks; the
   \`dispatch_max_chain_depth\` setting (default 3) caps runaway chains for every
   run-lifecycle event (\`run.started\` included).
 
@@ -295,13 +298,23 @@ rename therefore breaks every reference by design.
   (404 for an unknown event or playbook). Deliberately bypasses
   \`dispatch_max_per_event\`, but still counts against the per-hour cap and the
   run/token budget gate.
-- \`POST /api/dispatches/:id/retry\`: 409 unless the status is exactly \`failed\`.
+- \`POST /api/dispatches/:id/retry\`: 409 unless the status is \`failed\` or
+  \`cancelled\` (both are terminal and retryable in place; a \`done\` dispatch is
+  retried by re-running from scratch via \`POST /api/dispatches\`).
+- \`POST /api/dispatches/:id/cancel\`: abort a non-terminal dispatch. A
+  \`queued\` row is marked \`cancelled\` immediately (no lease was created);
+  \`leasing\`/\`running\`/\`collecting\` rows are torn down through the
+  dispatcher's per-dispatch abort seam and their lease is still released via
+  the normal finally path (and \`release_pending\` if the DELETE fails, exactly
+  like a failed run). Cancelled runs are never auto-retried. The response
+  carries the current dispatch row (for an in-flight cancel this is the
+  pre-cancel row; poll to see it flip to \`cancelled\`). 409 when the dispatch
+  is already terminal (\`done\`/\`failed\`/\`cancelled\`); 404 for an unknown id.
+  A \`run.cancelled\` event fires either way (see Events above).
 - \`GET /api/dispatches/:id/log\`: a \`text/plain\` stream that TAILS the log
   until the dispatch is terminal (it deliberately stays open while the dispatch
   runs; do not curl it and wait); 404 until the log file exists.
-- There is NO cancel endpoint: an in-flight dispatch runs to completion (which
-  is also why deleting its playbook is refused until it finishes).
-- Status flow: queued -> leasing -> running -> collecting -> done | failed.
+- Status flow: queued -> leasing -> running -> collecting -> done | failed | cancelled.
   A dispatch held by the run/token budget gate stays \`queued\` annotated with
   \`{waiting_reason: "budget", window_count, budget, next_eligible_at, ...}\`;
   check those fields when a dispatch seems stuck.
@@ -309,12 +322,13 @@ rename therefore breaks every reference by design.
   timestamp of a successful lease release; \`release_pending: true\` marks a row
   whose lease release is stuck retrying. A release sweep runs once at boot and
   periodically while the dispatcher is up; it reattempts release for any
-  TERMINAL (\`done\`/\`failed\`) dispatch with a non-null \`lease_id\` and a null
-  \`released_at\`; in-flight dispatches are never touched (their lease is owned
-  by the running pipeline, which releases it itself). A wisper "not_found"
-  response is treated as a successful release. \`POST /api/dispatches/:id/retry\`
-  refuses (409) while a failed dispatch still holds an unreleased lease; wait
-  for the sweep (typically under a minute), then retry.
+  TERMINAL (\`done\`/\`failed\`/\`cancelled\`) dispatch with a non-null
+  \`lease_id\` and a null \`released_at\`; in-flight dispatches are never touched
+  (their lease is owned by the running pipeline, which releases it itself). A
+  wisper "not_found" response is treated as a successful release.
+  \`POST /api/dispatches/:id/retry\` refuses (409) while a failed/cancelled
+  dispatch still holds an unreleased lease; wait for the sweep (typically
+  under a minute), then retry.
 - A retryable dispatch failure is NEVER requeued while it still holds an
   unreleased lease: the dispatcher tries one more inline release first, and if
   that also fails it leaves the row \`failed\` with \`release_pending\` set (the

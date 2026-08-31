@@ -5,7 +5,7 @@ import type { Request, Response } from "express";
 import { getDispatch } from "../db/dispatches";
 
 /** Statuses at which a dispatch is finished and its log stops growing. */
-const TERMINAL_STATUSES = new Set(["done", "failed"]);
+const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
 
 /** Resolved timings for a single tail; supplied by the router with defaults. */
 export interface TailOptions {
