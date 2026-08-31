@@ -323,6 +323,12 @@ rename therefore breaks every reference by design.
   the lease handle so the lease would run to wisper's TTL failsafe, billed.
 - Runs: \`GET /api/runs/:id\` -> run + collected output + findings. \`GET
   /api/runs\` also takes \`?limit=\` (1..1000) and \`?status=\` (a dispatch status).
+- The run detail page renders \`result_text\` as GitHub-Flavored Markdown (the
+  ADO PR/comment flavor: CommonMark + GFM tables, task lists, strikethrough)
+  with a Rendered / Raw toggle and a Copy markdown button that puts the RAW
+  \`result_text\` on the clipboard. Raw HTML in the source is NOT rendered
+  (escaped), so a playbook that wants formatted output should emit markdown,
+  not HTML.
 
 ## Notifiers & notifications
 
