@@ -448,6 +448,77 @@ describe("ADOClient", () => {
     });
   });
 
+  describe("getPullRequestById", () => {
+    it("GETs the project-scoped by-id endpoint and returns a normalized PR", async () => {
+      server.respondWith({
+        status: 200,
+        body: {
+          pullRequestId: 42,
+          title: "Fix login",
+          status: "active",
+          isDraft: true,
+          sourceRefName: "refs/heads/feature/login",
+          targetRefName: "refs/heads/main",
+          createdBy: { displayName: "Ada", uniqueName: "ada@x.com" },
+          repository: {
+            id: "repo-guid",
+            name: "web",
+            remoteUrl: "https://dev.azure.com/contoso/web/_git/web",
+          },
+          url: "https://dev.azure.com/contoso/_apis/git/pullRequests/42",
+        },
+      });
+      const client = clientFor(server, { org: "contoso", project: "web" });
+
+      const pr = await client.getPullRequestById(42);
+
+      const req = server.requests[0];
+      expect(req.method).toBe("GET");
+      expect(req.url).toBe(
+        `/contoso/web/_apis/git/pullrequests/42?api-version=${ADO_API_VERSION}`
+      );
+      expect(req.body).toBe("");
+      expect(pr).toMatchObject({
+        pullRequestId: 42,
+        title: "Fix login",
+        status: "active",
+        isDraft: true,
+        sourceRefName: "refs/heads/feature/login",
+        targetRefName: "refs/heads/main",
+        createdBy: { displayName: "Ada", uniqueName: "ada@x.com" },
+        repository: {
+          id: "repo-guid",
+          name: "web",
+          remoteUrl: "https://dev.azure.com/contoso/web/_git/web",
+        },
+      });
+    });
+
+    it("percent-encodes org and project path segments", async () => {
+      server.respondWith({ status: 200, body: {} });
+      const client = clientFor(server, { org: "my org", project: "a/b" });
+
+      await client.getPullRequestById(7);
+
+      expect(server.requests[0].url).toBe(
+        `/my%20org/a%2Fb/_apis/git/pullrequests/7?api-version=${ADO_API_VERSION}`
+      );
+    });
+
+    it("passes an ADOApiError through on a non-2xx (e.g. unknown id 404)", async () => {
+      server.respondWith({
+        status: 404,
+        body: { message: "TF401180: pull request not found", typeKey: "PullRequestNotFoundException" },
+      });
+      const client = clientFor(server);
+      await expect(client.getPullRequestById(1234)).rejects.toMatchObject({
+        name: "ADOApiError",
+        httpStatus: 404,
+        message: "TF401180: pull request not found",
+      });
+    });
+  });
+
   describe("getRepository", () => {
     it("GETs the project-scoped repository endpoint and returns the clone URL", async () => {
       server.respondWith({
@@ -531,6 +602,7 @@ describe("ADOClient", () => {
           "getRepository",
           "prUrl",
           "getPullRequest",
+          "getPullRequestById",
           "listPullRequestIterations",
           "listIterationChanges",
           "listPullRequestThreads",
@@ -555,6 +627,7 @@ describe("ADOClient", () => {
         "getRepository",
         "prUrl",
         "getPullRequest",
+        "getPullRequestById",
         "listPullRequestIterations",
         "listIterationChanges",
         "listPullRequestThreads",
@@ -574,6 +647,7 @@ describe("ADOClient", () => {
       server.respondWith({ status: 200, body: { authenticatedUser: {} } });
       server.respondWith({ status: 200, body: { value: [] } });
       server.respondWith({ status: 200, body: { remoteUrl: "https://x" } });
+      server.respondWith({ status: 200, body: {} });
       const client = clientFor(server);
 
       await client.runWiql("q");
@@ -582,6 +656,7 @@ describe("ADOClient", () => {
       await client.resolveMeIdentity();
       await client.listPullRequests();
       await client.getRepository("repo-1");
+      await client.getPullRequestById(9);
 
       const verbs = server.requests.map((r) => r.method);
       expect(verbs).not.toContain("PATCH");

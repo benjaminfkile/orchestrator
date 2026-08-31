@@ -327,6 +327,8 @@ All routes are under `/api`, loopback only, JSON in/out. Errors render as
 | `GET /api/modules/ado/discovery/identities?org=&project=&q=` | Identity search (`q` optional; empty matches all): `[{displayName, uniqueName}]`. |
 | `GET /api/modules/ado/discovery/workitems?q=` | Work-item picker search over the **configured** org/project: title search (`System.Title CONTAINS WORDS`) plus, when `q` is a positive integer, an exact-id lookup; capped at 25 rows shaped `[{id, title, work_item_type, state, area_path, iteration_path, assignee, url}]`. Read-only; requires the module enabled+configured. |
 | `POST /api/modules/ado/workitems/:id/materialize` | Fetch ONE work item and record it as a single `ado.workitem.manual` event (poller-identical payload, no dedupe, rule matching skipped) so a playbook can be dispatched against it. `201` with the created event row; `404` if the item does not exist in ADO. |
+| `GET /api/modules/ado/discovery/pullrequests` | Active pull requests in the **configured** org/project as `[{id, title, repository, source_branch, target_branch, is_draft}]`, for the Run Playbook dialog's PR picker. Read-only; requires the module enabled+configured. |
+| `POST /api/modules/ado/pullrequests/:id/materialize` | Fetch ONE pull request project-wide by id and record it as a single `ado.pullrequest.manual` event (payload identical to the `ado.pullrequest` poller's base shape, no dedupe, rule matching skipped) so a playbook can be dispatched against it. `201` with the created event row; `404` if the PR does not exist in ADO. |
 | `GET /api/modules/ado/identity/me` | The PAT's own identity `{uniqueName?, displayName?}` — used to prefill the `identity_me` setting. |
 | `GET /api/secrets` | Stored secret **names** only (`{keys}`) — never a value. |
 | `PUT /api/secrets` | Upsert `{key, value}`; echoes the name only. |
@@ -553,8 +555,9 @@ an explicit `config` may restate them plus the fields below.
 > replays its persisted config so producer triggers re-arm across restarts). The
 > `/api/modules` endpoints list it, `PUT /api/modules/ado/config` accepts its
 > config, and the `/api/modules/ado/discovery/*`, `/workitems/:id/materialize`,
-> and `/identity/me` reads above are live (the `discovery/workitems` search and
-> `materialize` both require the module enabled+configured). The producer only
+> `/pullrequests/:id/materialize`, and `/identity/me` reads above are live (the
+> `discovery/workitems`, `discovery/pullrequests`, and both `materialize`
+> endpoints require the module enabled+configured). The producer only
 > arms its interval trigger once `enabled`, `org`,
 > and `project` are all set; until then it stays on a manual trigger.
 

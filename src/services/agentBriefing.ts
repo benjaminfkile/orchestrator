@@ -430,12 +430,21 @@ rename therefore breaks every reference by design.
   \`projects?org=\`, \`work-item-types?org=&project=\`,
   \`states?org=&project=&type=\`, \`area-paths?org=&project=\`,
   \`iterations?org=&project=\`, \`identities?org=&project=&q=\`; \`workitems?q=\`
-  searches the CONFIGURED project's work items and needs the module enabled), plus
-  \`GET /api/modules/ado/identity/me\`. On a PAT lacking scopes these DEGRADE to
-  200 + an empty list with an \`X-Ado-Restricted\` header, never a hard 401.
+  searches the CONFIGURED project's work items and needs the module enabled;
+  \`pullrequests\` lists the CONFIGURED project's ACTIVE pull requests as
+  \`[{id, title, repository, source_branch, target_branch, is_draft}]\` and also
+  needs the module enabled), plus \`GET /api/modules/ado/identity/me\`. On a PAT
+  lacking scopes these DEGRADE to 200 + an empty list with an
+  \`X-Ado-Restricted\` header, never a hard 401.
 - \`POST /api/modules/ado/workitems/:id/materialize\` -> 201 with a stored
   \`ado.workitem.manual\` event (source \`ado\`; rule matching and dedupe are
   skipped): the way to mint a real test event on demand.
+- \`POST /api/modules/ado/pullrequests/:id/materialize\` -> 201 with a stored
+  \`ado.pullrequest.manual\` event (source \`ado\`, subject_kind
+  \`pull_request\`; rule matching and dedupe are skipped): the same on-demand
+  mint for a pull request. Payload is byte-for-byte the \`ado.pullrequest\`
+  poller's base shape. 404 when the PR does not exist in ADO. Both materialize
+  endpoints require the module enabled+configured.
 - Grantable capabilities (\`GET /api/capabilities\` -> \`[{id, module_id}]\`) are
   READ-ONLY prompt enrichers granted per playbook; for ANY capability, a grant
   with no \`config\` inherits the owning module's stored connection config. ADO
@@ -531,7 +540,8 @@ rename therefore breaks every reference by design.
 
 Confirm before destructive calls (DELETE, imports). After creating rules or
 playbooks, offer to test them: mint a synthetic event with \`POST /api/events\`
-(works on a fresh stack with no modules configured; the ADO materialize endpoint
-is fine too when ADO is set up), dispatch it manually, and report the run's
-outcome from \`GET /api/runs/:id\`.`;
+(works on a fresh stack with no modules configured; either ADO materialize
+endpoint - work item or pull request - is fine too when ADO is set up),
+dispatch it manually, and report the run's outcome from
+\`GET /api/runs/:id\`.`;
 }

@@ -7,7 +7,12 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api";
 import { createDispatch } from "../dispatches";
-import { materializeWorkItem, searchWorkItems } from "../discovery";
+import {
+  listAdoPullRequests,
+  materializePullRequest,
+  materializeWorkItem,
+  searchWorkItems,
+} from "../discovery";
 import { listPlaybooks } from "../playbooks";
 import { RunPlaybookDialog } from "./RunPlaybookDialog";
 
@@ -20,6 +25,8 @@ vi.mock("../discovery", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../discovery")>()),
   searchWorkItems: vi.fn(),
   materializeWorkItem: vi.fn(),
+  listAdoPullRequests: vi.fn(),
+  materializePullRequest: vi.fn(),
 }));
 vi.mock("../playbooks", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../playbooks")>()),
@@ -30,6 +37,8 @@ const mockCreateDispatch = vi.mocked(createDispatch);
 const mockSearchWorkItems = vi.mocked(searchWorkItems);
 const mockMaterializeWorkItem = vi.mocked(materializeWorkItem);
 const mockListPlaybooks = vi.mocked(listPlaybooks);
+const mockListAdoPullRequests = vi.mocked(listAdoPullRequests);
+const mockMaterializePullRequest = vi.mocked(materializePullRequest);
 
 const ROW = {
   id: 42,
@@ -41,6 +50,25 @@ const ROW = {
   assignee: "ada@contoso.com",
   url: "https://dev.azure.com/contoso/Alpha/_workitems/edit/42",
 };
+
+const PR_ROWS = [
+  {
+    id: 101,
+    title: "Fix login",
+    repository: "web",
+    source_branch: "feature/login",
+    target_branch: "main",
+    is_draft: false,
+  },
+  {
+    id: 202,
+    title: "Update docs",
+    repository: "web",
+    source_branch: "docs/readme",
+    target_branch: "main",
+    is_draft: true,
+  },
+];
 
 const PLAYBOOKS = [
   { id: 5, name: "Researcher" },
@@ -56,6 +84,10 @@ beforeEach(() => {
   >);
   mockCreateDispatch.mockResolvedValue({ id: 9 } as Awaited<
     ReturnType<typeof createDispatch>
+  >);
+  mockListAdoPullRequests.mockResolvedValue(PR_ROWS);
+  mockMaterializePullRequest.mockResolvedValue({ id: 200 } as Awaited<
+    ReturnType<typeof materializePullRequest>
   >);
 });
 
@@ -118,6 +150,83 @@ describe("RunPlaybookDialog — search mode (Queue)", () => {
     ).toBe(true);
 
     // A playbook alone is not enough without a work item.
+    fireEvent.change(screen.getByRole("combobox", { name: "Playbook" }), {
+      target: { value: "5" },
+    });
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+});
+
+describe("RunPlaybookDialog PR target (Queue search mode)", () => {
+  it("lists active PRs after switching target type, filters, picks, and runs", async () => {
+    const onDispatched = vi.fn();
+    const onOpenChange = vi.fn();
+    render(
+      <RunPlaybookDialog
+        open
+        onOpenChange={onOpenChange}
+        onDispatched={onDispatched}
+      />,
+    );
+    await screen.findByRole("option", { name: "Researcher" });
+
+    // Switch to Pull request mode; the PR list is fetched.
+    fireEvent.click(screen.getByRole("radio", { name: "Pull request" }));
+    await waitFor(() => expect(mockListAdoPullRequests).toHaveBeenCalled());
+    // Work-item search must not be called in PR mode.
+    expect(mockSearchWorkItems).not.toHaveBeenCalled();
+
+    // Both PRs render, then filtering by title narrows to one.
+    await screen.findByRole("radio", { name: /Fix login/ });
+    await screen.findByRole("radio", { name: /Update docs/ });
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Filter pull requests" }),
+      { target: { value: "docs" } },
+    );
+    expect(screen.queryByRole("radio", { name: /Fix login/ })).toBeNull();
+
+    // Pick the remaining PR and a playbook, then Run.
+    fireEvent.click(
+      await screen.findByRole("radio", { name: /Update docs/ }),
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Playbook" }), {
+      target: { value: "5" },
+    });
+
+    const run = screen.getByRole("button", { name: "Run" });
+    await waitFor(() =>
+      expect((run as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(run);
+
+    // Materialize the PR, then dispatch on the returned event id.
+    await waitFor(() =>
+      expect(mockMaterializePullRequest).toHaveBeenCalledWith(202),
+    );
+    await waitFor(() =>
+      expect(mockCreateDispatch).toHaveBeenCalledWith(200, 5),
+    );
+    // The work-item materialize was NOT called in PR mode.
+    expect(mockMaterializeWorkItem).not.toHaveBeenCalled();
+    expect(onDispatched).toHaveBeenCalledWith({ id: 9 });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps Run disabled in PR mode until both a PR and a playbook are chosen", async () => {
+    render(<RunPlaybookDialog open onOpenChange={vi.fn()} />);
+    await screen.findByRole("option", { name: "Researcher" });
+
+    fireEvent.click(screen.getByRole("radio", { name: "Pull request" }));
+    await waitFor(() => expect(mockListAdoPullRequests).toHaveBeenCalled());
+
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
     fireEvent.change(screen.getByRole("combobox", { name: "Playbook" }), {
       target: { value: "5" },
     });

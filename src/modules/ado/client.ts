@@ -619,6 +619,28 @@ export class ADOClient {
   }
 
   /**
+   * Read one pull request by id, resolved project-wide (no repository id).
+   * `GET {base}/{org}/{project}/_apis/git/pullrequests/{id}?api-version=7.0`.
+   *
+   * Distinct from {@link getPullRequest}, which is repository-scoped. This route
+   * lets the caller fetch a PR by id alone (the id space is unique within a
+   * project), which is what the on-demand materialize needs when the dialog has
+   * only the id and the poller may not have seen the PR yet. Normalized
+   * identically to {@link listPullRequests}. This is a read; it never mutates.
+   */
+  async getPullRequestById(
+    pullRequestId: number,
+    opts: ADORequestOptions = {}
+  ): Promise<ADOPullRequest> {
+    const url =
+      `${this.baseUrl}/${encodeSegment(this.org)}/${encodeSegment(this.project)}` +
+      `/_apis/git/pullrequests/${pullRequestId}` +
+      `?api-version=${ADO_API_VERSION}`;
+    const raw = await this.requestJson<unknown>(url, "GET", undefined, opts.signal);
+    return normalizePullRequest(raw);
+  }
+
+  /**
    * Resolve one git repository by id, for its HTTPS clone URL.
    * `GET {base}/{org}/{project}/_apis/git/repositories/{id}?api-version=7.0`.
    *

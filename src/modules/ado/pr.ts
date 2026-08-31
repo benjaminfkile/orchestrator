@@ -240,6 +240,32 @@ function createdByPayload(
 }
 
 /**
+ * Build the event base payload for one pull request, given its resolved HTTPS
+ * clone URL. This is the SINGLE definition: the poller uses it for every event
+ * type it emits, and the on-demand materialize path calls it too so the
+ * manually-materialized event is byte-for-byte the shape a first-seen poll would
+ * emit. Keep additions synchronized across both call sites by editing here only.
+ */
+export function buildPullRequestPayload(
+  pr: ADOPullRequest,
+  remoteUrl: string
+): Record<string, unknown> {
+  return {
+    id: pr.pullRequestId,
+    title: pr.title,
+    repository: pr.repository.name ?? "",
+    repo_remote_url: remoteUrl,
+    repo_remote_url_hostpath: toHostPath(remoteUrl),
+    source_branch: normalizeBranch(pr.sourceRefName),
+    target_branch: normalizeBranch(pr.targetRefName),
+    created_by: createdByPayload(pr.createdBy),
+    status: pr.status,
+    is_draft: pr.isDraft,
+    url: pr.url,
+  };
+}
+
+/**
  * True when a PR passes the watched-creator filter. An empty/absent `creators`
  * list matches any PR; otherwise the PR's `createdBy` uniqueName OR displayName
  * must appear in the list.
@@ -317,26 +343,6 @@ export function createPullRequestProducer(
     return url;
   }
 
-  /** Build the event payload for one PR, given its resolved clone URL. */
-  function buildPayload(
-    pr: ADOPullRequest,
-    remoteUrl: string
-  ): Record<string, unknown> {
-    return {
-      id: pr.pullRequestId,
-      title: pr.title,
-      repository: pr.repository.name ?? "",
-      repo_remote_url: remoteUrl,
-      repo_remote_url_hostpath: toHostPath(remoteUrl),
-      source_branch: normalizeBranch(pr.sourceRefName),
-      target_branch: normalizeBranch(pr.targetRefName),
-      created_by: createdByPayload(pr.createdBy),
-      status: pr.status,
-      is_draft: pr.isDraft,
-      url: pr.url,
-    };
-  }
-
   /**
    * Read a PR's current iterations and threads into a fresh snapshot entry.
    * Used when seeding and when a PR is first seen, so pre-existing pushes and
@@ -377,7 +383,7 @@ export function createPullRequestProducer(
     client: AdoPrReadClient,
     cache: Map<string, string>
   ): Promise<Record<string, unknown>> {
-    return buildPayload(pr, await resolveRemoteUrl(pr, client, cache));
+    return buildPullRequestPayload(pr, await resolveRemoteUrl(pr, client, cache));
   }
 
   /** Emit one `pushed` event per iteration newer than the snapshot's. */
@@ -612,7 +618,7 @@ export function createPullRequestProducer(
             type: ADO_PR_EVENT_CREATED,
             subject_kind: ADO_PR_SUBJECT_KIND,
             subject_ref: String(pr.pullRequestId),
-            payload: buildPayload(pr, remoteUrl),
+            payload: buildPullRequestPayload(pr, remoteUrl),
             dedupe_key: `${ADO_PR_EVENT_CREATED}:${pr.pullRequestId}`,
           });
           snapshot.set(pr.pullRequestId, await captureState(pr, client));
@@ -626,7 +632,7 @@ export function createPullRequestProducer(
             subject_kind: ADO_PR_SUBJECT_KIND,
             subject_ref: String(pr.pullRequestId),
             payload: {
-              ...buildPayload(pr, remoteUrl),
+              ...buildPullRequestPayload(pr, remoteUrl),
               previous_status: prev.status,
               previous_is_draft: prev.isDraft,
             },

@@ -6,6 +6,8 @@ import {
   ADOApiError,
   ADOClient,
   type ADOAuthenticatedIdentity,
+  type ADOPullRequest,
+  type ADORepositoryRef,
   type ADOWorkItem,
 } from "../modules/ado/client";
 import {
@@ -16,7 +18,10 @@ import {
   type ADOWorkItemState,
   type ADOWorkItemType,
 } from "../modules/ado/discovery";
-import { buildManualEvent } from "../modules/ado/materialize";
+import {
+  buildManualEvent,
+  buildManualPullRequestEvent,
+} from "../modules/ado/materialize";
 import { ADO_MODULE_ID, type AdoModuleConfig } from "../modules/ado/poller";
 import { searchWorkItems } from "../modules/ado/search";
 import { getRuntime } from "../runtime";
@@ -76,13 +81,20 @@ export interface AdoDiscoveryLike {
 /**
  * The per-connection read surface this router depends on; {@link ADOClient}
  * satisfies it. Beyond resolving the authenticated identity for `/identity/me`,
- * it exposes the two reads work-item search and materialize need
- * (`runWiql` + `getWorkItems`) — every method is a plain ADO read.
+ * it exposes the reads work-item search and materialize need
+ * (`runWiql` + `getWorkItems`), the two pull-request reads used by the manual
+ * materialize path (`listPullRequests` for the dialog list and
+ * `getPullRequestById` for the actual materialize), and `getRepository` as a
+ * fallback when a PR's embedded repository object omits `remoteUrl`. Every
+ * method is a plain ADO read.
  */
 export interface AdoMeClientLike {
   resolveMeIdentity(): Promise<ADOAuthenticatedIdentity>;
   runWiql(query: string): Promise<number[]>;
   getWorkItems(ids: number[]): Promise<ADOWorkItem[]>;
+  listPullRequests(): Promise<ADOPullRequest[]>;
+  getPullRequestById(pullRequestId: number): Promise<ADOPullRequest>;
+  getRepository(repositoryId: string): Promise<ADORepositoryRef>;
 }
 
 /** Connection options a {@link AdoMeClientLike} is built from. */
@@ -359,6 +371,111 @@ adoDiscoveryRouter.get(
     await discoverList(res, () =>
       searchWorkItems(getMeClient(config, pat), project, q)
     );
+  })
+);
+
+/**
+ * Resolve a pull request's HTTPS clone URL. Prefer the `remoteUrl` embedded in
+ * the PR's repository object; fall back to a single per-repo lookup when the
+ * response omits it, so a manually-materialized event always carries a
+ * clone-ready `repo_remote_url`. Matches the poller's fallback behavior so a
+ * materialize is byte-for-byte a first-seen poll's shape.
+ */
+async function resolvePrRemoteUrl(
+  pr: ADOPullRequest,
+  client: AdoMeClientLike
+): Promise<string> {
+  const embedded = pr.repository.remoteUrl;
+  if (embedded) return embedded;
+  const id = pr.repository.id;
+  if (!id) return "";
+  const resolved = await client.getRepository(id);
+  return resolved.remoteUrl ?? "";
+}
+
+/**
+ * Translate a caller-facing ADO read for a single entity into the router's HTTP
+ * error shape: a 404 on the upstream becomes a 404 with the caller's chosen
+ * `notFoundMessage`, any other ADO error becomes a 502 verbatim, and non-ADO
+ * failures escape to the app error middleware. Shared by the work-item and
+ * pull-request materialize handlers so both surface identical error semantics.
+ */
+async function readOne<T>(
+  fn: () => Promise<T>,
+  notFoundMessage: string
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof ADOApiError && err.httpStatus === 404) {
+      throw new HttpError(404, notFoundMessage);
+    }
+    if (err instanceof ADOApiError) {
+      throw new HttpError(
+        502,
+        err.message || `Azure DevOps request failed (${err.httpStatus})`
+      );
+    }
+    throw err;
+  }
+}
+
+adoDiscoveryRouter.get(
+  "/discovery/pullrequests",
+  handler(async (_req, res) => {
+    const { config, pat } = await resolveAdoPat();
+    requireEnabledConnection(config);
+    // The dialog only shows ACTIVE PRs; `listPullRequests` returns exactly those.
+    // Same degrade-on-permission behavior as the other discovery lists.
+    await discoverList(res, async () => {
+      const prs = await getMeClient(config, pat).listPullRequests();
+      return prs.map((pr) => ({
+        id: pr.pullRequestId,
+        title: pr.title,
+        repository: pr.repository.name ?? "",
+        source_branch: pr.sourceRefName.startsWith("refs/heads/")
+          ? pr.sourceRefName.slice("refs/heads/".length)
+          : pr.sourceRefName,
+        target_branch: pr.targetRefName.startsWith("refs/heads/")
+          ? pr.targetRefName.slice("refs/heads/".length)
+          : pr.targetRefName,
+        is_draft: pr.isDraft,
+      }));
+    });
+  })
+);
+
+adoDiscoveryRouter.post(
+  "/pullrequests/:id/materialize",
+  handler(async (req, res) => {
+    const { config, pat } = await resolveAdoPat();
+    requireEnabledConnection(config);
+    const id = parseIdParam(req.params.id);
+    const client = getMeClient(config, pat);
+
+    // Fetch exactly this one PR project-wide; a non-existent id 404s.
+    const pr = await readOne(
+      () => client.getPullRequestById(id),
+      `pull request ${id} not found in Azure DevOps`
+    );
+
+    // Fill in the clone URL if the by-id response omits it; matches the poller's
+    // fallback so the manual event is shaped identically to a poller-emitted one.
+    const remoteUrl = await resolvePrRemoteUrl(pr, client);
+
+    // Record ONE event through the normal intake with rule matching skipped, so
+    // no dispatch is created here (a manual dispatch is a separate step). No
+    // dedupe_key: a manual materialize must always insert.
+    const result = await emitEvent(
+      buildManualPullRequestEvent(pr, remoteUrl),
+      undefined,
+      undefined,
+      { skipRuleMatching: true }
+    );
+    if (result.suppressed) {
+      throw new HttpError(500, "materialized event was unexpectedly suppressed");
+    }
+    res.status(201).json(result.event);
   })
 );
 

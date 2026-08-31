@@ -338,3 +338,52 @@ export function materializeWorkItem(id: number): Promise<EventRecord> {
     method: "POST",
   });
 }
+
+// --- Azure DevOps pull-request discovery + materialize ---------------------
+//
+// These back the manual "run a playbook on a pull request" flow in the same
+// dialog as the work-item flow. Both are READ-ONLY against ADO (the
+// materialize only WRITES to local SQLite, via the event it records); the PAT
+// is resolved server-side from the module's `pat_secret_ref` and never
+// crosses this boundary.
+
+/**
+ * One active-PR discovery row shown in the dialog's PR list. These are exactly
+ * the fields the backend's `/discovery/pullrequests` endpoint returns and are
+ * the compact display shape; the full poller payload lands only when the user
+ * materializes and dispatches.
+ */
+export interface PullRequestDiscoveryRow {
+  id: number;
+  title: string;
+  repository: string;
+  source_branch: string;
+  target_branch: string;
+  is_draft: boolean;
+}
+
+/**
+ * List the configured project's ACTIVE pull requests for the dialog. Like the
+ * other ADO discovery lists this degrades a PAT-permission failure to a 200
+ * with the restricted header, which {@link adoList} rethrows so the caller
+ * renders the reason inline.
+ */
+export function listAdoPullRequests(): Promise<PullRequestDiscoveryRow[]> {
+  return adoList<PullRequestDiscoveryRow>(
+    `${ADO_BASE}/discovery/pullrequests`,
+  );
+}
+
+/**
+ * Materialize ONE pull request into a local event
+ * (`POST /pullrequests/:id/materialize`) and resolve to the created
+ * {@link EventRecord}. No rule matching runs and no dispatch is created here;
+ * the caller queues a dispatch separately with the returned event's id. A
+ * non-existent id rejects with an `ApiError` (404).
+ */
+export function materializePullRequest(id: number): Promise<EventRecord> {
+  return apiFetch<EventRecord>(
+    `${ADO_BASE}/pullrequests/${id}/materialize`,
+    { method: "POST" },
+  );
+}

@@ -1,10 +1,11 @@
 // The manual "run a playbook" dialog, shared by two entry points:
 //
-//   - Queue page (search mode): search for a work item, pick one, pick a
-//     playbook, then Run = materialize the work item into an event and queue a
-//     dispatch against it.
+//   - Queue page (search mode): pick a TARGET TYPE (work item or pull request),
+//     find the target (work items: search-as-you-type; PRs: filter the list of
+//     ACTIVE PRs), pick a playbook, then Run = materialize the target into an
+//     event and queue a dispatch against it.
 //   - Events page (event mode): the caller passes an existing `event`, so the
-//     search step is skipped — pick a playbook and dispatch against that event.
+//     search step is skipped; pick a playbook and dispatch against that event.
 //
 // Both modes share one playbook picker and one Run action; the only difference
 // is whether an event id already exists or must be materialized first. All API
@@ -32,8 +33,11 @@ import {
 import { ApiError } from "../api";
 import { createDispatch, type Dispatch } from "../dispatches";
 import {
+  listAdoPullRequests,
+  materializePullRequest,
   materializeWorkItem,
   searchWorkItems,
+  type PullRequestDiscoveryRow,
   type WorkItemSearchRow,
 } from "../discovery";
 import { listPlaybooks, type PlaybookRecord } from "../playbooks";
@@ -95,6 +99,9 @@ const useStyles = makeStyles({
   },
 });
 
+/** Target kinds the search step can pick from (work item, pull request). */
+type TargetType = "work_item" | "pull_request";
+
 /**
  * Manual playbook run/dispatch dialog. See the module comment for the two modes.
  */
@@ -111,11 +118,21 @@ export function RunPlaybookDialog({
   const [playbooksError, setPlaybooksError] = useState<string | null>(null);
   const [playbookId, setPlaybookId] = useState("");
 
+  const [targetType, setTargetType] = useState<TargetType>("work_item");
+
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<WorkItemSearchRow[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState("");
+
+  // Pull-request mode uses one server-side list + client-side filter, so it
+  // keeps its own state independent of the work-item search fields.
+  const [prQuery, setPrQuery] = useState("");
+  const [prRows, setPrRows] = useState<PullRequestDiscoveryRow[]>([]);
+  const [prLoading, setPrLoading] = useState(false);
+  const [prError, setPrError] = useState<string | null>(null);
+  const [prSelectedId, setPrSelectedId] = useState("");
 
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -134,11 +151,17 @@ export function RunPlaybookDialog({
   useEffect(() => {
     if (!open) return;
     setPlaybookId("");
+    setTargetType("work_item");
     setQuery("");
     setResults([]);
     setSearching(false);
     setSearchError(null);
     setSelectedId("");
+    setPrQuery("");
+    setPrRows([]);
+    setPrLoading(false);
+    setPrError(null);
+    setPrSelectedId("");
     setRunning(false);
     setRunError(null);
   }, [open]);
@@ -163,11 +186,11 @@ export function RunPlaybookDialog({
     };
   }, [open]);
 
-  // Debounced work-item search (search mode only). A request-id guard drops any
-  // response superseded by a newer query.
+  // Debounced work-item search (search mode only, work-item target). A
+  // request-id guard drops any response superseded by a newer query.
   const searchReqId = useRef(0);
   useEffect(() => {
-    if (!open || !searchMode) return;
+    if (!open || !searchMode || targetType !== "work_item") return;
     const q = query.trim();
     if (q === "") {
       setResults([]);
@@ -192,15 +215,62 @@ export function RunPlaybookDialog({
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(handle);
-  }, [open, searchMode, query]);
+  }, [open, searchMode, targetType, query]);
+
+  // Load the ACTIVE-PR list when the user switches to PR mode (search mode
+  // only). Filtering is client-side, so this is one request per switch; no
+  // debounced re-fetch on typing.
+  useEffect(() => {
+    if (!open || !searchMode || targetType !== "pull_request") return;
+    let active = true;
+    setPrLoading(true);
+    setPrError(null);
+    (async () => {
+      try {
+        const rows = await listAdoPullRequests();
+        if (!active) return;
+        setPrRows(rows);
+      } catch (err) {
+        if (!active) return;
+        setPrRows([]);
+        setPrError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (active) setPrLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [open, searchMode, targetType]);
 
   const selected = useMemo(
     () => results.find((r) => String(r.id) === selectedId) ?? null,
     [results, selectedId],
   );
 
+  const filteredPrs = useMemo(() => {
+    const needle = prQuery.trim().toLowerCase();
+    if (needle === "") return prRows;
+    return prRows.filter((r) => {
+      return (
+        String(r.id).includes(needle) ||
+        r.title.toLowerCase().includes(needle) ||
+        r.source_branch.toLowerCase().includes(needle) ||
+        r.target_branch.toLowerCase().includes(needle)
+      );
+    });
+  }, [prRows, prQuery]);
+
+  const selectedPr = useMemo(
+    () => prRows.find((r) => String(r.id) === prSelectedId) ?? null,
+    [prRows, prSelectedId],
+  );
+
   const canRun =
-    playbookId !== "" && (!searchMode || selected !== null) && !running;
+    playbookId !== "" &&
+    (!searchMode ||
+      (targetType === "work_item" ? selected !== null : selectedPr !== null)) &&
+    !running;
 
   const onRun = useCallback(async () => {
     const pbId = Number(playbookId);
@@ -210,10 +280,15 @@ export function RunPlaybookDialog({
     try {
       let eventId: number;
       if (searchMode) {
-        if (!selected) return;
-        // Materialize the picked work item into an event, then dispatch on it.
-        const created = await materializeWorkItem(selected.id);
-        eventId = created.id;
+        if (targetType === "work_item") {
+          if (!selected) return;
+          const created = await materializeWorkItem(selected.id);
+          eventId = created.id;
+        } else {
+          if (!selectedPr) return;
+          const created = await materializePullRequest(selectedPr.id);
+          eventId = created.id;
+        }
       } else {
         eventId = event!.id;
       }
@@ -232,7 +307,16 @@ export function RunPlaybookDialog({
     } finally {
       if (mounted.current) setRunning(false);
     }
-  }, [playbookId, searchMode, selected, event, onDispatched, onOpenChange]);
+  }, [
+    playbookId,
+    searchMode,
+    targetType,
+    selected,
+    selectedPr,
+    event,
+    onDispatched,
+    onOpenChange,
+  ]);
 
   return (
     <Dialog
@@ -249,62 +333,145 @@ export function RunPlaybookDialog({
           <DialogContent className={styles.content}>
             {searchMode ? (
               <>
-                <Field label="Search work items">
-                  <Input
-                    value={query}
-                    onChange={(_, d) => setQuery(d.value)}
-                    placeholder="Search by title or id…"
-                    aria-label="Search work items"
-                    contentAfter={
-                      searching ? (
-                        <Spinner size="tiny" aria-label="Searching" />
-                      ) : undefined
-                    }
-                  />
+                <Field label="Target">
+                  <RadioGroup
+                    layout="horizontal"
+                    value={targetType}
+                    onChange={(_, d) => setTargetType(d.value as TargetType)}
+                    aria-label="Target"
+                  >
+                    <Radio value="work_item" label="Work item" />
+                    <Radio value="pull_request" label="Pull request" />
+                  </RadioGroup>
                 </Field>
-                {searchError && (
-                  <Text as="p" role="alert" className={styles.error}>
-                    {searchError}
-                  </Text>
-                )}
-                <div
-                  className={styles.results}
-                  role="group"
-                  aria-label="Search results"
-                >
-                  {query.trim() === "" ? (
-                    <Text className={styles.hint}>
-                      Type to search for a work item.
-                    </Text>
-                  ) : searching && results.length === 0 ? (
-                    <Spinner size="tiny" label="Searching…" />
-                  ) : results.length === 0 && !searchError ? (
-                    <Text className={styles.hint}>No matching work items.</Text>
-                  ) : (
-                    <RadioGroup
-                      value={selectedId}
-                      onChange={(_, d) => setSelectedId(d.value)}
+                {targetType === "work_item" ? (
+                  <>
+                    <Field label="Search work items">
+                      <Input
+                        value={query}
+                        onChange={(_, d) => setQuery(d.value)}
+                        placeholder="Search by title or id…"
+                        aria-label="Search work items"
+                        contentAfter={
+                          searching ? (
+                            <Spinner size="tiny" aria-label="Searching" />
+                          ) : undefined
+                        }
+                      />
+                    </Field>
+                    {searchError && (
+                      <Text as="p" role="alert" className={styles.error}>
+                        {searchError}
+                      </Text>
+                    )}
+                    <div
+                      className={styles.results}
+                      role="group"
+                      aria-label="Search results"
                     >
-                      {results.map((r) => (
-                        <Radio
-                          key={r.id}
-                          value={String(r.id)}
-                          label={
-                            <span className={styles.resultLabel}>
-                              <span className={styles.resultTitle}>
-                                {r.title || `Work item ${r.id}`}
-                              </span>
-                              <span className={styles.resultMeta}>
-                                #{r.id} · {r.work_item_type} · {r.state}
-                                {r.area_path ? ` · ${r.area_path}` : ""}
-                              </span>
-                            </span>
-                          }
-                        />
-                      ))}
-                    </RadioGroup>
-                  )}
-                </div>
+                      {query.trim() === "" ? (
+                        <Text className={styles.hint}>
+                          Type to search for a work item.
+                        </Text>
+                      ) : searching && results.length === 0 ? (
+                        <Spinner size="tiny" label="Searching…" />
+                      ) : results.length === 0 && !searchError ? (
+                        <Text className={styles.hint}>
+                          No matching work items.
+                        </Text>
+                      ) : (
+                        <RadioGroup
+                          value={selectedId}
+                          onChange={(_, d) => setSelectedId(d.value)}
+                        >
+                          {results.map((r) => (
+                            <Radio
+                              key={r.id}
+                              value={String(r.id)}
+                              label={
+                                <span className={styles.resultLabel}>
+                                  <span className={styles.resultTitle}>
+                                    {r.title || `Work item ${r.id}`}
+                                  </span>
+                                  <span className={styles.resultMeta}>
+                                    #{r.id} · {r.work_item_type} · {r.state}
+                                    {r.area_path ? ` · ${r.area_path}` : ""}
+                                  </span>
+                                </span>
+                              }
+                            />
+                          ))}
+                        </RadioGroup>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <Field label="Filter pull requests">
+                      <Input
+                        value={prQuery}
+                        onChange={(_, d) => setPrQuery(d.value)}
+                        placeholder="Filter by id, title, or branch…"
+                        aria-label="Filter pull requests"
+                        contentAfter={
+                          prLoading ? (
+                            <Spinner size="tiny" aria-label="Loading" />
+                          ) : undefined
+                        }
+                      />
+                    </Field>
+                    {prError && (
+                      <Text as="p" role="alert" className={styles.error}>
+                        {prError}
+                      </Text>
+                    )}
+                    <div
+                      className={styles.results}
+                      role="group"
+                      aria-label="Pull requests"
+                    >
+                      {prLoading && prRows.length === 0 ? (
+                        <Spinner size="tiny" label="Loading pull requests…" />
+                      ) : prRows.length === 0 && !prError ? (
+                        <Text className={styles.hint}>
+                          No active pull requests.
+                        </Text>
+                      ) : filteredPrs.length === 0 ? (
+                        <Text className={styles.hint}>
+                          No matching pull requests.
+                        </Text>
+                      ) : (
+                        <RadioGroup
+                          value={prSelectedId}
+                          onChange={(_, d) => setPrSelectedId(d.value)}
+                        >
+                          {filteredPrs.map((r) => (
+                            <Radio
+                              key={r.id}
+                              value={String(r.id)}
+                              label={
+                                <span className={styles.resultLabel}>
+                                  <span className={styles.resultTitle}>
+                                    {r.title || `Pull request ${r.id}`}
+                                  </span>
+                                  <span className={styles.resultMeta}>
+                                    #{r.id}
+                                    {r.repository ? ` · ${r.repository}` : ""}
+                                    {" · "}
+                                    {r.source_branch}
+                                    {" -> "}
+                                    {r.target_branch}
+                                    {r.is_draft ? " · draft" : ""}
+                                  </span>
+                                </span>
+                              }
+                            />
+                          ))}
+                        </RadioGroup>
+                      )}
+                    </div>
+                  </>
+                )}
               </>
             ) : (
               event?.label && (
