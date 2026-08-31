@@ -19,6 +19,7 @@ import {
 import { Link as RouterLink, useParams } from "react-router-dom";
 import { ApiError } from "../api";
 import { SubjectCell } from "../components/SubjectCell";
+import { WriteupView } from "../components/WriteupView";
 import {
   getDispatch,
   getEvent,
@@ -192,17 +193,6 @@ const useStyles = makeStyles({
   },
   logEmpty: {
     color: tokens.colorNeutralForeground3,
-  },
-  result: {
-    margin: 0,
-    padding: tokens.spacingVerticalM,
-    borderRadius: tokens.borderRadiusMedium,
-    backgroundColor: tokens.colorNeutralBackground3,
-    fontFamily: tokens.fontFamilyMonospace,
-    fontSize: tokens.fontSizeBase200,
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    overflowX: "auto",
   },
   findings: {
     display: "flex",
@@ -679,13 +669,7 @@ function CompletedPanels({
         <Title3 as="h2" className={styles.sectionTitle}>
           Result
         </Title3>
-        {run?.result_text ? (
-          <pre className={styles.result} aria-label="Result text">
-            {run.result_text}
-          </pre>
-        ) : (
-          <Text className={styles.muted}>No result text.</Text>
-        )}
+        <WriteupView text={run?.result_text ?? null} ariaLabel="Result text" />
       </div>
 
       <div className={styles.section}>

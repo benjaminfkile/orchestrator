@@ -320,6 +320,15 @@ owns the lease lifecycle, never the agent inside it.
   unset `WISPER_HOST_ID`; session-dismissable, clears live when the missing
   value is stored.
 - Per-entry "Step-only" toggle on the playbook Env requirements editor.
+- Run detail page renders `result_text` as GitHub-Flavored Markdown (the
+  ADO PR/comment flavor: CommonMark plus GFM tables, task lists, and
+  strikethrough) via `react-markdown` + `remark-gfm`, with a Rendered / Raw
+  toggle and a Copy markdown button that puts the RAW text on the clipboard
+  (async Clipboard API, with a hidden-textarea `execCommand` fallback for
+  insecure LAN contexts). Raw HTML in the source is escaped (default
+  sanitization posture). Styling is scoped to the writeup container, so no
+  global CSS bleed. Shared `WriteupView` component
+  (`web/src/components/WriteupView.tsx`).
 - `SubjectCell` renders the triggering subject as a flex stack — a leading,
   colour-tinted type icon (a presentation-layer registry keyed by event-source
   prefix and the opaque `subject_type`; ADO Bug/User Story/Epic/Task/Initiative

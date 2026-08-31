@@ -961,6 +961,22 @@ top bar) cycles System → Light → Dark. Under the hood it swaps Fluent UI's
 token-based, so dark mode is a pure theme swap (the resolved neutral background /
 foreground are also mirrored onto `:root` so overscroll paints correctly).
 
+### Run writeup rendering
+
+The run detail page shows the run's `result_text` as GitHub-Flavored Markdown
+(the flavor Azure DevOps accepts in PR descriptions and comments: CommonMark
+plus GFM tables, task lists, and strikethrough) via `react-markdown` +
+`remark-gfm`. The pane has a **Rendered / Raw** toggle and a **Copy markdown**
+button that always places the RAW `result_text` on the clipboard (async
+`navigator.clipboard.writeText` on secure contexts, falling back to a hidden
+`<textarea>` + `document.execCommand("copy")` when the app is served over
+plain HTTP on the LAN and the browser withholds the async API). Raw HTML in
+the source is NOT rendered (escaped): the sanitization posture is the
+`react-markdown` default. The single shared `WriteupView` component
+(`web/src/components/WriteupView.tsx`) scopes all element styling to its own
+wrapper, so headings/tables/code styling in the writeup never bleed into the
+rest of the app.
+
 ### Mobile / responsive layout
 
 The single breakpoint is **768px** (`web/src/useMediaQuery.ts`). Above it, a
