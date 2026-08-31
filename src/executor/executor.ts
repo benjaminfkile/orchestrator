@@ -90,6 +90,22 @@ export type EnvResolver = (
   name: string
 ) => string | undefined | Promise<string | undefined>;
 
+/**
+ * Sentinel error the executor recognises as an operator-initiated cancel: the
+ * dispatcher's {@link import("../services/dispatcher").Dispatcher.cancel}
+ * passes an instance of this class to `AbortController.abort(reason)`, which
+ * flows through the wisper client's abort path back into `runDispatch`'s
+ * catch. `recordFailure` inspects the thrown value and marks the dispatch
+ * `cancelled` (not `failed`) and non-retryable, while the finally block still
+ * releases the lease exactly as it does for a timeout or an ordinary failure.
+ */
+export class DispatchCancelledError extends Error {
+  constructor(message = "cancelled") {
+    super(message);
+    this.name = "DispatchCancelledError";
+  }
+}
+
 /** Injected collaborators for {@link runDispatch}. */
 export interface RunDispatchDeps {
   /** Wisper client whose lease this dispatch runs in. */
@@ -789,18 +805,42 @@ export async function runDispatch(
   // Set by recordFailure; surfaced to the caller so the dispatcher can decide
   // whether to retry. Stays false on success and on a terminal failure.
   let retryable = false;
+  // True when the abort was an operator-initiated cancel (an external signal
+  // aborted with a {@link DispatchCancelledError} reason). recordFailure then
+  // writes status `cancelled` instead of `failed`, and every step iteration
+  // checks the signal at the top of the loop so a cancel that lands BETWEEN
+  // steps stops before the next step starts.
+  const isCancelled = (): boolean =>
+    controller.signal.reason instanceof DispatchCancelledError ||
+    deps.signal?.reason instanceof DispatchCancelledError ||
+    false;
+  const throwIfCancelled = (): void => {
+    if (isCancelled()) {
+      throw new DispatchCancelledError();
+    }
+  };
 
   /**
-   * Record a terminal failure on the dispatch. A timeout wins over any other
-   * message — the whole run failed because it ran too long — so it is reported as
-   * a bare `timeout`; otherwise the thrown message folds in any auth signal. A
-   * timeout, or a thrown {@link WisperApiError} the client flagged retryable,
-   * marks the failure retryable.
+   * Record a terminal outcome for a failing/cancelled run. A cancel (an abort
+   * whose reason is a {@link DispatchCancelledError}, or a thrown
+   * {@link DispatchCancelledError}) wins over every other classification (the
+   * whole run ended because an operator asked it to), so it lands as status
+   * `cancelled` with error `cancelled` and is NEVER marked retryable. A timeout
+   * wins over an ordinary error next, and is retryable. Otherwise the thrown
+   * message folds in any auth signal, and a {@link WisperApiError} the client
+   * flagged retryable marks the failure retryable.
    */
   const recordFailure = async (err: unknown): Promise<void> => {
     let message: string;
-    if (timedOut) {
+    let status: DispatchStatus;
+    const cancelled = isCancelled() || err instanceof DispatchCancelledError;
+    if (cancelled) {
+      message = "cancelled";
+      status = "cancelled";
+      retryable = false;
+    } else if (timedOut) {
       message = "timeout";
+      status = "failed";
       retryable = true;
     } else {
       message = errorMessage(err);
@@ -808,6 +848,7 @@ export async function runDispatch(
       if (authMatch && !message.includes(authMatch)) {
         message += ` (auth failure: ${authMatch})`;
       }
+      status = "failed";
       retryable = err instanceof WisperApiError && err.retryable;
     }
     // A wisper client-side timeout on an exec surfaces the ms value in its own
@@ -816,12 +857,16 @@ export async function runDispatch(
     // execTimeoutMs alongside the error either way so an operator can tell
     // whether to raise WISPER_EXEC_TIMEOUT_MS. Task 213: retry semantics are
     // unchanged; only the log line carries the new detail.
-    logger.error("dispatch failed", {
-      error: message,
-      retryable,
-      execTimeoutMs: lastExecTimeoutMs,
-    });
-    await updateDispatch(dispatchId, { status: "failed", error: message }, db);
+    if (cancelled) {
+      logger.info("dispatch cancelled", { execTimeoutMs: lastExecTimeoutMs });
+    } else {
+      logger.error("dispatch failed", {
+        error: message,
+        retryable,
+        execTimeoutMs: lastExecTimeoutMs,
+      });
+    }
+    await updateDispatch(dispatchId, { status, error: message }, db);
   };
 
   try {
@@ -1120,6 +1165,11 @@ export async function runDispatch(
     // throw short-circuits every remaining step.
     for (const step of steps) {
       if (step.phase !== "pre") continue;
+      // A cancel that lands BETWEEN two pre steps must stop before the next one
+      // starts. The next execSync would abort itself anyway (its wisper call
+      // sees the aborted signal), but the explicit check is clearer and covers
+      // the fence unambiguously in the "multi-step" acceptance criterion.
+      throwIfCancelled();
       const command = renderTemplate(step.command_template, promptEvent, {
         env,
       });
@@ -1157,6 +1207,9 @@ export async function runDispatch(
     }
 
     // --- running -----------------------------------------------------------
+    // A cancel that lands after the last pre step but before the agent step
+    // must stop before the agent runs.
+    throwIfCancelled();
     await updateDispatch(dispatchId, { status: "running" }, db);
     // The runner shapes the agent command from its opaque runner_config and
     // the lease OS. A prompt-driven runner (the `claude-code` runner) reads
@@ -1236,6 +1289,9 @@ export async function runDispatch(
     const collected: Record<string, string> = {};
     for (const step of steps) {
       if (step.phase !== "collect") continue;
+      // As with the pre-step loop above, refuse to start the next collect step
+      // once a cancel has arrived.
+      throwIfCancelled();
       const command = renderTemplate(step.command_template, promptEvent, {
         env,
       });

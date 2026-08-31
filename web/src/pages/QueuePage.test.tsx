@@ -10,6 +10,7 @@ import { MemoryRouter, Route, Routes, useParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api";
 import {
+  cancelDispatch,
   createDispatch,
   listDispatches,
   listEvents,
@@ -25,6 +26,7 @@ vi.mock("../dispatches", async (importOriginal) => ({
   listEvents: vi.fn(),
   listPlaybooks: vi.fn(),
   createDispatch: vi.fn(),
+  cancelDispatch: vi.fn(),
 }));
 // The page registers a live-refetch subscription that requires a ChangesProvider
 // in the tree. These unit tests render the page bare, so stub the hook to a
@@ -37,6 +39,7 @@ const mockListDispatches = vi.mocked(listDispatches);
 const mockListEvents = vi.mocked(listEvents);
 const mockListPlaybooks = vi.mocked(listPlaybooks);
 const mockCreateDispatch = vi.mocked(createDispatch);
+const mockCancelDispatch = vi.mocked(cancelDispatch);
 
 function dispatch(overrides: Partial<Dispatch> & Pick<Dispatch, "id">): Dispatch {
   return {
@@ -117,6 +120,9 @@ beforeEach(() => {
   mockListPlaybooks.mockResolvedValue(PLAYBOOKS);
   mockCreateDispatch.mockResolvedValue(
     dispatch({ id: 99, event_id: 10, playbook_id: 100, status: "queued" }),
+  );
+  mockCancelDispatch.mockResolvedValue(
+    dispatch({ id: 1, event_id: 10, playbook_id: 100, status: "cancelled" }),
   );
 });
 
@@ -259,6 +265,75 @@ describe("QueuePage", () => {
 
     fireEvent.click(screen.getByText("alpha"));
     expect(screen.getByText("runs-detail:1")).toBeTruthy();
+  });
+
+  it("offers a Cancel button on every non-terminal dispatch row", async () => {
+    renderPage();
+    const table = await screen.findByRole("table", { name: "Dispatch queue" });
+    // Every fixture row (running/leasing/queued) surfaces a Cancel action.
+    const cancelButtons = within(table).getAllByRole("button", { name: "Cancel" });
+    expect(cancelButtons).toHaveLength(3);
+  });
+
+  it("confirms then cancels a dispatch via the row action", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      renderPage();
+      const table = await screen.findByRole("table", { name: "Dispatch queue" });
+      // Cancel the running row (id 1).
+      const row = within(table).getByText("alpha").closest("tr")!;
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+
+      await waitFor(() => expect(mockCancelDispatch).toHaveBeenCalledWith(1));
+      expect(confirm).toHaveBeenCalled();
+      // Success surfaces inline; the page stays on the queue.
+      expect(await screen.findByText(/Dispatch #1 cancelled/)).toBeTruthy();
+      expect(screen.queryByText(/^runs-detail:/)).toBeNull();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("skips the cancel API call when the user declines the confirm", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      renderPage();
+      const table = await screen.findByRole("table", { name: "Dispatch queue" });
+      const row = within(table).getByText("alpha").closest("tr")!;
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+      expect(mockCancelDispatch).not.toHaveBeenCalled();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("surfaces a cancel failure without leaving the page", async () => {
+    mockCancelDispatch.mockRejectedValueOnce(new ApiError("cannot cancel", 409));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      renderPage();
+      const table = await screen.findByRole("table", { name: "Dispatch queue" });
+      const row = within(table).getByText("alpha").closest("tr")!;
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toContain("cannot cancel");
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("renders the cancelled status badge (even though the queue rarely lists them)", async () => {
+    mockListDispatches.mockResolvedValue([
+      dispatch({
+        id: 42,
+        event_id: 10,
+        playbook_id: 100,
+        status: "cancelled",
+      }),
+    ]);
+    renderPage();
+    const table = await screen.findByRole("table", { name: "Dispatch queue" });
+    expect(within(table).getByText("cancelled")).toBeTruthy();
   });
 
   it("auto-refreshes every 5s and stops when paused", async () => {

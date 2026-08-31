@@ -39,6 +39,13 @@ export const RUN_STARTED_TYPE = "run.started";
 export const RUN_COMPLETED_TYPE = "run.completed";
 /** Event `type` emitted when a dispatch fails terminally (no retry pending). */
 export const RUN_FAILED_TYPE = "run.failed";
+/**
+ * Event `type` emitted when a dispatch ends via operator cancel: either the
+ * queued-cancel fast path in the router or the in-flight cancel driven through
+ * the executor's abort seam. Distinct from {@link RUN_FAILED_TYPE} so a rule
+ * can act on user aborts specifically (e.g. skip a "run failed" notifier).
+ */
+export const RUN_CANCELLED_TYPE = "run.cancelled";
 
 /** Injected collaborators for {@link emitRunEvent}. */
 export interface EmitRunEventDeps {
@@ -70,11 +77,11 @@ function readChainDepth(payload: unknown): number | null {
  * its terminal state.
  *
  * `status` is the terminal dispatch status: `done` → a `run.completed` event,
- * `failed` → a `run.failed` event. The event copies the originating event's
- * `subject_kind`/`subject_ref`, carries a null `dedupe_key`, and its payload
- * summarizes the run (latest run id, findings, collected output, token/duration
- * totals) alongside the `origin` of the triggering event and the incremented
- * `chain_depth`.
+ * `failed` → a `run.failed` event, `cancelled` → a `run.cancelled` event. The
+ * event copies the originating event's `subject_kind`/`subject_ref`, carries a
+ * null `dedupe_key`, and its payload summarizes the run (latest run id,
+ * findings, collected output, token/duration totals) alongside the `origin` of
+ * the triggering event and the incremented `chain_depth`.
  *
  * The event is emitted through the normal intake ({@link emitEvent}) so rules
  * match it and any resulting dispatch is enqueued and the dispatcher kicked — but
@@ -84,7 +91,7 @@ function readChainDepth(payload: unknown): number | null {
  */
 export async function emitRunEvent(
   dispatch: DispatchRecord,
-  status: "done" | "failed",
+  status: "done" | "failed" | "cancelled",
   deps: EmitRunEventDeps = {}
 ): Promise<void> {
   const db = deps.db ?? getDb();
@@ -121,7 +128,12 @@ export async function emitRunEvent(
 
   const originDepth = readChainDepth(event.payload) ?? 0;
 
-  const type = status === "done" ? RUN_COMPLETED_TYPE : RUN_FAILED_TYPE;
+  const type =
+    status === "done"
+      ? RUN_COMPLETED_TYPE
+      : status === "cancelled"
+        ? RUN_CANCELLED_TYPE
+        : RUN_FAILED_TYPE;
 
   const payload = {
     dispatch_id: dispatch.id,

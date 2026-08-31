@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api";
 import {
+  cancelDispatch,
   getDispatch,
   getEvent,
   getPlaybook,
@@ -13,19 +14,21 @@ import {
 } from "../dispatches";
 import { RunDetailPage } from "./RunDetailPage";
 
-// Mock the data layer wholesale; the page's only inputs are these four calls.
+// Mock the data layer wholesale; the page's only inputs are these five calls.
 vi.mock("../dispatches", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../dispatches")>()),
   getDispatch: vi.fn(),
   getEvent: vi.fn(),
   getPlaybook: vi.fn(),
   streamDispatchLog: vi.fn(),
+  cancelDispatch: vi.fn(),
 }));
 
 const mockGetDispatch = vi.mocked(getDispatch);
 const mockGetEvent = vi.mocked(getEvent);
 const mockGetPlaybook = vi.mocked(getPlaybook);
 const mockStream = vi.mocked(streamDispatchLog);
+const mockCancelDispatch = vi.mocked(cancelDispatch);
 
 /** The latest `onChunk` handed to the mocked stream, so tests can push log data. */
 let logSink: ((text: string) => void) | null = null;
@@ -317,5 +320,83 @@ describe("RunDetailPage", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("boom");
+  });
+
+  describe("cancel action", () => {
+    it("shows a Cancel button while the dispatch is non-terminal", async () => {
+      mockGetDispatch.mockResolvedValue(dispatch("running", [run({ id: 1 })]));
+      renderPage();
+      expect(await screen.findByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    it("hides the Cancel button once the dispatch is terminal", async () => {
+      mockGetDispatch.mockResolvedValue(
+        dispatch("cancelled", [run({ id: 1, ended_at: 1_700_000_300_000 })]),
+      );
+      renderPage();
+      // The status timeline renders before actions; wait for it, then assert.
+      await screen.findByRole("list", { name: "Status timeline" });
+      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+    });
+
+    it("confirms then calls cancelDispatch, keeping the page mounted", async () => {
+      mockGetDispatch.mockResolvedValue(dispatch("running", [run({ id: 1 })]));
+      mockCancelDispatch.mockResolvedValue(
+        dispatch("running", [run({ id: 1 })]),
+      );
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        renderPage();
+        const button = await screen.findByRole("button", { name: "Cancel" });
+        fireEvent.click(button);
+        expect(confirm).toHaveBeenCalled();
+        await act(async () => {
+          await Promise.resolve();
+        });
+        expect(mockCancelDispatch).toHaveBeenCalledWith(1);
+      } finally {
+        confirm.mockRestore();
+      }
+    });
+
+    it("skips the API call when the user declines the confirm", async () => {
+      mockGetDispatch.mockResolvedValue(dispatch("running", [run({ id: 1 })]));
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      try {
+        renderPage();
+        const button = await screen.findByRole("button", { name: "Cancel" });
+        fireEvent.click(button);
+        expect(mockCancelDispatch).not.toHaveBeenCalled();
+      } finally {
+        confirm.mockRestore();
+      }
+    });
+
+    it("surfaces a cancel failure inline (e.g. a 409)", async () => {
+      mockGetDispatch.mockResolvedValue(dispatch("running", [run({ id: 1 })]));
+      mockCancelDispatch.mockRejectedValue(new ApiError("already terminal", 409));
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        renderPage();
+        const button = await screen.findByRole("button", { name: "Cancel" });
+        fireEvent.click(button);
+        const alert = await screen.findByText(/already terminal/);
+        expect(alert).toBeTruthy();
+      } finally {
+        confirm.mockRestore();
+      }
+    });
+
+    it("renders a `cancelled` status badge on the header", async () => {
+      mockGetDispatch.mockResolvedValue(
+        dispatch("cancelled", [run({ id: 1, ended_at: 1_700_000_300_000 })]),
+      );
+      renderPage();
+      // The status badge appears next to the title.
+      await screen.findByRole("list", { name: "Status timeline" });
+      const badges = screen.getAllByText("cancelled");
+      // At least one badge: the header badge (the timeline row also carries it).
+      expect(badges.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

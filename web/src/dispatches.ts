@@ -10,6 +10,9 @@ import { API_BASE, ApiError, apiFetch } from "./api";
 /**
  * Lifecycle states of a dispatch, mirrored from the backend `DispatchStatus`
  * union. Order matters: it drives the tile row and the filter dropdown.
+ * `cancelled` is a terminal state reached only via
+ * `POST /api/dispatches/:id/cancel`. Like `failed`, it is retryable and
+ * belongs to the Runs history, not the Queue.
  */
 export const DISPATCH_STATUSES = [
   "queued",
@@ -18,6 +21,7 @@ export const DISPATCH_STATUSES = [
   "collecting",
   "done",
   "failed",
+  "cancelled",
 ] as const;
 
 export type DispatchStatus = (typeof DISPATCH_STATUSES)[number];
@@ -225,12 +229,24 @@ export function listDispatches(opts?: {
 }
 
 /**
- * Requeue a failed dispatch. Resolves to the updated record (now `queued` with
- * attempts reset); rejects with an `ApiError` (409) if the dispatch is not in
- * the `failed` state.
+ * Requeue a failed or cancelled dispatch. Resolves to the updated record (now
+ * `queued` with attempts reset); rejects with an `ApiError` (409) if the
+ * dispatch is not in the `failed` or `cancelled` state.
  */
 export function retryDispatch(id: number): Promise<Dispatch> {
   return apiFetch<Dispatch>(`/dispatches/${id}/retry`, { method: "POST" });
+}
+
+/**
+ * Cancel a non-terminal dispatch. A queued dispatch is marked `cancelled`
+ * directly and the response carries the updated row; an in-flight dispatch is
+ * aborted through the dispatcher's per-dispatch signal and the response
+ * carries the CURRENT row (still e.g. `running`); the caller polls the
+ * dispatch record to see it flip to `cancelled`. Rejects with an `ApiError`
+ * (409) when the dispatch is already terminal (done/failed/cancelled).
+ */
+export function cancelDispatch(id: number): Promise<Dispatch> {
+  return apiFetch<Dispatch>(`/dispatches/${id}/cancel`, { method: "POST" });
 }
 
 /**

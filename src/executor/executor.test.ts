@@ -23,6 +23,7 @@ import { WisperClient } from "../wisper/client";
 import {
   attemptLeaseRelease,
   DEFAULT_RELEASE_TIMEOUT_MS,
+  DispatchCancelledError,
   EXEC_TIMEOUT_CAP_MS,
   EXEC_TIMEOUT_FLOOR_MS,
   EXEC_TIMEOUT_MARGIN_MS,
@@ -2047,6 +2048,69 @@ describe("runDispatch pipeline", () => {
     expect(logText).not.toContain("s3cr3t-value");
     expect(logText).toContain("login --token *** --pin 99");
     expect(logText).toContain("report --token ***");
+  });
+
+  describe("cancel via external signal", () => {
+    it("mid-stream abort with DispatchCancelledError: dispatch lands cancelled (not failed), lease released, no retry", async () => {
+      // The stream hangs forever; only the external abort ends it.
+      fake.planExec({ hang: true, chunks: [`working...\n`] });
+      const dispatchId = await seedDispatch({ ttl_seconds: 600 });
+
+      const controller = new AbortController();
+      // Fire the cancel shortly after the stream opens.
+      setTimeout(() => controller.abort(new DispatchCancelledError()), 60);
+
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        signal: controller.signal,
+      });
+
+      expect(result.status).toBe("cancelled");
+      expect(result.error).toBe("cancelled");
+      expect(result.retryable).toBe(false);
+      // The lease is still released via the finally, exactly like a timeout.
+      expect(fake.releasedLeases).toEqual(["lease-1"]);
+      // No run row was written (the agent never exited 0).
+      expect(await listRuns(dispatchId, db)).toHaveLength(0);
+    });
+
+    it("cancel BETWEEN two pre steps stops before the next step starts", async () => {
+      // A pre-signalled cancel makes the executor's throwIfCancelled fence at
+      // the top of the pre-step loop throw before the second step's execSync
+      // fires. The agent step is never reached either.
+      fake.planSync(() => ({ exitCode: 0 }));
+      const dispatchId = await seedDispatch({
+        steps: [
+          { phase: "pre", command_template: "echo one", label: "first" },
+          { phase: "pre", command_template: "echo two", label: "second" },
+        ],
+      });
+
+      const controller = new AbortController();
+      // Fire cancel after the first pre exec resolves but before the second
+      // starts. Cancel is signalled synchronously in this test AFTER the first
+      // step by planning the fake's syncPlan to abort on its first call.
+      let syncCalls = 0;
+      fake.planSync(() => {
+        syncCalls += 1;
+        if (syncCalls === 1) {
+          controller.abort(new DispatchCancelledError());
+        }
+        return { exitCode: 0 };
+      });
+
+      const result = await runDispatch(dispatchId, {
+        ...deps(),
+        signal: controller.signal,
+      });
+
+      expect(result.status).toBe("cancelled");
+      // Exactly ONE step exec ran; the second was fenced off by throwIfCancelled.
+      // (Every exec goes through fake.execs; the agent step also streams, but
+      // the run cancelled before `running` was reached, so no stream exec fired.)
+      expect(syncCalls).toBe(1);
+      expect(fake.releasedLeases).toEqual(["lease-1"]);
+    });
   });
 
   it("per-dispatch timeout aborts the in-flight stream, fails 'timeout', releases the lease", async () => {

@@ -339,8 +339,11 @@ export interface PlaybookUpdate {
 /**
  * Lifecycle states of a dispatch. A dispatch starts `queued`, is atomically
  * claimed into `leasing`, then advances through `running`/`collecting` to a
- * terminal `done` or `failed`. These strings are the ONLY allowed statuses;
- * they describe pipeline stage, never domain intent.
+ * terminal `done`, `failed`, or `cancelled`. `cancelled` is reached only via
+ * `POST /api/dispatches/:id/cancel`: an operator abort, terminal like the
+ * other two (never auto-retried; the release sweep chases its lease like any
+ * other terminal row). These strings are the ONLY allowed statuses; they
+ * describe pipeline stage, never domain intent.
  */
 export type DispatchStatus =
   | "queued"
@@ -348,7 +351,8 @@ export type DispatchStatus =
   | "running"
   | "collecting"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 /**
  * A persisted dispatch as stored in the `dispatches` table: one queued unit of
@@ -374,9 +378,10 @@ export interface DispatchRecord {
    * Timestamp (ms since epoch) when the lease was successfully released, or
    * `null` when either no lease was ever created OR the release has not yet
    * succeeded. The sweep queries for `lease_id IS NOT NULL AND released_at IS
-   * NULL AND status IN ('done','failed')` — the terminal-status filter is
-   * load-bearing (an in-flight row's lease is owned by its own pipeline) — so
-   * a stuck release keeps retrying past the dispatch's terminal state.
+   * NULL AND status IN ('done','failed','cancelled')` (the terminal-status
+   * filter is load-bearing: an in-flight row's lease is owned by its own
+   * pipeline), so a stuck release keeps retrying past the dispatch's terminal
+   * state.
    */
   released_at: number | null;
   /**

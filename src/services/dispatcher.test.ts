@@ -30,6 +30,13 @@ interface ExecPlan {
   exitCode?: number;
   /** When set, the stream ends with an `error` frame carrying this code. */
   errorCode?: string;
+  /**
+   * When true, the stream writes its initial chunk then hangs forever with no
+   * terminal frame; only the client's own abort (or timeout) closes it. Used
+   * by the cancel tests to hold the executor in the agent-step exec while an
+   * external signal fires.
+   */
+  hang?: boolean;
 }
 
 /**
@@ -121,6 +128,10 @@ class FakeWisper {
           data: `{"type":"result","result":"ok"}\n`,
         })}\n\n`
       );
+      if (plan.hang) {
+        // Leave the response open with no terminal frame; the client aborts.
+        return;
+      }
       if (plan.errorCode) {
         res.write(
           `event: error\ndata: ${JSON.stringify({ error: plan.errorCode })}\n\n`
@@ -953,6 +964,67 @@ describe("Dispatcher", () => {
     // throwing — retention is best-effort housekeeping, never on the hot path.
     expect((await getDispatch(first, db))?.status).toBe("done");
     expect((await getDispatch(second, db))?.status).toBe("done");
+  });
+
+  describe("cancel", () => {
+    it("returns false when no run is in-flight for the id", async () => {
+      const d = makeDispatcher();
+      // No processDispatch has been called for id 1, so the inflight map is empty.
+      expect(d.cancel(1)).toBe(false);
+    });
+
+    it("cancelling an in-flight dispatch: dispatch lands cancelled, lease released, run.cancelled emitted, no auto-retry", async () => {
+      // The agent stream hangs open so the dispatch stays in `running` until
+      // an external cancel tears it down.
+      fake.planExecs([{ hang: true }]);
+      const id = await seedDispatch("1");
+
+      const d = makeDispatcher();
+      const drainPromise = (async () => {
+        d.kick();
+        await d.whenSettled();
+      })();
+
+      // Poll until the row is in-flight (leasing/running/collecting), then
+      // trigger the cancel. This avoids a fixed sleep by observing state.
+      await new Promise<void>((resolve) => {
+        const tick = async () => {
+          const row = await getDispatch(id, db);
+          if (
+            row &&
+            (row.status === "leasing" ||
+              row.status === "running" ||
+              row.status === "collecting")
+          ) {
+            resolve();
+            return;
+          }
+          setTimeout(tick, 10);
+        };
+        void tick();
+      });
+
+      expect(d.cancel(id)).toBe(true);
+      await drainPromise;
+
+      const dispatch = await getDispatch(id, db);
+      expect(dispatch?.status).toBe("cancelled");
+      expect(dispatch?.error).toBe("cancelled");
+      // Lease was still released via the executor's finally.
+      expect(fake.releasedLeases).toEqual(["lease-1"]);
+      // Cancelled dispatches are terminal and never auto-retried, so exactly
+      // ONE agent-stream exec ever fired (no second attempt).
+      expect(fake.streamCommands).toHaveLength(1);
+      // run.cancelled fired; run.failed did NOT.
+      const cancelled = await callbackEvents("run.cancelled");
+      const failed = await callbackEvents("run.failed");
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0].payload).toMatchObject({
+        dispatch_id: id,
+        status: "cancelled",
+      });
+      expect(failed).toHaveLength(0);
+    });
   });
 
   it("stays idle with no wisper client and never claims work", async () => {

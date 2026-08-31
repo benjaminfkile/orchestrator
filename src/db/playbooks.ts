@@ -194,8 +194,8 @@ const IN_FLIGHT_DISPATCH_STATUSES = [
   "collecting",
 ] as const;
 
-/** The terminal dispatch statuses — a completed run's history. */
-const TERMINAL_DISPATCH_STATUSES = ["done", "failed"] as const;
+/** The terminal dispatch statuses; a completed, failed, or cancelled run's history. */
+const TERMINAL_DISPATCH_STATUSES = ["done", "failed", "cancelled"] as const;
 
 /** Counts of the run history a playbook owns, used to warn before a delete cascade. */
 export interface PlaybookHistoryCounts {

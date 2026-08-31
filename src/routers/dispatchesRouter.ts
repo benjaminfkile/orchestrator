@@ -14,8 +14,10 @@ import { listFindings } from "../db/findings";
 import { getPlaybook } from "../db/playbooks";
 import { listRuns } from "../db/runs";
 import type { DispatchRecord, DispatchStatus } from "../interfaces";
+import { log } from "../log";
 import { getRuntime } from "../runtime";
 import { dispatchLogPath } from "../services/dispatchLog";
+import { emitRunEvent } from "../services/runEvents";
 import { evaluateRunBudget, type BudgetWait } from "../services/runBudget";
 
 import { streamDispatchLog } from "./dispatchLogStream";
@@ -30,7 +32,7 @@ import {
 } from "./http";
 
 /**
- * `/api/dispatches` — read the dispatch queue and retry failed work.
+ * `/api/dispatches`: read the dispatch queue and retry/cancel work.
  *
  *   GET /               list, newest-first; `?status=` filters to one state,
  *                       `?active=1` filters to the non-terminal (queued/leasing/
@@ -40,13 +42,18 @@ import {
  *   GET /:id            one dispatch with its runs (each with findings) embedded
  *   GET /:id/log        tail the dispatch's log file as chunked text/plain:
  *                       current content, then appended bytes, until the dispatch
- *                       is done|failed or the client disconnects; 404 if the
- *                       dispatch or its log file does not exist yet
+ *                       is done|failed|cancelled or the client disconnects; 404 if
+ *                       the dispatch or its log file does not exist yet
  *   POST /               manually queue an existing playbook against an existing
  *                       event, creating a rule-less dispatch (no rule matching);
  *                       body `{event_id, playbook_id}`, 404 if either is unknown
- *   POST /:id/retry     requeue a `failed` dispatch, resetting attempts, and kick
- *                       the dispatcher; 409 unless the dispatch is `failed`
+ *   POST /:id/retry     requeue a `failed` OR `cancelled` dispatch, resetting
+ *                       attempts, and kick the dispatcher; 409 otherwise
+ *   POST /:id/cancel    abort a non-terminal dispatch: a queued row is marked
+ *                       `cancelled` directly; an in-flight one is aborted through
+ *                       the dispatcher's per-dispatch signal so its lease still
+ *                       releases via the normal finally path. 409 when the
+ *                       dispatch is already terminal (done/failed/cancelled)
  */
 const dispatchesRouter = express.Router();
 
@@ -58,6 +65,19 @@ export const DISPATCH_STATUSES: readonly DispatchStatus[] = [
   "collecting",
   "done",
   "failed",
+  "cancelled",
+];
+
+/**
+ * The terminal dispatch statuses. `cancel` refuses any of these with 409, and
+ * `retry` accepts only `failed`/`cancelled` (a `done` dispatch is retried by
+ * re-running from scratch, which is a `POST /api/dispatches`: see the router
+ * comment above and the web UI's Re-run action).
+ */
+const TERMINAL_DISPATCH_STATUSES: readonly DispatchStatus[] = [
+  "done",
+  "failed",
+  "cancelled",
 ];
 
 /**
@@ -217,10 +237,15 @@ dispatchesRouter.post(
       res.status(404).json({ error: "dispatch not found" });
       return;
     }
-    if (dispatch.status !== "failed") {
+    // A `cancelled` dispatch is retryable through the same path as a `failed`
+    // one: it is terminal (no lease still owed while release_pending is
+    // false), never auto-retried by the dispatcher's retry policy, and an
+    // operator may explicitly requeue it here. A `done` dispatch is retried
+    // by re-running from scratch (POST /api/dispatches).
+    if (dispatch.status !== "failed" && dispatch.status !== "cancelled") {
       throw new HttpError(
         409,
-        `only a failed dispatch can be retried (status is ${dispatch.status})`
+        `only a failed or cancelled dispatch can be retried (status is ${dispatch.status})`
       );
     }
     // A failed dispatch still holding an UNRELEASED lease belongs to the
@@ -252,6 +277,74 @@ dispatchesRouter.post(
     // no-op when leasing is unconfigured (no dispatcher wired).
     getRuntime().dispatcher?.kick();
     res.status(200).json(updated);
+  })
+);
+
+dispatchesRouter.post(
+  "/:id/cancel",
+  handler(async (req, res) => {
+    const id = parseIdParam(req.params.id);
+    const dispatch = await getDispatch(id);
+    if (!dispatch) {
+      res.status(404).json({ error: "dispatch not found" });
+      return;
+    }
+    if (TERMINAL_DISPATCH_STATUSES.includes(dispatch.status)) {
+      throw new HttpError(
+        409,
+        `only a non-terminal dispatch can be cancelled (status is ${dispatch.status})`
+      );
+    }
+
+    // A queued dispatch has never been claimed, so the executor has no
+    // controller for it: just mark it `cancelled` directly and emit
+    // `run.cancelled` from here. No lease is owed (no createLease has run),
+    // so `release_pending` stays false and the sweep is not involved.
+    if (dispatch.status === "queued") {
+      const updated = await updateDispatch(id, {
+        status: "cancelled",
+        error: "cancelled",
+      });
+      // Fire `run.cancelled` so any rule matching cancellation reacts (the
+      // executor is what emits terminal events for in-flight cancels, but a
+      // queued cancel never enters the executor). Best-effort: an emission
+      // failure must not fail the API call.
+      if (updated) {
+        try {
+          await emitRunEvent(updated, "cancelled", {
+            dispatcher: getRuntime().dispatcher,
+          });
+        } catch (err) {
+          log.error("failed to emit run.cancelled event for queued cancel", {
+            dispatchId: id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      res.status(200).json(updated);
+      return;
+    }
+
+    // An in-flight dispatch (leasing/running/collecting): route through the
+    // dispatcher's per-dispatch abort controller so its in-flight wisper
+    // calls tear down. The executor's finally block still releases the
+    // lease, and its recordFailure writes status `cancelled` (not `failed`)
+    // then the dispatcher emits `run.cancelled`. If no dispatcher is wired
+    // (leasing unconfigured, an unusual state for an in-flight row but
+    // possible in tests) or no controller is registered (a claim we cannot
+    // see; a race with the terminal transition), 409 is the honest answer.
+    const cancelled = getRuntime().dispatcher?.cancel?.(id) ?? false;
+    if (!cancelled) {
+      throw new HttpError(
+        409,
+        "no in-flight dispatch to cancel; the run may have just finished, please retry"
+      );
+    }
+    // The abort fires asynchronously; return the CURRENT row (still e.g.
+    // `running`). Clients poll the dispatch record to see it flip to
+    // `cancelled` (typically within a moment); the run detail page already
+    // does this.
+    res.status(200).json(dispatch);
   })
 );
 

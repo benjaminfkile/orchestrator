@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Badge,
+  Button,
   Card,
   CardHeader,
   makeStyles,
@@ -21,6 +22,7 @@ import { ApiError } from "../api";
 import { SubjectCell } from "../components/SubjectCell";
 import { WriteupView } from "../components/WriteupView";
 import {
+  cancelDispatch,
   getDispatch,
   getEvent,
   getPlaybook,
@@ -52,6 +54,7 @@ const SCROLL_THRESHOLD_PX = 24;
 const TERMINAL_STATUSES: ReadonlySet<DispatchStatus> = new Set([
   "done",
   "failed",
+  "cancelled",
 ]);
 
 /** The non-terminal pipeline stages, in the order a dispatch advances through. */
@@ -70,6 +73,7 @@ const STAGE_INDEX: Record<DispatchStatus, number> = {
   collecting: 3,
   done: 4,
   failed: 4,
+  cancelled: 4,
 };
 
 /** The four token counters shown in the usage table, with display labels. */
@@ -103,6 +107,7 @@ const STATUS_COLOR: Record<DispatchStatus, BadgeProps["color"]> = {
   collecting: "brand",
   done: "success",
   failed: "danger",
+  cancelled: "subtle",
 };
 
 const useStyles = makeStyles({
@@ -271,12 +276,14 @@ function buildTimeline(
   }));
 
   // Final row: the terminal outcome once reached, otherwise the pending
-  // "completed" step the pipeline is still working toward.
+  // "completed" step the pipeline is still working toward. A `cancelled`
+  // outcome reads as "failed" visually (the run ended without success), but
+  // its label is the status itself so an operator sees the abort clearly.
   const terminalTs = latestRun?.ended_at ?? (terminal ? dispatch.updated_at : null);
   stages.push({
     label: terminal ? dispatch.status : "completed",
     state:
-      dispatch.status === "failed"
+      dispatch.status === "failed" || dispatch.status === "cancelled"
         ? "failed"
         : dispatch.status === "done"
           ? "done"
@@ -326,6 +333,12 @@ export function RunDetailPage() {
   const [log, setLog] = useState("");
   const [logError, setLogError] = useState<string | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  // True while the cancel request is in flight, so the button disables
+  // (and reads "Cancelling…") until it settles.
+  const [cancelling, setCancelling] = useState(false);
+  // Set from the cancel handler so a 409 (already-terminal dispatch, no
+  // in-flight controller) surfaces inline rather than hiding in a toast.
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   // Latest status, read by the log-stream retry loop without re-subscribing.
   const statusRef = useRef<DispatchStatus | null>(null);
@@ -446,6 +459,25 @@ export function RunDetailPage() {
     setAutoScroll(distance <= SCROLL_THRESHOLD_PX);
   }, []);
 
+  // Cancel this run. The dispatch-poll loop above picks up the new terminal
+  // state on its next tick, so the status badge and timeline flip live once
+  // the executor's abort settles.
+  const onCancel = useCallback(async () => {
+    const ok = window.confirm(
+      `Cancel dispatch #${id}? Its lease will still be released.`,
+    );
+    if (!ok) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelDispatch(id);
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCancelling(false);
+    }
+  }, [id]);
+
   const latestRun = useMemo(
     () => (dispatch && dispatch.runs.length ? dispatch.runs[dispatch.runs.length - 1] : undefined),
     [dispatch],
@@ -482,11 +514,26 @@ export function RunDetailPage() {
             </Badge>
           )}
         </div>
+        {dispatch && !TERMINAL_STATUSES.has(dispatch.status) && (
+          <Button
+            appearance="secondary"
+            disabled={cancelling}
+            onClick={() => void onCancel()}
+          >
+            {cancelling ? "Cancelling…" : "Cancel"}
+          </Button>
+        )}
       </div>
 
       {error && (
         <Text as="p" className={styles.error} role="alert">
           {error}
+        </Text>
+      )}
+
+      {cancelError && (
+        <Text as="p" className={styles.error} role="alert">
+          {cancelError}
         </Text>
       )}
 
