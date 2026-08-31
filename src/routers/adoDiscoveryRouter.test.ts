@@ -13,13 +13,22 @@ import { runMigrations } from "../db/migrate";
 import { setModuleConfig } from "../db/moduleConfig";
 import { createPlaybook } from "../db/playbooks";
 import { createRule } from "../db/rules";
-import { ADOApiError, type ADOWorkItem } from "../modules/ado/client";
-import { ADO_EVENT_MANUAL } from "../modules/ado/materialize";
+import {
+  ADOApiError,
+  type ADOPullRequest,
+  type ADORepositoryRef,
+  type ADOWorkItem,
+} from "../modules/ado/client";
+import {
+  ADO_EVENT_MANUAL,
+  ADO_PR_EVENT_MANUAL,
+} from "../modules/ado/materialize";
 import {
   ADO_EVENT_SOURCE,
   ADO_MODULE_ID,
   ADO_SUBJECT_KIND,
 } from "../modules/ado/poller";
+import { ADO_PR_SUBJECT_KIND } from "../modules/ado/pr";
 import { resetRuntime, setRuntime } from "../runtime";
 import { SecretStore, setSecretStore, type Keychain } from "../secrets";
 
@@ -84,6 +93,31 @@ function fakeDiscovery(): AdoDiscoveryLike & { calls: Record<string, unknown[]> 
   };
 }
 
+/** Build a normalized PR shape (as the client returns) for the fake PR store. */
+function pullRequest(
+  id: number,
+  over: Partial<ADOPullRequest> = {}
+): ADOPullRequest {
+  return {
+    pullRequestId: id,
+    title: `PR ${id}`,
+    status: "active",
+    isDraft: false,
+    sourceRefName: "refs/heads/feature/x",
+    targetRefName: "refs/heads/main",
+    sourceCommit: "abc",
+    createdBy: { uniqueName: "ada@contoso.com", displayName: "Ada Lovelace" },
+    repository: {
+      id: "repo-guid",
+      name: "web",
+      remoteUrl: "https://dev.azure.com/contoso/Alpha/_git/web",
+    },
+    reviewers: [],
+    url: `https://dev.azure.com/contoso/_apis/git/pullRequests/${id}`,
+    ...over,
+  };
+}
+
 /** Build a raw work item with the fields the payload builder reads. */
 function workItem(
   id: number,
@@ -95,22 +129,29 @@ function workItem(
 
 /**
  * A mocked per-connection client recording its calls. `runWiql` returns
- * `wiqlIds`; `getWorkItems` returns the matching entries from `store`. A test
- * may reassign a method to simulate an upstream error.
+ * `wiqlIds`; `getWorkItems` returns the matching entries from `store`. Pull
+ * requests come from `prStore` (an id-keyed map). A test may reassign a method
+ * to simulate an upstream error.
  */
 type FakeWorkItemClient = AdoMeClientLike & {
   calls: Record<string, unknown[]>;
   wiqlIds: number[];
   store: Map<number, ADOWorkItem>;
+  prStore: Map<number, ADOPullRequest>;
+  repoStore: Map<string, ADORepositoryRef>;
 };
 
 function fakeWorkItemClient(): FakeWorkItemClient {
   const calls: Record<string, unknown[]> = {};
   const store = new Map<number, ADOWorkItem>();
+  const prStore = new Map<number, ADOPullRequest>();
+  const repoStore = new Map<string, ADORepositoryRef>();
   const client: FakeWorkItemClient = {
     calls,
     wiqlIds: [],
     store,
+    prStore,
+    repoStore,
     async resolveMeIdentity() {
       calls.resolveMeIdentity = [];
       return { uniqueName: "me@contoso.com", displayName: "Me Myself" };
@@ -136,6 +177,34 @@ function fakeWorkItemClient(): FakeWorkItemClient {
         out.push(item);
       }
       return out;
+    },
+    async listPullRequests() {
+      calls.listPullRequests = [];
+      return [...prStore.values()];
+    },
+    async getPullRequestById(id) {
+      calls.getPullRequestById = [id];
+      const pr = prStore.get(id);
+      if (!pr) {
+        throw new ADOApiError({
+          httpStatus: 404,
+          message: "TF401180: pull request not found",
+          typeKey: "PullRequestNotFoundException",
+        });
+      }
+      return pr;
+    },
+    async getRepository(repositoryId) {
+      calls.getRepository = [repositoryId];
+      const repo = repoStore.get(repositoryId);
+      if (!repo) {
+        throw new ADOApiError({
+          httpStatus: 404,
+          message: "TF401019: repository not found",
+          typeKey: "GitRepositoryNotFoundException",
+        });
+      }
+      return repo;
     },
   };
   return client;
@@ -651,6 +720,250 @@ describe("ADO discovery router", () => {
       );
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/enabled/);
+    });
+  });
+
+  describe("pull-request discovery", () => {
+    beforeEach(configureAdoEnabled);
+
+    it("lists ACTIVE PRs with a compact per-row shape for the dialog", async () => {
+      meClient.prStore.set(
+        11,
+        pullRequest(11, {
+          title: "Add widget",
+          sourceRefName: "refs/heads/feature/widget",
+          targetRefName: "refs/heads/main",
+          isDraft: false,
+          repository: {
+            id: "repo-guid",
+            name: "web",
+            remoteUrl: "https://dev.azure.com/contoso/Alpha/_git/web",
+          },
+        })
+      );
+      meClient.prStore.set(
+        12,
+        pullRequest(12, {
+          title: "Draft change",
+          sourceRefName: "refs/heads/wip",
+          targetRefName: "refs/heads/main",
+          isDraft: true,
+          repository: {
+            id: "repo-guid",
+            name: "web",
+          },
+        })
+      );
+
+      const res = await request(app).get(
+        "/api/modules/ado/discovery/pullrequests"
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([
+        {
+          id: 11,
+          title: "Add widget",
+          repository: "web",
+          source_branch: "feature/widget",
+          target_branch: "main",
+          is_draft: false,
+        },
+        {
+          id: 12,
+          title: "Draft change",
+          repository: "web",
+          source_branch: "wip",
+          target_branch: "main",
+          is_draft: true,
+        },
+      ]);
+    });
+
+    it("400s when the module is configured but not enabled", async () => {
+      await setModuleConfig(ADO_MODULE_ID, {
+        org: "contoso",
+        project: "Alpha",
+        pat_secret_ref: "ADO_PAT",
+      });
+      const res = await request(app).get(
+        "/api/modules/ado/discovery/pullrequests"
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/enabled/);
+    });
+
+    it("degrades a 401 to a 200 empty list with the restricted header", async () => {
+      meClient.listPullRequests = async () => {
+        throw new ADOApiError({
+          httpStatus: 403,
+          message: "TF400813: not authorized",
+          typeKey: "UnauthorizedRequestException",
+        });
+      };
+      const res = await request(app).get(
+        "/api/modules/ado/discovery/pullrequests"
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+      expect(res.headers["x-ado-restricted"]).toMatch(/restricted/i);
+    });
+  });
+
+  describe("pull-request materialize", () => {
+    beforeEach(configureAdoEnabled);
+
+    it("materializes one manual event with a poller-identical PR payload", async () => {
+      meClient.prStore.set(
+        101,
+        pullRequest(101, {
+          title: "Fix login",
+          isDraft: true,
+          sourceRefName: "refs/heads/feature/login",
+          targetRefName: "refs/heads/main",
+          status: "active",
+          repository: {
+            id: "repo-guid",
+            name: "web",
+            remoteUrl: "https://dev.azure.com/contoso/Alpha/_git/web",
+          },
+        })
+      );
+
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/101/materialize"
+      );
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        source: ADO_EVENT_SOURCE,
+        type: ADO_PR_EVENT_MANUAL,
+        subject_kind: ADO_PR_SUBJECT_KIND,
+        subject_ref: "101",
+        dedupe_key: null,
+        // Rule matching was skipped, so no dispatch was stamped.
+        last_dispatched_at: null,
+      });
+      // The payload is exactly the poller's base shape for a PR event.
+      expect(res.body.payload).toEqual({
+        id: 101,
+        title: "Fix login",
+        repository: "web",
+        repo_remote_url: "https://dev.azure.com/contoso/Alpha/_git/web",
+        repo_remote_url_hostpath: "dev.azure.com/contoso/Alpha/_git/web",
+        source_branch: "feature/login",
+        target_branch: "main",
+        created_by: {
+          uniqueName: "ada@contoso.com",
+          displayName: "Ada Lovelace",
+        },
+        status: "active",
+        is_draft: true,
+        url: "https://dev.azure.com/contoso/_apis/git/pullRequests/101",
+      });
+      // Exactly one event recorded, and no dispatch created.
+      const events = await listEvents({}, db);
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe(ADO_PR_EVENT_MANUAL);
+      expect(await listDispatches(undefined, db)).toHaveLength(0);
+    });
+
+    it("resolves the clone URL via getRepository when the PR omits remoteUrl", async () => {
+      meClient.prStore.set(
+        202,
+        pullRequest(202, {
+          repository: { id: "repo-guid", name: "web" },
+        })
+      );
+      meClient.repoStore.set("repo-guid", {
+        id: "repo-guid",
+        name: "web",
+        remoteUrl: "https://dev.azure.com/contoso/Alpha/_git/web",
+      });
+
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/202/materialize"
+      );
+      expect(res.status).toBe(201);
+      expect(res.body.payload.repo_remote_url).toBe(
+        "https://dev.azure.com/contoso/Alpha/_git/web"
+      );
+      expect(meClient.calls.getRepository).toEqual(["repo-guid"]);
+    });
+
+    it("does NOT run rules even when a rule would match", async () => {
+      const pb = await createPlaybook(
+        { name: "p", image: "img:latest", ttl_seconds: 60 },
+        db
+      );
+      await createRule(
+        { name: "catch-all", match: {}, dispatch: [{ playbook_id: pb.id }] },
+        db
+      );
+      meClient.prStore.set(303, pullRequest(303));
+
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/303/materialize"
+      );
+      expect(res.status).toBe(201);
+      expect(await listDispatches(undefined, db)).toHaveLength(0);
+      expect(res.body.last_dispatched_at).toBeNull();
+    });
+
+    it("always inserts (no dedupe_key) so repeated calls create new events", async () => {
+      meClient.prStore.set(404, pullRequest(404));
+      const first = await request(app).post(
+        "/api/modules/ado/pullrequests/404/materialize"
+      );
+      const second = await request(app).post(
+        "/api/modules/ado/pullrequests/404/materialize"
+      );
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(201);
+      expect(first.body.id).not.toBe(second.body.id);
+      expect(await listEvents({}, db)).toHaveLength(2);
+    });
+
+    it("passes the ADO 'not found' through as a 404", async () => {
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/9999/materialize"
+      );
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/not found/i);
+      expect(await listEvents({}, db)).toHaveLength(0);
+    });
+
+    it("400s when the id is not a positive integer", async () => {
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/abc/materialize"
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("400s when the module is configured but not enabled", async () => {
+      await setModuleConfig(ADO_MODULE_ID, {
+        org: "contoso",
+        project: "Alpha",
+        pat_secret_ref: "ADO_PAT",
+      });
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/101/materialize"
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/enabled/);
+    });
+
+    it("passes a non-404 ADO error through as 502", async () => {
+      meClient.getPullRequestById = async () => {
+        throw new ADOApiError({
+          httpStatus: 500,
+          message: "TF400898: internal error",
+          typeKey: "InternalServerException",
+        });
+      };
+      const res = await request(app).post(
+        "/api/modules/ado/pullrequests/101/materialize"
+      );
+      expect(res.status).toBe(502);
+      expect(res.body.error).toBe("TF400898: internal error");
     });
   });
 });

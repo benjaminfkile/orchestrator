@@ -264,6 +264,19 @@ owns the lease lifecycle, never the agent inside it.
   playbook can be dispatched against it manually (`404` if the item is absent).
   The poller's payload builder is extracted to a shared module and reused, so a
   materialized event is byte-for-byte the shape a poll tick emits.
+- Run Playbook on a pull request: the Run Playbook dialog's search step gains a
+  target-type switch (Work item / Pull request); in PR mode it lists the
+  configured project's ACTIVE pull requests via
+  `GET /api/modules/ado/discovery/pullrequests` (returning
+  `[{id, title, repository, source_branch, target_branch, is_draft}]`, client-side
+  filtered), and Run materializes the picked PR via
+  `POST /api/modules/ado/pullrequests/:id/materialize` before dispatching.
+  The materialize endpoint fetches ONE pull request project-wide by id (a new
+  project-scoped `getPullRequestById` client read that hits
+  `GET .../_apis/git/pullrequests/{id}`, distinct from the repository-scoped
+  read) and records it as a single `ado.pullrequest.manual` event whose payload
+  is byte-for-byte the pull-request poller's base shape; the poller's payload
+  builder is reused, not duplicated.
 
 #### Secrets & playbooks
 
