@@ -321,6 +321,23 @@ export async function claimNextQueuedDispatch(
  * in the patch, so a field can be explicitly cleared by passing `null`. Returns
  * the updated record, or `undefined` if no dispatch with `id` exists.
  */
+/**
+ * Atomically cancel a dispatch ONLY while it is still queued: a conditional
+ * write guarded on status, so a dispatcher claim racing this call loses
+ * cleanly (0 rows change and undefined is returned; the caller then treats
+ * the dispatch as in-flight). Returns the updated record when the guard won.
+ */
+export async function cancelQueuedDispatch(
+  id: number,
+  db: Knex = getDb()
+): Promise<DispatchRecord | undefined> {
+  const changed = await db<DispatchRow>("dispatches")
+    .where({ id, status: "queued" })
+    .update({ status: "cancelled", error: "cancelled", updated_at: Date.now() });
+  if (changed === 0) return undefined;
+  return getDispatch(id, db);
+}
+
 export async function updateDispatch(
   id: number,
   patch: DispatchUpdate,

@@ -985,17 +985,14 @@ describe("Dispatcher", () => {
         await d.whenSettled();
       })();
 
-      // Poll until the row is in-flight (leasing/running/collecting), then
-      // trigger the cancel. This avoids a fixed sleep by observing state.
+      // Poll until the row reaches RUNNING (the lease exists and the hung
+      // agent stream is open), then trigger the cancel. Cancelling during
+      // `leasing` would abort createLease before a lease id exists, which is
+      // a different scenario than the mid-run teardown this test pins.
       await new Promise<void>((resolve) => {
         const tick = async () => {
           const row = await getDispatch(id, db);
-          if (
-            row &&
-            (row.status === "leasing" ||
-              row.status === "running" ||
-              row.status === "collecting")
-          ) {
+          if (row && row.status === "running") {
             resolve();
             return;
           }

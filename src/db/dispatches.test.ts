@@ -455,4 +455,27 @@ describe("dispatches repo", () => {
       expect(none).toHaveLength(0);
     });
   });
+
+  it("cancelQueuedDispatch wins only while the row is still queued", async () => {
+    const { cancelQueuedDispatch } = await import("./dispatches");
+    const queued = await createDispatch(
+      { event_id: eventId, rule_id: ruleId, playbook_id: playbookId },
+      db
+    );
+    const won = await cancelQueuedDispatch(queued.id, db);
+    expect(won?.status).toBe("cancelled");
+    expect(won?.error).toBe("cancelled");
+
+    const created = await createDispatch(
+      { event_id: eventId, rule_id: ruleId, playbook_id: playbookId },
+      db
+    );
+    await updateDispatch(created.id, { status: "running" }, db);
+    const running = { id: created.id };
+    const lost = await cancelQueuedDispatch(running.id, db);
+    expect(lost).toBeUndefined();
+    const untouched = await getDispatch(running.id, db);
+    expect(untouched?.status).toBe("running");
+    expect(untouched?.error ?? null).toBeNull();
+  });
 });

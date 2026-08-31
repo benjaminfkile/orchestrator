@@ -4,6 +4,7 @@ import express from "express";
 
 import {
   createDispatch,
+  cancelQueuedDispatch,
   getDispatch,
   getDispatchWithSubject,
   listDispatchesWithSubject,
@@ -301,10 +302,11 @@ dispatchesRouter.post(
     // `run.cancelled` from here. No lease is owed (no createLease has run),
     // so `release_pending` stays false and the sweep is not involved.
     if (dispatch.status === "queued") {
-      const updated = await updateDispatch(id, {
-        status: "cancelled",
-        error: "cancelled",
-      });
+      // Guarded write: only wins while the row is STILL queued, so a
+      // dispatcher claim racing this call makes the update a no-op and the
+      // dispatch is handled below as in-flight instead of being marked
+      // cancelled underneath a running executor.
+      const updated = await cancelQueuedDispatch(id);
       // Fire `run.cancelled` so any rule matching cancellation reacts (the
       // executor is what emits terminal events for in-flight cancels, but a
       // queued cancel never enters the executor). Best-effort: an emission
@@ -320,9 +322,11 @@ dispatchesRouter.post(
             error: err instanceof Error ? err.message : String(err),
           });
         }
+        res.status(200).json(updated);
+        return;
       }
-      res.status(200).json(updated);
-      return;
+      // The guard lost: a dispatcher claim raced this call and the dispatch
+      // is in flight now; fall through to the abort-controller path below.
     }
 
     // An in-flight dispatch (leasing/running/collecting): route through the
