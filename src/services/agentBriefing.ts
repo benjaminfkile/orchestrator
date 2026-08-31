@@ -76,7 +76,10 @@ Key invariants you must respect:
   ts, last_dispatched_at, cleared_at}\`. Payload is opaque JSON from the
   producer. All columns are addressable in rule criteria as \`event.<column>\`. Only the newest 1000 events are kept (dispatch-referenced ones survive).
 - ADO producer events: \`ado.workitem.created/.assigned/.state_changed/
-  .area_changed/.iteration_changed/.tagged/.updated\`, \`ado.pullrequest.created/
+  .area_changed/.iteration_changed/.tagged/.updated/.comment.created\` (work item
+  payloads carry \`changed_by\` {uniqueName, displayName} and \`comment_count\`;
+  \`.comment.created\` adds \`comment_id\`, \`author\`, \`content\`, \`created_date\`
+  and fires once per new comment), \`ado.pullrequest.created/
   .updated/.pushed/.comment.created/.thread.status_changed/.vote/.completed/
   .abandoned\` (source \`ado\`). PR payloads carry \`is_draft\`; \`.updated\` fires on a
   status or draft-flag change with \`previous_status\` and \`previous_is_draft\`;

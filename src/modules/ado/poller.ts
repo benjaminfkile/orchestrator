@@ -45,6 +45,7 @@ import {
 import {
   ADOClient,
   type ADOClientOptions,
+  type ADOComment,
   type ADOWorkItem,
 } from "./client";
 import {
@@ -58,6 +59,7 @@ import {
 import { buildWatchedWiql, type WatchedWiqlConfig } from "./wiql";
 import {
   buildWorkItemPayload,
+  identityPayload,
   toWorkItemView,
   type WorkItemView,
 } from "./workItemPayload";
@@ -80,6 +82,7 @@ export const ADO_EVENT_AREA_CHANGED = "ado.workitem.area_changed";
 export const ADO_EVENT_ITERATION_CHANGED = "ado.workitem.iteration_changed";
 export const ADO_EVENT_TAGGED = "ado.workitem.tagged";
 export const ADO_EVENT_UPDATED = "ado.workitem.updated";
+export const ADO_EVENT_COMMENT_CREATED = "ado.workitem.comment.created";
 
 /** Poll cadence used when the module is enabled but names no `interval_seconds`. */
 export const ADO_DEFAULT_INTERVAL_SECONDS = 60;
@@ -122,6 +125,10 @@ interface WorkItemSnapshot {
   iteration: string;
   tags: string[];
   changed: string;
+  /** `System.CommentCount` at the last tick; a rise triggers one comments read. */
+  commentCount: number;
+  /** Highest comment id already emitted (0 until the first comments read). */
+  lastCommentId: number;
 }
 
 /**
@@ -146,6 +153,7 @@ export type SecretResolver = (ref: string) => Promise<string | undefined>;
 export interface AdoReadClient {
   runWiql(query: string): Promise<number[]>;
   getWorkItems(ids: number[]): Promise<ADOWorkItem[]>;
+  getWorkItemComments(id: number): Promise<ADOComment[]>;
 }
 
 /** Builds a read client from resolved connection options; injectable for tests. */
@@ -226,7 +234,7 @@ function changedAdvanced(prev: string, next: string): boolean {
 }
 
 /** Capture the diffed facets of a view into a snapshot entry. */
-function snapshotOf(v: WorkItemView): WorkItemSnapshot {
+function snapshotOf(v: WorkItemView, lastCommentId = 0): WorkItemSnapshot {
   return {
     state: v.state,
     assignee: v.assignee,
@@ -234,6 +242,8 @@ function snapshotOf(v: WorkItemView): WorkItemSnapshot {
     iteration: v.iteration_path,
     tags: v.tags,
     changed: v.changed,
+    commentCount: v.comment_count,
+    lastCommentId,
   };
 }
 
@@ -320,12 +330,60 @@ export function createAdoModule(deps: AdoModuleDeps): AdoModule {
     }
   }
 
-  /** Emit every event a CHANGED item warrants, given its prior snapshot. */
+  /**
+   * Emit one `comment.created` per comment added since the prior snapshot.
+   * Only called when `System.CommentCount` rose, so the common tick issues no
+   * comments read. Returns the highest comment id now accounted for. Before the
+   * first read the snapshot knows only a count, so the newest `delta` comments
+   * (by id) are treated as the new ones; afterwards ids above lastCommentId are.
+   */
+  async function emitNewComments(
+    v: WorkItemView,
+    prev: WorkItemSnapshot,
+    client: AdoReadClient,
+    base: Record<string, unknown>
+  ): Promise<number> {
+    const comments = (await client.getWorkItemComments(v.id))
+      .filter((c) => typeof c.id === "number" && c.id > 0)
+      .sort((a, b) => a.id - b.id);
+    const delta = Math.max(0, v.comment_count - prev.commentCount);
+    const fresh =
+      prev.lastCommentId > 0
+        ? comments.filter((c) => c.id > prev.lastCommentId)
+        : comments.slice(Math.max(0, comments.length - delta));
+    for (const c of fresh) {
+      await emit({
+        source: ADO_EVENT_SOURCE,
+        type: ADO_EVENT_COMMENT_CREATED,
+        subject_kind: ADO_SUBJECT_KIND,
+        subject_ref: String(v.id),
+        payload: {
+          ...base,
+          comment_id: c.id,
+          author: identityPayload(c.createdBy),
+          content: c.text,
+          created_date: c.createdDate,
+        },
+        dedupe_key: `${ADO_EVENT_COMMENT_CREATED}:${v.id}:${c.id}`,
+      });
+    }
+    return comments.length > 0 ? comments[comments.length - 1].id : prev.lastCommentId;
+  }
+
+  /**
+   * Emit every event a CHANGED item warrants, given its prior snapshot. Returns
+   * the highest comment id accounted for, to carry into the next snapshot.
+   */
   async function emitForChanged(
     v: WorkItemView,
-    prev: WorkItemSnapshot
-  ): Promise<void> {
+    prev: WorkItemSnapshot,
+    client: AdoReadClient
+  ): Promise<number> {
     const base = buildWorkItemPayload(v);
+    let lastCommentId = prev.lastCommentId;
+    if (v.comment_count > prev.commentCount) {
+      lastCommentId = await emitNewComments(v, prev, client, base);
+    }
     // Whether any facet-specific change fired; only when none did does a bare
     // ChangedDate advance collapse to a single "updated" event.
     let specificChange = false;
@@ -392,7 +450,8 @@ export function createAdoModule(deps: AdoModuleDeps): AdoModule {
       });
     }
 
-    if (!specificChange && changedAdvanced(prev.changed, v.changed)) {
+    const commentAdded = v.comment_count > prev.commentCount;
+    if (!specificChange && !commentAdded && changedAdvanced(prev.changed, v.changed)) {
       await emit({
         source: ADO_EVENT_SOURCE,
         type: ADO_EVENT_UPDATED,
@@ -402,6 +461,7 @@ export function createAdoModule(deps: AdoModuleDeps): AdoModule {
         dedupe_key: `${ADO_EVENT_UPDATED}:${v.id}:${v.changed}`,
       });
     }
+    return lastCommentId;
   }
 
   /**
@@ -533,10 +593,11 @@ export function createAdoModule(deps: AdoModuleDeps): AdoModule {
         const prev = snapshot.get(v.id);
         if (!prev) {
           await emitForNew(v);
+          snapshot.set(v.id, snapshotOf(v));
         } else {
-          await emitForChanged(v, prev);
+          const lastCommentId = await emitForChanged(v, prev, client);
+          snapshot.set(v.id, snapshotOf(v, lastCommentId));
         }
-        snapshot.set(v.id, snapshotOf(v));
       }
       status.seeded_count = snapshot.size;
       status.last_error = null;

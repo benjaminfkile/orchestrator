@@ -52,6 +52,19 @@ export interface WorkItemView {
   tags: string[];
   url: string;
   changed: string;
+  /** Who made the most recent change (`System.ChangedBy`); empty names when absent. */
+  changed_by: { uniqueName: string; displayName: string };
+  /** `System.CommentCount`; 0 when absent. */
+  comment_count: number;
+}
+
+/** Reduce an identity ref (or bare string) to `{ uniqueName, displayName }`. */
+export function identityPayload(
+  raw: ADOIdentityRef | string | undefined
+): { uniqueName: string; displayName: string } {
+  if (!raw) return { uniqueName: "", displayName: "" };
+  if (typeof raw === "string") return { uniqueName: raw, displayName: raw };
+  return { uniqueName: raw.uniqueName ?? "", displayName: raw.displayName ?? "" };
 }
 
 /** Flatten a raw {@link ADOWorkItem} into the fields the poller reads. */
@@ -68,6 +81,11 @@ export function toWorkItemView(item: ADOWorkItem): WorkItemView {
     tags: parseTags(f["System.Tags"]),
     url: item.url,
     changed: strField(f["System.ChangedDate"]),
+    changed_by: identityPayload(
+      f["System.ChangedBy"] as ADOIdentityRef | string | undefined
+    ),
+    comment_count:
+      typeof f["System.CommentCount"] === "number" ? f["System.CommentCount"] : 0,
   };
 }
 
@@ -90,5 +108,7 @@ export function buildWorkItemPayload(v: WorkItemView): Record<string, unknown> {
     tags: v.tags,
     url: toWorkItemWebUrl(v.url),
     api_url: v.url,
+    changed_by: v.changed_by,
+    comment_count: v.comment_count,
   };
 }

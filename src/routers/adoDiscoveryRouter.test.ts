@@ -574,6 +574,8 @@ describe("ADO discovery router", () => {
         tags: ["urgent", "regression"],
         url: "https://dev.azure.com/contoso/Alpha/_workitems/edit/77",
         api_url: "https://dev.azure.com/contoso/Alpha/_apis/wit/workItems/77",
+        changed_by: { uniqueName: "", displayName: "" },
+        comment_count: 0,
       });
 
       // Exactly one event recorded, and no dispatch created.

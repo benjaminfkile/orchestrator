@@ -673,9 +673,16 @@ and **never committed** to this repo.
 
 - Work items: `ado.workitem.created`, `.assigned` (+ `previous_assignee`),
   `.state_changed` (+ `previous_state`), `.area_changed` (+ `previous_area`),
-  `.iteration_changed` (+ `previous_iteration`), `.tagged`, `.updated`. Each
-  payload carries `work_item_type`, `state`, `assignee`, `area_path`,
-  `iteration_path`, `tags`, and `url`.
+  `.iteration_changed` (+ `previous_iteration`), `.tagged`, `.updated`, and
+  `.comment.created` (one per new comment: `comment_id`, `author`
+  {uniqueName, displayName}, `content`, `created_date`; dedupe key
+  `ado.workitem.comment.created:<id>:<comment_id>`). Each payload carries
+  `work_item_type`, `state`, `assignee`, `area_path`, `iteration_path`,
+  `tags`, `url`, `changed_by` {uniqueName, displayName} (who made the latest
+  change), and `comment_count`. Comments are read only when
+  `System.CommentCount` rises, so the common tick issues no extra request;
+  comments that already exist when an item is first seen are not emitted, and
+  a tick that only added a comment does not also fire `.updated`.
 - Pull requests (every payload carries `id`, `title`, `repository`,
   `repo_remote_url`, `repo_remote_url_hostpath`, `source_branch`,
   `target_branch`, `created_by`, `status`, `is_draft`, `url`):

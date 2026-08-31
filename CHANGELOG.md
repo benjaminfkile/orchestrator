@@ -22,6 +22,12 @@ owns the lease lifecycle, never the agent inside it.
   in-app surface.
 - Events are capped at the newest 1000 (dispatch-referenced events are kept).
 
+#### Work items
+
+- `ado.workitem.comment.created` fires once per new comment (`comment_id`,
+  `author`, `content`, `created_date`); every work-item payload carries
+  `changed_by` and `comment_count`.
+
 #### Pull requests
 
 - `ado.pullrequest.*` payloads carry `is_draft`; `.updated` fires when a PR's

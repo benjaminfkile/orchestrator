@@ -14,10 +14,11 @@ import { createLogger } from "../../log";
 import { emitEvent } from "../../services/eventIntake";
 import { TriggerScheduler } from "../../services/triggerScheduler";
 
-import type { ADOWorkItem, ADOIdentityRef } from "./client";
+import type { ADOWorkItem, ADOIdentityRef, ADOComment } from "./client";
 import {
   ADO_EVENT_AREA_CHANGED,
   ADO_EVENT_ASSIGNED,
+  ADO_EVENT_COMMENT_CREATED,
   ADO_EVENT_CREATED,
   ADO_EVENT_ITERATION_CHANGED,
   ADO_EVENT_STATE_CHANGED,
@@ -41,6 +42,8 @@ function wi(
     iteration?: string;
     tags?: string;
     changed?: string;
+    changedBy?: ADOIdentityRef | string;
+    commentCount?: number;
     url?: string;
   } = {}
 ): ADOWorkItem {
@@ -56,6 +59,8 @@ function wi(
       "System.IterationPath": fields.iteration ?? "Proj\\Sprint 1",
       "System.Tags": fields.tags,
       "System.ChangedDate": fields.changed ?? "2026-07-13T10:00:00Z",
+      "System.ChangedBy": fields.changedBy,
+      "System.CommentCount": fields.commentCount ?? 0,
     },
   };
 }
@@ -63,6 +68,8 @@ function wi(
 /** A mutable fake ADO read client backed by an in-memory board of items. */
 class FakeAdoClient {
   board: ADOWorkItem[] = [];
+  comments = new Map<number, ADOComment[]>();
+  commentReads: number[] = [];
   async runWiql(): Promise<number[]> {
     return this.board.map((item) => item.id);
   }
@@ -71,6 +78,10 @@ class FakeAdoClient {
     return ids
       .map((id) => byId.get(id))
       .filter((item): item is ADOWorkItem => item !== undefined);
+  }
+  async getWorkItemComments(id: number): Promise<ADOComment[]> {
+    this.commentReads.push(id);
+    return this.comments.get(id) ?? [];
   }
 }
 
@@ -233,6 +244,8 @@ describe("ado work-item poller", () => {
         // api_url. The default wi() url is the _apis/wit/workItems shape.
         url: "https://dev.azure.com/o/p/_workitems/edit/7",
         api_url: "https://dev.azure.com/o/p/_apis/wit/workItems/7",
+        changed_by: { uniqueName: "", displayName: "" },
+        comment_count: 0,
       });
     });
 
@@ -623,6 +636,10 @@ describe("ado project scoping (poller + backfill, cross-project isolation)", () 
         .map((entry) => entry.item.id);
     }
 
+    async getWorkItemComments(): Promise<ADOComment[]> {
+      return [];
+    }
+
     async getWorkItems(ids: number[]): Promise<ADOWorkItem[]> {
       const byId = new Map(this.org.map((entry) => [entry.item.id, entry.item]));
       return ids
@@ -863,5 +880,86 @@ describe("ado backfill through real intake (dedupe + caps)", () => {
     // ...but the per-hour cap gates dispatch creation to the configured 2.
     const dispatches = await db("dispatches");
     expect(dispatches).toHaveLength(2);
+  });
+});
+
+describe("ado work-item comments and changed_by", () => {
+  const author = { uniqueName: "kim@x.com", displayName: "Kim" };
+  const comment = (id: number, text = `c${id}`): ADOComment => ({
+    id,
+    text,
+    createdBy: author,
+    createdDate: "2026-08-30T12:00:00Z",
+  });
+
+  it("carries changed_by and comment_count on every work-item payload", async () => {
+    const { emitted, client, tick } = setup();
+    await tick(); // seed empty
+    client.board = [wi(1, { changedBy: author, commentCount: 2 })];
+    await tick();
+    const created = ofType(emitted, ADO_EVENT_CREATED);
+    expect(created).toHaveLength(1);
+    expect(created[0].payload).toMatchObject({ changed_by: author, comment_count: 2 });
+  });
+
+  it("emits comment.created for the newest comments when the count rises, without reading comments otherwise", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [wi(1, { commentCount: 1, changed: "2026-08-30T10:00:00Z" })];
+    client.comments.set(1, [comment(10)]);
+    await tick(); // seed
+    await tick(); // unchanged
+    expect(client.commentReads).toEqual([]);
+
+    client.board = [wi(1, { commentCount: 3, changed: "2026-08-30T11:00:00Z", changedBy: author })];
+    client.comments.set(1, [comment(10), comment(11, "first new"), comment(12, "second new")]);
+    await tick();
+
+    const events = ofType(emitted, ADO_EVENT_COMMENT_CREATED);
+    expect(client.commentReads).toEqual([1]);
+    expect(events.map((e) => e.dedupe_key)).toEqual([
+      `${ADO_EVENT_COMMENT_CREATED}:1:11`,
+      `${ADO_EVENT_COMMENT_CREATED}:1:12`,
+    ]);
+    expect(events[0].payload).toMatchObject({
+      id: 1,
+      comment_id: 11,
+      author,
+      content: "first new",
+      created_date: "2026-08-30T12:00:00Z",
+      changed_by: author,
+    });
+    // A comment is not also reported as a bare update.
+    expect(ofType(emitted, "ado.workitem.updated")).toHaveLength(0);
+
+    // Subsequent comments use the exact id watermark.
+    client.board = [wi(1, { commentCount: 4, changed: "2026-08-30T12:00:00Z" })];
+    client.comments.set(1, [comment(10), comment(11), comment(12), comment(13, "third")]);
+    await tick();
+    const after = ofType(emitted, ADO_EVENT_COMMENT_CREATED);
+    expect(after).toHaveLength(3);
+    expect(after[2].payload).toMatchObject({ comment_id: 13, content: "third" });
+    await tick();
+    expect(ofType(emitted, ADO_EVENT_COMMENT_CREATED)).toHaveLength(3);
+  });
+
+  it("does not emit comments that already existed when an item is first seen", async () => {
+    const { emitted, client, tick } = setup();
+    await tick(); // seed empty
+    client.board = [wi(2, { commentCount: 5 })];
+    client.comments.set(2, [comment(1), comment(2), comment(3), comment(4), comment(5)]);
+    await tick();
+    expect(ofType(emitted, ADO_EVENT_COMMENT_CREATED)).toHaveLength(0);
+    expect(client.commentReads).toEqual([]);
+  });
+
+  it("still emits the specific facet event alongside a comment in the same tick", async () => {
+    const { emitted, client, tick } = setup();
+    client.board = [wi(1, { state: "New", commentCount: 0 })];
+    await tick(); // seed
+    client.board = [wi(1, { state: "Active", commentCount: 1, changed: "2026-08-30T13:00:00Z" })];
+    client.comments.set(1, [comment(7)]);
+    await tick();
+    expect(ofType(emitted, ADO_EVENT_COMMENT_CREATED)).toHaveLength(1);
+    expect(ofType(emitted, "ado.workitem.state_changed")).toHaveLength(1);
   });
 });
